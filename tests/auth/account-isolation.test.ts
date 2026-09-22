@@ -190,7 +190,9 @@ describe('a stint belongs to the account that watched it', () => {
     const raceId = await createRace(alex);
 
     // The engine looks the race up scoped by the account, so a foreign id has
-    // no race behind it at all.
+    // no race behind it at all. Prisma logs the resulting `findFirstOrThrow`
+    // as `prisma:error` on its way out — that line in the test output is this
+    // test working, not this test failing.
     await expect(as(sam, () => logSessionAction(stintForm(raceId)))).rejects.toThrow();
 
     expect(await prisma.raceViewingSession.count({ where: { userId: sam } })).toBe(0);
@@ -307,26 +309,20 @@ describe('a one-shot bonus belongs to one account', () => {
   });
 
   /**
-   * SKIPPED, AND IT SHOULD NOT BE. This asserts the behaviour the application
-   * is supposed to have, and the behaviour it does not have yet.
+   * The regression test for the bug that made a second account worth less
+   * than the first. `dedupeKey` used to be `@unique` across the whole table,
+   * and every one-shot key an engine builds — achievements, milestones, the
+   * global and event mastery trees — is derived from what was earned rather
+   * than from who earned it. So the second account to unlock any of them was
+   * shown the unlock and paid nothing: the same career seeded into two
+   * accounts scored 321,130 XP and 188,330 XP.
    *
-   * `XPTransaction.dedupeKey` is `@unique` across the whole table rather than
-   * per account (prisma/schema.prisma), and `awardXp` looks it up with
-   * `findUnique({ where: { dedupeKey } })` (src/lib/engines/xp-ledger.ts).
-   * Every one-shot key an engine builds — achievements, milestones, the global
-   * and event mastery trees — is derived from a key rather than from the
-   * account, so the SECOND account to earn any of them is told it earned it
-   * and paid nothing. Measured on a throwaway database: the same career seeded
-   * into two accounts scored 321,130 XP and 188,330 XP.
-   *
-   * Un-skipping this needs BOTH halves of the fix, in one change:
-   *   1. schema: `dedupeKey String?` plus `@@unique([userId, dedupeKey])`,
-   *      with a migration;
-   *   2. xp-ledger: `findFirst({ where: { userId, dedupeKey } })`.
-   * Doing only (2) turns a silent underpayment into a P2002 crash on the
-   * insert that follows, which is strictly worse.
+   * The constraint is now `@@unique([userId, dedupeKey])` and `awardXp` looks
+   * the key up with `findFirst` scoped by account, so both halves of the
+   * guarantee hold at once — a second account earns it for the first time,
+   * and re-running an engine still cannot pay the same account twice.
    */
-  it.skip('pays two accounts the same one-shot bonus', async () => {
+  it('pays two accounts the same one-shot bonus', async () => {
     const key = 'story:test-race';
 
     const first = await awardXpStandalone(alex, {

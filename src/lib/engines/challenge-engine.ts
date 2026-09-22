@@ -1779,8 +1779,26 @@ export async function ensureChallenges(
     buildChallengesForScope(scope, library, period, `${userId}:${scope}:${period.key}`),
   );
 
+  const where = {
+    userId,
+    OR: periods.map(({ scope, period }) => ({ scope, periodStart: period.start })),
+  };
+
+  // Read what is already there before inserting, not after.
+  //
+  // This function runs on every page load and the board it generates is almost
+  // always already in the database, so letting the insert collide and catching
+  // P2002 meant Prisma logged thirty-odd `prisma:error` lines every time the
+  // dashboard was opened. Harmless, but in a desktop application that noise
+  // goes into the user's log file and makes a healthy app look broken.
+  let rows = await db.challenge.findMany({ where });
+
   if (generated.length > 0) {
-    await createManySkippingDuplicates(
+    const keyOf = (row: { scope: string; templateKey: string; periodStart: Date }) =>
+      `${row.scope}|${row.templateKey}|${row.periodStart.getTime()}`;
+    const existing = rows.map(keyOf);
+
+    const created = await createManySkippingDuplicates(
       db.challenge,
       generated.map((challenge) => ({
         userId,
@@ -1796,15 +1814,12 @@ export async function ensureChallenges(
         periodStart: challenge.periodStart,
         periodEnd: challenge.periodEnd,
       })),
+      { keyOf, findExisting: () => existing },
     );
-  }
 
-  const rows = await db.challenge.findMany({
-    where: {
-      userId,
-      OR: periods.map(({ scope, period }) => ({ scope, periodStart: period.start })),
-    },
-  });
+    // Only worth a second read when something was actually inserted.
+    if (created > 0) rows = await db.challenge.findMany({ where });
+  }
 
   // Every challenge carries an ACTIVE progress row from the moment it exists,
   // so the board, the budget engine and the strategist all see the same state

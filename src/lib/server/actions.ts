@@ -20,7 +20,6 @@ import { revalidatePath } from 'next/cache';
 import { prisma } from '@/lib/db/client';
 import type { Tx } from '@/lib/db/client';
 import { requireUserId } from '@/lib/auth/session';
-import { isAccountError, renameAccount } from '@/lib/auth/accounts';
 import {
   championshipInputSchema, raceInputSchema, raceUpdateSchema, restWeekSchema,
   seasonInputSchema, sessionDeleteSchema, sessionInputSchema, settingsSchema,
@@ -420,7 +419,6 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
   const userId = await requireUserId();
   await ensureCareer(userId);
   const parsed = settingsSchema.safeParse({
-    name: formValue(form, 'name'),
     weekStart: formValue(form, 'weekStart'),
     annualBudgetHours: formValue(form, 'annualBudgetHours'),
     weeklyTargetHours: formValue(form, 'weeklyTargetHours'),
@@ -434,19 +432,6 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
   }
 
   const input = parsed.data;
-
-  // Renaming goes through the accounts module rather than being written here.
-  // The display name is what the account picker calls this career, so it is
-  // unique — and there should be exactly one place that knows how to check
-  // that, the same way there is exactly one place that creates an account.
-  if (input.name !== undefined) {
-    try {
-      await renameAccount(userId, input.name);
-    } catch (error) {
-      if (isAccountError(error)) return { ok: false, errors: { name: error.message }, message: error.message };
-      throw error;
-    }
-  }
 
   await prisma.$transaction(async (tx) => {
     if (input.weekStart !== undefined) {

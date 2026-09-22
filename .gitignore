@@ -17,8 +17,12 @@
 /.next/
 /out/
 
-# production
-/build
+# The compiled desktop shell. Rebuilt by `npm run desktop:build`; committing it
+# would mean reviewing generated JavaScript on every change to desktop/src.
+/desktop/out/
+
+# Installers and unpacked application trees from electron-builder.
+/dist/
 
 # misc
 .DS_Store

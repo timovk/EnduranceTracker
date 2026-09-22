@@ -205,7 +205,9 @@ export type SeasonInput = z.infer<typeof seasonInputSchema>;
 // ---------------------------------------------------------------------------
 
 export const settingsSchema = z.object({
-  name: z.string().trim().min(1).max(60).optional(),
+  // No `name` here on purpose. The display name is the account's, not the
+  // career's, so renaming goes through `renameAccount` from the account panel
+  // — one place that knows the length limit and the uniqueness rule.
   weekStart: z.coerce.number().int().min(0).max(6).optional(),
   annualBudgetHours: z.coerce.number().positive().max(8760).optional(),
   weeklyTargetHours: z.coerce.number().positive().max(168).optional(),

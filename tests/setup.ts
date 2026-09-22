@@ -12,7 +12,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import Database from 'better-sqlite3';
 import { resolve } from 'node:path';
 import { config } from 'dotenv';
 
@@ -35,9 +36,43 @@ function databaseFile(url: string | undefined): string | null {
 
 const file = databaseFile(process.env.DATABASE_URL);
 
-// A missing or empty file means the schema has never been applied. Applying it
-// is cheap and idempotent, so there is no reason to make the user do it.
-if (file !== null && (!existsSync(file) || statSync(file).size === 0)) {
+/**
+ * Whether the database is behind the migrations on disk.
+ *
+ * Checking only for a missing file is not enough: a database created before
+ * the newest migration existed stays behind forever, and what it produces is
+ * a "no such column" from deep inside some query rather than anything that
+ * points at the schema. Comparing the two lists is a few milliseconds, where
+ * shelling out to `migrate deploy` on every test file is a second each.
+ */
+function needsMigrating(path: string): boolean {
+  if (!existsSync(path) || statSync(path).size === 0) return true;
+
+  const onDisk = readdirSync(resolve(root, 'prisma', 'migrations'), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+
+  const database = new Database(path, { readonly: true });
+  try {
+    const applied = new Set(
+      (
+        database
+          .prepare(
+            'SELECT "migration_name" FROM "_prisma_migrations" WHERE "finished_at" IS NOT NULL',
+          )
+          .all() as { migration_name: string }[]
+      ).map((row) => row.migration_name),
+    );
+    return onDisk.some((name) => !applied.has(name));
+  } catch {
+    // No `_prisma_migrations` table at all, so nothing has ever been applied.
+    return true;
+  } finally {
+    database.close();
+  }
+}
+
+if (file !== null && needsMigrating(file)) {
   // `npm run`, never `npx`. npx falls back to fetching the registry's
   // `latest` when it cannot resolve a local binary, and prisma's `latest` is
   // currently a release candidate for the NEXT major version with a different

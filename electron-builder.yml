@@ -1,0 +1,119 @@
+# How the installer is assembled.
+#
+# Everything here is read by `npm run dist:win` (Windows, in CI) and
+# `npm run desktop:pack` (Linux, for local rehearsal). The Windows artefact is
+# built on a GitHub Actions runner — there is no Windows and no Wine in the
+# development container — so this file has to be right the first time rather
+# than tuned by trial. Where an option is not obvious, the comment says what
+# breaks without it.
+
+appId: com.enduranceracing.career
+productName: Endurance Racing Career
+
+directories:
+  output: dist
+  buildResources: build
+
+# No update server, no publisher, nowhere for this application to phone home.
+# The career lives on one machine and stays there; `--publish never` on the
+# command line says the same thing twice, deliberately.
+publish: null
+
+# `desktop/src/main.ts` calls app.setName() as well, but naming the product in
+# the packaged package.json means Electron resolves app.getPath('userData') to
+# %APPDATA%\Endurance Racing Career from the very first line, before any of our
+# code runs.
+extraMetadata:
+  productName: Endurance Racing Career
+
+# The native SQLite binding is rebuilt for Electron's ABI *before* `next build`
+# runs, because `next build` copies whatever .node file is on disk into
+# .next/standalone. Letting the builder rebuild afterwards would leave the
+# standalone tree holding the older binary — an installer that starts and then
+# cannot open a career.
+npmRebuild: false
+
+asar: true
+# A .node file cannot be dlopen'd out of an archive. Unpacking the whole module
+# rather than just the binary keeps `bindings` — which locates the binary by
+# walking up from its own directory — looking at one consistent tree.
+asarUnpack:
+  - node_modules/better-sqlite3/**
+
+# The asar holds the desktop shell and nothing else. The web application is not
+# in here: it is an extraResource, below.
+#
+# electron-builder copies every production dependency into the asar unless told
+# otherwise, and this project's production dependencies are Next, React, Prisma
+# and friends — several hundred megabytes the shell never requires, because the
+# server child process loads its own copies out of the standalone tree.
+#
+# The exclusions below are an inverted allow-list because they have to be: the
+# node_modules walk begins from `**/*` and can only ever be narrowed, so an
+# inclusive pattern there does nothing. `!(a|b|c)` is minimatch's "any name
+# except these", which is why the module we keep is named inside a negation.
+files:
+  - package.json
+  - desktop/out/**/*
+  - "!node_modules/!(better-sqlite3|bindings|file-uri-to-path)"
+  - "!node_modules/!(better-sqlite3|bindings|file-uri-to-path)/**/*"
+  # The SQLite amalgamation and the addon's C++ sources are build inputs. The
+  # compiled binary in build/Release is the only part that runs.
+  - "!node_modules/better-sqlite3/{deps,src}{,/**}"
+
+# The Next standalone server and the migration SQL, side by side in
+# resources/. desktop/src/paths.ts looks for them at exactly
+# resources/app/server.js and resources/migrations/<name>/migration.sql.
+#
+# The second entry is not redundant. electron-builder's copier refuses a
+# directory whose path relative to the copy root is exactly "node_modules" —
+# it is guarding against sweeping up a development tree — and never descends
+# into it. Copying that directory as its own root sidesteps the guard; without
+# it the application installs perfectly and then cannot find Next.
+extraResources:
+  - from: .next/standalone
+    to: app
+  - from: .next/standalone/node_modules
+    to: app/node_modules
+  - from: prisma/migrations
+    to: migrations
+
+win:
+  icon: build/icon.ico
+  # Installing a career-tracking application must not need an administrator.
+  requestedExecutionLevel: asInvoker
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  # A real installer with a visible path, not a one-click drop into %LOCALAPPDATA%.
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Endurance Racing Career
+  # THE line in this file. The career — every race, every hour watched — lives
+  # in %APPDATA%, and uninstalling the application must never take it. Someone
+  # reinstalling later gets their history back.
+  deleteAppDataOnUninstall: false
+  artifactName: ${productName} Setup ${version}.${ext}
+  uninstallDisplayName: ${productName}
+
+portable:
+  artifactName: ${productName} ${version} portable.${ext}
+
+# Linux is not a shipping target. It exists so the whole packaging chain can be
+# built and run in the development container, which is the only place any of
+# this can be tested before it reaches a Windows machine.
+linux:
+  icon: build/icon.png
+  category: Game
+  target:
+    - AppImage
+    - dir

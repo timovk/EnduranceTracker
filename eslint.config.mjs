@@ -11,6 +11,14 @@ const eslintConfig = defineConfig([
     ".next/**",
     "out/**",
     "build/**",
+    // The compiled desktop shell. `desktop/tsconfig.json` emits CommonJS, so
+    // linting it as source only ever reports the `require()` calls tsc itself
+    // wrote. The sources under `desktop/src` are linted normally.
+    "desktop/out/**",
+    // electron-builder's output: an unpacked Electron runtime and a copy of
+    // the application. Thousands of files of somebody else's JavaScript, and
+    // it appears the moment anyone runs `npm run desktop:pack`.
+    "dist/**",
     "next-env.d.ts",
   ]),
 ]);

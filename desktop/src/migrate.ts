@@ -86,10 +86,25 @@ export function runMigrations(databaseFile: string, migrationsDir: string): Migr
   try {
     // WAL keeps a reader (the backup) from blocking the writer (the server),
     // and survives in the file itself, so this only really matters on the
-    // first launch. Foreign keys are off by default in SQLite and every
-    // cascade in the schema depends on them being on.
+    // first launch.
     database.pragma('journal_mode = WAL');
-    database.pragma('foreign_keys = ON');
+
+    // Foreign keys stay OFF while migrations run, and this is load-bearing
+    // rather than laziness.
+    //
+    // Prisma emits a "RedefineTables" migration for almost any column change
+    // on SQLite: create `new_users`, copy the rows across, `DROP TABLE users`,
+    // rename. With foreign keys enforced, that DROP fires `ON DELETE CASCADE`
+    // down every child table and takes the whole career with it. The migration
+    // opens with `PRAGMA foreign_keys=OFF`, but a pragma is a no-op inside a
+    // transaction — and we apply each migration in one — so the migration
+    // cannot protect itself here. Prisma's own engine survives this only
+    // because its connection has foreign keys off to begin with.
+    //
+    // better-sqlite3 opens connections with them ON, so turning them off has
+    // to happen here, outside any transaction, and they go back on below once
+    // every migration has been applied.
+    database.pragma('foreign_keys = OFF');
     database.exec(CREATE_MIGRATIONS_TABLE);
 
     const recorded = new Map<string, RecordedMigration>();
@@ -151,6 +166,10 @@ export function runMigrations(databaseFile: string, migrationsDir: string): Migr
         durationMs: Date.now() - startedAt,
       });
     }
+
+    // Every cascade in the schema depends on these being on, so the database
+    // is handed back to the application with them enforced.
+    database.pragma('foreign_keys = ON');
 
     return {
       databaseFile,

@@ -1,6 +1,7 @@
 # Endurance Racing Career Mode
 
-A permanent career record for watching endurance racing.
+A permanent career record for watching endurance racing, as a Windows
+application.
 
 It turns a personal viewing history — WEC, IMSA, ELMS, Asian Le Mans, GT World
 Challenge, the 24H Series, or any championship you invent — into something
@@ -25,33 +26,160 @@ back. Ready for another stint?"* and nothing else.
 
 ---
 
-## Running it
+## Installing it
 
-**Windows, the short way.** Install [Node.js](https://nodejs.org) (take the LTS
-installer), download this repository as a ZIP from the green *Code* button,
-unzip it, and double-click **`start.bat`**. That is the whole procedure. The
-first run installs and sets up; every run after that just opens the
-application.
+1. Open the **[Releases](../../releases)** page and download
+   **`Endurance Racing Career Setup <version>.exe`**.
+2. Run it. It installs for you alone, so there is no administrator prompt, and
+   you can choose where it goes. You get a Start-menu entry and a desktop
+   shortcut called *Endurance Racing Career*.
+3. Open it and make yourself an account. That is the whole setup.
 
-**Everywhere else**, or if you would rather see what is happening:
+Windows will probably show a blue *"Windows protected your PC"* box the first
+time, because the installer is not code-signed — a certificate costs a few
+hundred pounds a year and this is a personal project. Choose **More info** and
+then **Run anyway** if you are willing to; if you are not, that is an entirely
+reasonable place to stop.
+
+There is also a **portable** build on the same page —
+`Endurance Racing Career <version> portable.exe` — which runs without
+installing anything. It keeps your career in the same place the installed
+version does.
+
+Nothing about the application uses the internet. There is no account server, no
+sync, no telemetry, no update check. It works on a machine that has never been
+online.
+
+[docs/install.md](docs/install.md) is the longer version of all of this —
+backups, moving a career to another PC, and what to do when something does not
+work.
+
+### Your career, and where it lives
+
+```
+%APPDATA%\Endurance Racing Career\
+  data\endurance.db        your entire career, in one file
+  logs\main.log            what the application did on start-up
+  backups\                 where "Back up career…" suggests saving
+```
+
+Uninstalling deliberately does **not** delete that folder. Reinstall later and
+your history is still there.
+
+**Career → Back up career…** writes a copy wherever you like, safely, while the
+application is running. Copying `endurance.db` by hand while the application is
+open is not safe; use the menu, or close the application first.
+
+### More than one person, one PC
+
+The application opens on an account picker. Each account is a separate career —
+separate races, hours, XP, achievements, collections and statistics — and
+nothing is shared between them.
+
+An account can have a password, and it is worth being plain about what that
+password is for: it stops a housemate opening your career by clicking on it. It
+is not disk encryption. Anyone who can read the database file can read what is
+in it, password or no password. There is also no way to recover a password you
+have forgotten — no email, no reset, nothing to phone home to — so if you set
+one, set one you will remember.
+
+Accounts, passwords and everything else live on this machine only.
+
+### If the Releases page is empty
+
+The Windows `.exe` is built by GitHub Actions, on a `windows-latest` runner —
+there is no Windows machine in this project's development environment, so
+nobody can produce one by hand. To produce one:
+
+- **Actions → Windows desktop build → Run workflow**, which attaches the
+  installer and the portable build to that run as artefacts; or
+- push a tag that starts with `v` (`git tag v0.1.0 && git push origin v0.1.0`),
+  which does the same and also attaches them to a GitHub Release.
+
+The workflow is `.github/workflows/desktop-windows.yml`. Its steps, and why
+they have to run in that order, are in [docs/releasing.md](docs/releasing.md).
+
+### What has actually been tested
+
+Worth saying out loud, because "it builds" and "it works" are different claims:
+
+- The desktop shell — splash, migrations, server supervision, window, menu,
+  backup — has been built and run end to end on Linux.
+- The whole application has been **packaged with electron-builder and the
+  packaged binary driven through the real flows**: first run, creating an
+  account, adding a race, logging a stint and being paid the XP for it,
+  signing out, creating a second password-protected account, confirming it
+  cannot see the first account's races, a wrong password, a right one, and a
+  clean quit with no server process left behind. That is the Linux package of
+  exactly the code the Windows job builds.
+- The Windows installer is produced by the CI workflow above. At the time of
+  writing, no one had yet run the resulting `.exe` on a Windows machine — the
+  packaging itself is verified, the Windows-specific parts (NSIS, shortcuts,
+  SmartScreen) are not. If you are the first,
+  [docs/releasing.md](docs/releasing.md) lists what to check.
+- Nothing here is code-signed, so Windows will show a "Windows protected your
+  PC" warning on first run. It looks like a virus warning and is not one:
+  choose **More info → Run anyway**.
+
+---
+
+## Running it from the source
+
+You do not need any of this to use the application. It is here for working on
+it.
 
 ```bash
 npm install                       # also generates the database client
 cp .env.example .env              # the default value works as-is
-npm run db:migrate                # create the database
-npm run db:seed                   # an empty career, ready for real races
+npm run db:deploy                 # create the database
 npm run dev                       # http://localhost:3000
 ```
 
-There is nothing else to install. The database is SQLite — a single
-`endurance.db` file next to the code. No server to run, nothing in the
-background, and your whole viewing history is one file you can copy to back
-up or move to another machine.
+The first page you land on asks you to create an account, exactly as the
+desktop application does.
+
+If you would rather see the systems with data in them, `npm run db:seed:demo`
+adds a separate *Demo Driver* account with a demonstration career in it —
+eleven races, real coverage, a populated ledger. Add `-- --account "Your Name"`
+to put that career in an account you have already made instead, and
+`npm run db:unseed:demo` takes it away again.
+
+On Windows, **`start.bat`** does the same thing by double-click: it checks for
+Node, installs on first run, applies migrations and starts the development
+server in your browser. It is a fallback for working on the project without a
+terminal, not the way to use the application — the installer is.
+
+### The desktop shell, from a checkout
+
+```bash
+npm run desktop:build             # compile desktop/ -> desktop/out
+npm run desktop:dev               # Electron around `next dev`
+```
+
+`desktop:dev` uses the repository's own `endurance.db`, so it shows the same
+career `npm run dev` does. `npm run desktop:start` instead runs the built
+standalone server exactly as an installed copy does, down to running it under
+Electron rather than Node — so it needs the §1.2 build order first:
+
+```bash
+npm run desktop:rebuild     # better-sqlite3 for Electron's ABI
+npm run desktop:prepare     # next build + prepare-standalone
+npm run desktop:start
+npm rebuild better-sqlite3  # ...and back to Node's ABI for `npm test`
+```
+
+On Linux the application needs a display; in a container,
+`xvfb-run -a npm run desktop:dev`.
+
+One trap worth knowing before you hit it: `better-sqlite3` is a native module,
+and Electron and Node need it compiled differently. `npm run desktop:rebuild`
+builds it for Electron and stops `npm test` working; `npm rebuild
+better-sqlite3` puts it back. See [docs/releasing.md](docs/releasing.md).
 
 ### The other commands
 
 ```bash
-npm run test                      # the full suite
+npm test                          # the full suite
 npm run test:coverage             # with coverage
 npm run typecheck                 # tsc --noEmit
 npm run lint
@@ -62,7 +190,8 @@ npm run db:recompute              # rebuild every derived figure from source
 `db:recompute` is the safety net. Cached counters, career XP, mastery,
 achievements and collections are all *derived*; this rebuilds them from the
 watched intervals, the session log and the XP ledger. It is also how a
-re-balanced economy is applied to an existing career.
+re-balanced economy is applied to an existing career. With no arguments it
+rebuilds every account on the machine.
 
 ---
 
@@ -137,13 +266,18 @@ that every endurance race in existence is waiting to be watched.
 ## Architecture
 
 ```
+desktop/                  the Electron shell: window, menu, server supervision,
+                          migrations at start-up, backups. A separate program
+                          from the one below, and it imports nothing from it.
 src/
   app/                    Next.js App Router — pages and route handlers only
   components/
     ui/                   panels, timing bars, progress rings, controls
     races/                race cards, the timeline bar, the 24-hour clock
     dashboard/            the dashboard and system panels
+    accounts/             the picker, the cards, the sign-in prompt
   lib/
+    auth/                 passwords, sessions, accounts
     config/               every game-balance constant, in one place
     domain/               pure logic: intervals, playback, levels, periods
     engines/              budget, strategist, challenges, achievements,
@@ -154,7 +288,10 @@ src/
 tests/
   domain/                 pure logic
   engines/                the pure core of each engine
+  auth/                   passwords, sessions, accounts, account isolation
+  desktop/                the shell's testable parts
   integration/            against a real database
+  e2e/                    the whole application, driven through Electron
 ```
 
 Three rules keep it maintainable:
@@ -165,29 +302,37 @@ Three rules keep it maintainable:
    and curve parameter is there, which is what makes the economy
    re-balanceable later.
 3. **Every XP award is a ledger row.** Career XP is never a bare mutable
-   number — `XPTransaction.dedupeKey` is UNIQUE, which is what structurally
+   number — `XPTransaction.dedupeKey` is unique, which is what structurally
    prevents a one-shot bonus being granted twice however often an engine
    re-runs.
+
+A fourth rule arrived with accounts: **no page and no server action ever
+accepts a user id.** Both resolve one from the session, first, before they look
+at anything the browser sent. A race id or a session id that belongs to someone
+else reads as gone rather than as something to edit.
 
 Each engine that writes takes a transaction client and never opens its own, so
 one logged stint is one atomic write across every system it touches.
 
 ### Stack
 
-Next.js 16 · React 19 · TypeScript (strict) · Tailwind CSS 4 · SQLite ·
-Prisma 7 · Zod · Vitest
+Electron 38 · Next.js 16 · React 19 · TypeScript (strict) · Tailwind CSS 4 ·
+SQLite · Prisma 7 · Zod · Vitest
 
-SQLite rather than a database server, deliberately: this is a single-user
-application whose entire history lives on one machine, so a file next to the
-code is the right shape for it — nothing to install, nothing to keep running,
-and the whole career is one file you can copy.
+SQLite rather than a database server, deliberately: this is a desktop
+application whose whole history lives on one machine, so a single file is the
+right shape for it — nothing to install, nothing to keep running, and every
+account on the PC in one thing to back up. The application has been scoped by
+account in its schema since the first commit, which is why adding accounts
+needed columns and a session rather than a rewrite.
 
 ---
 
 ## Testing
 
-The suite concentrates on the places where an error would corrupt a career
-rather than on the places where one would look untidy:
+The suite concentrates on the places where an error would corrupt a career —
+or lock someone out of one — rather than on the places where one would look
+untidy:
 
 - watched-interval merging, overlap and subtraction
 - real time versus timeline time, at every playback speed
@@ -200,6 +345,12 @@ rather than on the places where one would look untidy:
 - season-pass tier curve and reward determinism
 - mastery metrics, including consecutive editions of a recurring event
 - collection completion against the user's own season definition
+- password hashing, including every way a stored record can be corrupt
+- sessions: expiry, sign-out, unknown tokens, and the cookie that must never
+  be marked `secure`
+- one account being unable to read or change another's races, stints or XP
+- the start-up migrations that turn an empty folder into a working database
+- window bounds being rejected when the monitor they were saved on is gone
 - end-to-end session logging against a real database
 
 Integration tests run against a real database rather than a fake, because
@@ -208,7 +359,21 @@ They use a separate file so a test run can never touch a real viewing history,
 and it is created automatically:
 
 ```bash
-npm run test
+npm test
+```
+
+The test database looks after itself. `tests/setup.ts` compares the migrations
+on disk against the ones the file records as applied and re-runs
+`db:deploy` when they disagree, so pulling a change that adds a migration
+needs nothing from you.
+
+`tests/e2e/desktop.mjs` drives the built desktop application itself — launching
+it, creating accounts, logging a stint and checking the XP. It needs a build and
+a display, so it is run deliberately rather than by `npm test`; the header of
+the file says how. It also runs against a packaged build:
+
+```bash
+xvfb-run -a node tests/e2e/desktop.mjs --app dist/linux-unpacked/endurance-racing-career
 ```
 
 ---

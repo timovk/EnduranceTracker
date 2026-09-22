@@ -24,10 +24,9 @@ const WEEKDAYS = [
 ];
 
 export function SettingsForm({
-  name, weekStart, annualBudgetHours, weeklyTargetHours, themeKey, raceCardKey,
+  weekStart, annualBudgetHours, weeklyTargetHours, themeKey, raceCardKey,
   titleKey, defaultPlaybackSpeed, themes, raceCards, titles, libraryCounts,
 }: {
-  name: string;
   weekStart: number;
   annualBudgetHours: number;
   weeklyTargetHours: number;
@@ -156,10 +155,6 @@ export function SettingsForm({
               </Select>
             </Field>
           </div>
-
-          <Field label="Your name">
-            <Input name="name" defaultValue={name} maxLength={60} />
-          </Field>
         </PanelBody>
       </Panel>
 

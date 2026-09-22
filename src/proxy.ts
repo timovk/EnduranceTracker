@@ -1,8 +1,15 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
+// A module with no imports of its own, precisely so the edge bundle stays
+// clear of the data layer.
+import { SESSION_COOKIE } from '@/lib/auth/cookie';
 
 /**
  * Route guard.
+ *
+ * Next 16 renamed the `middleware` file convention to `proxy`; this is the
+ * same thing under the name the framework now expects, and `next build` warns
+ * about the old one.
  *
  * This runs on the edge runtime, where Prisma cannot go, so it does exactly
  * one cheap thing: send a request carrying no session cookie to the account
@@ -12,17 +19,10 @@ import type { NextRequest } from 'next/server';
  * this only saves the user from watching a page render and then bounce.
  */
 
-/**
- * Kept in step with `SESSION_COOKIE` in src/lib/auth/session.ts by hand.
- * That module is server-only and reaches the database, so importing the
- * constant from it would drag the whole data layer into the edge bundle.
- */
-const SESSION_COOKIE = 'endurance_session';
-
 /** The paths that exist precisely because nobody is signed in yet. */
 const PUBLIC_PREFIXES = ['/accounts', '/welcome'];
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   if (isPublic(pathname)) return NextResponse.next();
   if (request.cookies.has(SESSION_COOKIE)) return NextResponse.next();

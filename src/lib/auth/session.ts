@@ -18,8 +18,9 @@ import { randomBytes } from 'node:crypto';
 import { cookies } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { prisma } from '@/lib/db/client';
+import { SESSION_COOKIE } from '@/lib/auth/cookie';
 
-export const SESSION_COOKIE = 'endurance_session';
+export { SESSION_COOKIE } from '@/lib/auth/cookie';
 
 /** Thirty days. Long, because being asked to sign in to your own PC is a chore. */
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -175,8 +176,16 @@ async function resolveSession(now: Date = new Date()) {
   }
 
   // Refreshing on every page load would turn a read into a write for no gain.
+  //
+  // `lastActiveAt` rides along on the same throttle. Writing it only at
+  // sign-in would be nearly useless: sessions last thirty days, so somebody
+  // who opens the application every morning would still be told on the picker
+  // that they last raced three weeks ago.
   if (now.getTime() - session.lastSeenAt.getTime() >= LAST_SEEN_INTERVAL_MS) {
-    await prisma.userSession.update({ where: { id: session.id }, data: { lastSeenAt: now } });
+    await prisma.$transaction([
+      prisma.userSession.update({ where: { id: session.id }, data: { lastSeenAt: now } }),
+      prisma.user.update({ where: { id: session.userId }, data: { lastActiveAt: now } }),
+    ]);
   }
 
   return session;

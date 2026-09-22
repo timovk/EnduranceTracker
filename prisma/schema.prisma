@@ -502,10 +502,16 @@ model XPTransaction {
   levelAfter    Int    @default(1)
 
   /// Structural guard against double-awarding. One-shot bonuses set this.
-  dedupeKey String? @unique
+  ///
+  /// Unique PER ACCOUNT, not globally: the keys for achievements, milestones
+  /// and the global mastery trees carry no user id, so a single global
+  /// constraint meant the second account to earn one was told it had earned
+  /// it and paid nothing.
+  dedupeKey String?
 
   createdAt DateTime @default(now())
 
+  @@unique([userId, dedupeKey])
   @@index([userId, createdAt])
   @@index([userId, source])
   @@map("xp_transactions")

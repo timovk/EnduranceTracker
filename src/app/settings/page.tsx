@@ -1,8 +1,10 @@
 import { PageHeader } from '@/components/layout/page-header';
 import { SettingsForm } from '@/components/dashboard/settings-form';
+import { AccountSettings } from '@/components/accounts/account-settings';
 import { Panel, PanelBody, PanelHeader } from '@/components/ui/primitives';
 import { prisma } from '@/lib/db/client';
 import { ensureCareer, ensureBudgetYearRow } from '@/lib/server/bootstrap';
+import { MAX_ACCOUNT_NAME_LENGTH, describeAccountLosses, getAccount } from '@/lib/auth/accounts';
 import { requireUserId } from '@/lib/auth/session';
 import { BUDGET_CONFIG, LEVEL_TITLES, RACE_CARD_STYLES, THEMES, XP_CONFIG, STORY_CONFIG, SEASON_PASS_CONFIG } from '@/lib/config';
 import { levelFromXp, titleForLevel } from '@/lib/domain/progression';
@@ -16,7 +18,7 @@ export default async function SettingsPage() {
   const year = new Date().getFullYear();
   await ensureBudgetYearRow(userId, year);
 
-  const [user, profile, budgetYear, speedOverride, counts] = await Promise.all([
+  const [user, profile, budgetYear, speedOverride, counts, account, losses] = await Promise.all([
     prisma.user.findUniqueOrThrow({ where: { id: userId } }),
     prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
     prisma.budgetYear.findUniqueOrThrow({ where: { userId_year: { userId, year } } }),
@@ -26,6 +28,8 @@ export default async function SettingsPage() {
       prisma.championship.count({ where: { userId } }),
       prisma.raceViewingSession.count({ where: { userId } }),
     ]),
+    getAccount(userId),
+    describeAccountLosses(userId),
   ]);
 
   const level = levelFromXp(Number(profile.careerXp)).level;
@@ -40,7 +44,6 @@ export default async function SettingsPage() {
       />
 
       <SettingsForm
-        name={user.name}
         weekStart={user.weekStart}
         annualBudgetHours={budgetYear.annualBudgetHours}
         weeklyTargetHours={budgetYear.weeklyTargetHours}
@@ -53,6 +56,17 @@ export default async function SettingsPage() {
         titles={unlockedTitles.map((t) => t.title)}
         libraryCounts={{ races: counts[0], championships: counts[1], sessions: counts[2] }}
       />
+
+      {account !== null && (
+        <AccountSettings
+          name={account.name}
+          avatarKey={account.avatarKey}
+          accentKey={account.accentKey}
+          hasPassword={account.hasPassword}
+          maxNameLength={MAX_ACCOUNT_NAME_LENGTH}
+          losses={losses ?? { races: 0, hours: 0, achievements: 0 }}
+        />
+      )}
 
       <Panel>
         <PanelHeader title="Progression economy" />

@@ -14,7 +14,7 @@
  */
 
 import { BrowserWindow, app, dialog, ipcMain, screen, shell } from 'electron';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { backUpCareer } from './backup';
 import { createLogger, describe, type Logger } from './log';
@@ -78,6 +78,26 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(boot, (error) => fail('The application could not start', error));
 }
 
+/**
+ * The version to show the user.
+ *
+ * `app.getVersion()` reads the package.json at the app path, which once
+ * installed is the asar and is right. Run from a checkout the app path is
+ * `desktop/out`, which has no package.json of its own, so Electron falls back
+ * to "0.0" — and the About box is the one place a wrong version is actively
+ * misleading. Fall back to the repository's own package.json instead.
+ */
+function applicationVersion(): string {
+  const reported = app.getVersion();
+  if (app.isPackaged || paths === null) return reported;
+  try {
+    const manifest = readFileSync(join(paths.repoRoot, 'package.json'), 'utf8');
+    return (JSON.parse(manifest) as { version?: string }).version ?? reported;
+  } catch {
+    return reported;
+  }
+}
+
 async function boot(): Promise<void> {
   try {
     paths = resolvePaths({
@@ -89,7 +109,7 @@ async function boot(): Promise<void> {
     for (const directory of directoriesToCreate(paths)) mkdirSync(directory, { recursive: true });
 
     logger = createLogger(paths.logFile, { mirrorToConsole: !app.isPackaged });
-    logger.info(`Endurance Racing Career ${app.getVersion()} starting (${paths.mode})`);
+    logger.info(`Endurance Racing Career ${applicationVersion()} starting (${paths.mode})`);
     logger.info(`database:   ${paths.databaseFile}`);
     logger.info(`migrations: ${paths.migrationsDir}`);
     logger.info(`server:     ${paths.server.entry}`);
@@ -283,7 +303,7 @@ function menuActions() {
       const options = {
         type: 'info' as const,
         title: 'About Endurance Racing Career',
-        message: `Endurance Racing Career ${app.getVersion()}`,
+        message: `Endurance Racing Career ${applicationVersion()}`,
         detail: [
           'Your career, kept on this machine and nowhere else.',
           '',

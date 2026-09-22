@@ -170,7 +170,16 @@ function resolveServer(mode: DesktopMode, repoRoot: string, resourcesPath: strin
       entry: join(appDir, 'server.js'),
       args: [],
       cwd: appDir,
-      electronAsNode: false,
+      // Electron-as-Node here too, and this is the whole point of the mode
+      // rather than a detail. The documented build order rebuilds
+      // `better-sqlite3` for Electron's ABI BEFORE `next build`, because the
+      // packaged child runs under `ELECTRON_RUN_AS_NODE=1` — so the
+      // `better_sqlite3.node` that `next build` traces into the standalone
+      // tree is an Electron binary. Launching that tree with plain Node gets
+      // `NODE_MODULE_VERSION 139 ... requires 127` on the first query, and
+      // what was meant to be a rehearsal of the installed application instead
+      // tests a combination that can never ship.
+      electronAsNode: true,
       nodeEnv: 'production',
     };
   }

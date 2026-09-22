@@ -2,6 +2,8 @@
   "name": "endurance-racing-career",
   "version": "0.1.0",
   "private": true,
+  "description": "A career mode for watching endurance racing — your library, your hours, your record.",
+  "author": "Endurance Racing Career",
   "main": "desktop/out/main.js",
   "engines": {
     "node": ">=20.9.0"
@@ -20,6 +22,9 @@
     "desktop:start": "npm run desktop:build && electron desktop/out/main.js --standalone",
     "desktop:rebuild": "electron-rebuild -f -w better-sqlite3",
     "desktop:prepare": "next build && node scripts/desktop/prepare-standalone.mjs",
+    "desktop:icon": "node scripts/desktop/make-icon.mjs",
+    "desktop:pack": "npm run desktop:rebuild && npm run desktop:build && npm run desktop:prepare && electron-builder --linux dir --publish never",
+    "dist:win": "npm run db:generate && npm run desktop:rebuild && npm run desktop:build && npm run desktop:prepare && electron-builder --win nsis portable --x64 --publish never",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",

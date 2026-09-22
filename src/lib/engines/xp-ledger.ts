@@ -6,9 +6,10 @@
  * rebuilt from the ledger at any time (`recalculateCareerXp`). This is what
  * makes progression auditable, and what lets a re-balance be replayed.
  *
- * `dedupeKey` is the structural guard against double-awarding: it is UNIQUE in
- * the database, so a one-shot bonus physically cannot be granted twice, no
- * matter how many times an engine is re-run.
+ * `dedupeKey` is the structural guard against double-awarding: it is UNIQUE
+ * per account in the database, so a one-shot bonus physically cannot be
+ * granted twice to the same account, no matter how many times an engine is
+ * re-run — while a second account can still earn it for the first time.
  */
 
 import type { Tx } from '@/lib/db/client';
@@ -59,8 +60,11 @@ export async function awardXp(tx: Tx, userId: string, award: XpAward): Promise<X
   const seasonAmount = Math.max(0, Math.round(award.seasonAmount ?? 0));
 
   if (award.dedupeKey) {
-    const existing = await tx.xPTransaction.findUnique({
-      where: { dedupeKey: award.dedupeKey },
+    // Scoped by account. The key is unique per user, not globally — an
+    // achievement key carries no user id, so an unscoped lookup would report
+    // the SECOND account's first unlock as a duplicate and pay it nothing.
+    const existing = await tx.xPTransaction.findFirst({
+      where: { userId, dedupeKey: award.dedupeKey },
       select: { id: true },
     });
     if (existing) {
@@ -190,17 +194,18 @@ export async function revokeSessionXp(tx: Tx, userId: string, sessionId: string)
  * Remove a one-shot award by its dedupe key.
  *
  * Deleting the row is what frees the key. That matters more than the XP: the
- * key is UNIQUE, so a bonus whose row outlives the thing it was awarded for
+ * key is unique within the account, so a bonus whose row outlives the thing it
+ * was awarded for
  * can never be earned again — the next attempt is silently swallowed as a
  * duplicate. Removing it together with the condition keeps "the bonus exists
  * exactly when the thing is true" an invariant rather than a hope.
  */
 export async function revokeXpByDedupeKey(tx: Tx, userId: string, dedupeKey: string): Promise<XpRevocation> {
-  const row = await tx.xPTransaction.findUnique({
-    where: { dedupeKey },
-    select: { id: true, userId: true, amount: true, seasonAmount: true },
+  const row = await tx.xPTransaction.findFirst({
+    where: { userId, dedupeKey },
+    select: { id: true, amount: true, seasonAmount: true },
   });
-  if (!row || row.userId !== userId) return NOTHING_REVOKED;
+  if (!row) return NOTHING_REVOKED;
 
   await tx.xPTransaction.delete({ where: { id: row.id } });
 

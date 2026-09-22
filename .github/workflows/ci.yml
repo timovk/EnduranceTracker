@@ -1,0 +1,64 @@
+# The check that runs on everything.
+#
+# The Windows installer is built rarely and only from a tag. This job runs on
+# every push, so that the desktop work and the accounts work stay honest in
+# between — including compiling the desktop shell, which is the code that
+# becomes the .exe and which the Next build never touches.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # `.env.test` is not in the repository. tests/setup.ts creates and
+      # migrates this file on the first run, so a clean checkout needs nothing
+      # else — the same promise the README makes to a new contributor.
+      DATABASE_URL: file:./endurance-test.db
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate the Prisma client
+        run: npm run db:generate
+
+      # tsc --noEmit over the whole repository covers desktop/src as source,
+      # but not as CommonJS. This is the compile that actually produces
+      # desktop/out, under desktop/tsconfig.json and noEmitOnError.
+      - name: Compile the desktop shell
+        run: npm run desktop:build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test

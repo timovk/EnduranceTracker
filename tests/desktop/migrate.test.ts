@@ -292,6 +292,76 @@ describe('applying them again', () => {
   });
 });
 
+describe('a migration that rebuilds a table', () => {
+  /**
+   * The regression test for a way to lose an entire career in one launch.
+   *
+   * Prisma emits a "RedefineTables" migration for almost any column change on
+   * SQLite: build `new_parent`, copy the rows, `DROP TABLE parent`, rename.
+   * With foreign keys enforced, that DROP fires `ON DELETE CASCADE` down every
+   * child table — so the upgrade that was meant to add a column silently takes
+   * the races, the stints and the XP with it. The migration opens with
+   * `PRAGMA foreign_keys=OFF`, but a pragma is a no-op inside a transaction
+   * and the runner applies each migration in one, so the SQL cannot save
+   * itself. The runner has to turn them off around the whole operation.
+   *
+   * The shape below is the shape Prisma writes, and the assertion is simply
+   * that the child row is still there afterwards.
+   */
+  it('keeps the rows in every child table', () => {
+    const file = freshDatabase();
+    mkdirSync(join(file, '..'), { recursive: true });
+
+    const seeded = new Database(file);
+    seeded.exec(`
+      CREATE TABLE "parents" ("id" TEXT PRIMARY KEY NOT NULL, "name" TEXT NOT NULL);
+      CREATE TABLE "children" (
+        "id" TEXT PRIMARY KEY NOT NULL,
+        "parentId" TEXT NOT NULL,
+        CONSTRAINT "children_parentId_fkey" FOREIGN KEY ("parentId")
+          REFERENCES "parents" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+      );
+      INSERT INTO "parents" ("id", "name") VALUES ('p1', 'Driver');
+      INSERT INTO "children" ("id", "parentId") VALUES ('c1', 'p1');
+    `);
+    seeded.close();
+
+    const redefine = join(scratch, `redefine-${counter}`);
+    mkdirSync(join(redefine, '20260101000000_redefine'), { recursive: true });
+    writeFileSync(
+      join(redefine, '20260101000000_redefine', 'migration.sql'),
+      `-- RedefineTables
+PRAGMA defer_foreign_keys=ON;
+PRAGMA foreign_keys=OFF;
+CREATE TABLE "new_parents" (
+  "id" TEXT PRIMARY KEY NOT NULL,
+  "name" TEXT NOT NULL,
+  "avatarKey" TEXT NOT NULL DEFAULT 'helmet'
+);
+INSERT INTO "new_parents" ("id", "name") SELECT "id", "name" FROM "parents";
+DROP TABLE "parents";
+ALTER TABLE "new_parents" RENAME TO "parents";
+PRAGMA foreign_keys=ON;
+PRAGMA defer_foreign_keys=OFF;
+`,
+      'utf8',
+    );
+
+    runMigrations(file, redefine);
+
+    const after = new Database(file, { readonly: true });
+    const children = (after.prepare('SELECT COUNT(*) AS n FROM "children"').get() as { n: number }).n;
+    const parents = (after.prepare('SELECT COUNT(*) AS n FROM "parents"').get() as { n: number }).n;
+    // And the runner must hand the database back with them enforced again.
+    const violations = after.pragma('foreign_key_check') as unknown[];
+    after.close();
+
+    expect(parents).toBe(1);
+    expect(children).toBe(1);
+    expect(violations).toEqual([]);
+  });
+});
+
 describe('when the database and the shipped migrations disagree', () => {
   it('reports a changed migration instead of re-running it', () => {
     // Not fatal — refusing to open somebody's career at this point would help

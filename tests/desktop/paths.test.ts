@@ -125,7 +125,15 @@ describe('a checkout rehearsing the packaged server', () => {
     expect(paths.server.entry).toBe(join(REPO, '.next', 'standalone', 'server.js'));
     expect(paths.server.cwd).toBe(join(REPO, '.next', 'standalone'));
     expect(paths.server.nodeEnv).toBe('production');
-    expect(paths.server.electronAsNode).toBe(false);
+  });
+
+  it('runs the standalone tree the same way the installed application does', () => {
+    // Not a detail. The build order rebuilds `better-sqlite3` for Electron's
+    // ABI before `next build`, so the `better_sqlite3.node` traced into the
+    // standalone tree is an Electron binary. Spawning that tree with plain
+    // Node fails on the first query with a NODE_MODULE_VERSION mismatch — a
+    // rehearsal of a combination that can never ship.
+    expect(paths.server.electronAsNode).toBe(true);
   });
 
   it('keeps its career in the user data folder, like the installed app', () => {
@@ -135,19 +143,25 @@ describe('a checkout rehearsing the packaged server', () => {
 });
 
 describe('reading the launch switch', () => {
+  /** A process environment, with the fields Next's types insist on. */
+  const env = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    NODE_ENV: 'test',
+    ...extra,
+  });
+
   it('accepts it on the command line or in the environment', () => {
     // `npm run` cannot set an environment variable in a way that works on both
     // Windows and everything else, so both are accepted.
-    expect(environmentFlags(['electron', '.', '--standalone'], {}).useStandalone).toBe(true);
-    expect(environmentFlags(['electron', '.'], { ENDURANCE_DESKTOP_STANDALONE: '1' }).useStandalone).toBe(
-      true,
-    );
+    expect(environmentFlags(['electron', '.', '--standalone'], env()).useStandalone).toBe(true);
+    expect(
+      environmentFlags(['electron', '.'], env({ ENDURANCE_DESKTOP_STANDALONE: '1' })).useStandalone,
+    ).toBe(true);
   });
 
   it('defaults to the dev server', () => {
-    expect(environmentFlags(['electron', '.'], {}).useStandalone).toBe(false);
-    expect(environmentFlags(['electron', '.'], { ENDURANCE_DESKTOP_STANDALONE: '0' }).useStandalone).toBe(
-      false,
-    );
+    expect(environmentFlags(['electron', '.'], env()).useStandalone).toBe(false);
+    expect(
+      environmentFlags(['electron', '.'], env({ ENDURANCE_DESKTOP_STANDALONE: '0' })).useStandalone,
+    ).toBe(false);
   });
 });

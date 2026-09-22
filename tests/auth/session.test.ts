@@ -74,7 +74,7 @@ async function resetAccounts(): Promise<void> {
       name: 'Session Test Alex',
       avatarKey: 'stopwatch',
       accentKey: 'crimson',
-      careerProfile: { create: { level: 12, careerXp: 48_500n, titleKey: 'Stint Specialist' } },
+      careerProfile: { create: { level: 12, careerXp: BigInt(48_500), titleKey: 'Stint Specialist' } },
     },
   });
   await prisma.user.create({
