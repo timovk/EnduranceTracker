@@ -1,0 +1,214 @@
+@import "tailwindcss";
+
+/* ===========================================================================
+   Endurance Racing Career Mode — visual language
+
+   The reference points are modern WEC timing graphics, Le Mans broadcast
+   design and race-control interfaces: a very dark graphite field, off-white
+   type, restrained championship accents, and large tabular numerals doing the
+   talking. Deliberately not a neon gaming UI.
+   =========================================================================== */
+
+@theme {
+  /* -- Surfaces ---------------------------------------------------------- */
+  --color-void: #06080a;
+  --color-base: #0b0e12;
+  --color-panel: #12171e;
+  --color-panel-2: #182028;
+  --color-panel-3: #212b36;
+  --color-hairline: #222c37;
+  --color-hairline-strong: #31404e;
+
+  /* -- Type -------------------------------------------------------------- */
+  --color-ink: #e9edf1;
+  --color-ink-muted: #94a3b1;
+  --color-ink-dim: #64717e;
+  --color-ink-faint: #47525d;
+
+  /* -- Accents (restrained, championship-style) -------------------------- */
+  --color-gold: #c8a45c;
+  --color-gold-dim: #8a713c;
+  --color-azure: #4f8fd0;
+  --color-verde: #3fa06b;
+  --color-amber: #d9a13a;
+  --color-signal: #c0504d;
+  --color-violet: #8f6fc0;
+  --color-rust: #d97a3a;
+
+  /* -- Rarity ------------------------------------------------------------ */
+  --color-rarity-common: #8b98a5;
+  --color-rarity-uncommon: #5aa06b;
+  --color-rarity-rare: #4f8fd0;
+  --color-rarity-epic: #8f6fc0;
+  --color-rarity-legendary: #c8a45c;
+  --color-rarity-mythic: #d9603a;
+
+  /* -- Type scale -------------------------------------------------------- */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+
+  --text-timing: 2.75rem;
+  --text-timing--line-height: 1;
+  --text-timing--letter-spacing: -0.03em;
+  --text-timing--font-weight: 600;
+
+  --text-timing-lg: 4.25rem;
+  --text-timing-lg--line-height: 0.92;
+  --text-timing-lg--letter-spacing: -0.04em;
+  --text-timing-lg--font-weight: 600;
+
+  --text-label: 0.6875rem;
+  --text-label--line-height: 1.2;
+  --text-label--letter-spacing: 0.14em;
+  --text-label--font-weight: 600;
+
+  /* -- Motion ------------------------------------------------------------ */
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-sweep: sweep 1.8s var(--ease-out-quint) infinite;
+  --animate-rise: rise 0.42s var(--ease-out-quint) both;
+  --animate-fade: fade 0.3s ease both;
+  --animate-pulse-soft: pulse-soft 2.4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* ---------------------------------------------------------------------------
+   Theme accent. Themes are a cosmetic season-pass reward; they only ever
+   change the accent colour, never the information architecture.
+   --------------------------------------------------------------------------- */
+:root {
+  --accent: var(--color-gold);
+  --accent-soft: color-mix(in oklab, var(--color-gold) 16%, transparent);
+  color-scheme: dark;
+}
+[data-theme="midnight"]    { --accent: var(--color-azure);  --accent-soft: color-mix(in oklab, #4f8fd0 16%, transparent); }
+[data-theme="sarthe"]      { --accent: var(--color-verde);  --accent-soft: color-mix(in oklab, #3fa06b 16%, transparent); }
+[data-theme="daytona"]     { --accent: var(--color-rust);   --accent-soft: color-mix(in oklab, #d97a3a 16%, transparent); }
+[data-theme="nordschleife"]{ --accent: #7f9f4f;             --accent-soft: color-mix(in oklab, #7f9f4f 16%, transparent); }
+
+html, body {
+  background: var(--color-base);
+  color: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  /* A barely-there vertical gradient, like a broadcast lower-third backdrop. */
+  background-image:
+    radial-gradient(1200px 600px at 50% -10%, rgba(80, 110, 150, 0.07), transparent 70%),
+    linear-gradient(180deg, #0c1015 0%, #0b0e12 40%, #090c0f 100%);
+  background-attachment: fixed;
+}
+
+/* Tabular numerals everywhere a number is a measurement, not prose. */
+.tnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+/* ---------------------------------------------------------------------------
+   Component primitives used across the application.
+   --------------------------------------------------------------------------- */
+@layer components {
+  /* A graphite panel — the basic unit of the interface. */
+  .panel {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0) 120px),
+      var(--color-panel);
+    border: 1px solid var(--color-hairline);
+    border-radius: 0.625rem;
+  }
+
+  .panel-raised {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 100px),
+      var(--color-panel-2);
+    border: 1px solid var(--color-hairline-strong);
+    border-radius: 0.625rem;
+  }
+
+  /* Small all-caps label, as used above every value on a timing screen. */
+  .label {
+    font-size: var(--text-label);
+    line-height: 1.2;
+    letter-spacing: 0.14em;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--color-ink-dim);
+  }
+
+  /* The big numbers. */
+  .timing {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.03em;
+    font-weight: 600;
+  }
+
+  /* A sector-striped divider, borrowed from timing graphics. */
+  .sector-rule {
+    height: 2px;
+    background: repeating-linear-gradient(
+      90deg,
+      var(--color-hairline-strong) 0 18px,
+      transparent 18px 24px
+    );
+  }
+
+  /* Shimmer used on loading skeletons. */
+  .skeleton {
+    position: relative;
+    overflow: hidden;
+    background: var(--color-panel-2);
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+    animation: var(--animate-sweep);
+  }
+}
+
+/* Scrollbars that match the instrument-panel feel. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-hairline-strong) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--color-hairline-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background-color: #43525f; background-clip: content-box; }
+
+::selection { background: color-mix(in oklab, var(--accent) 35%, transparent); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

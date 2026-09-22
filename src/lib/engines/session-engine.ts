@@ -1,0 +1,470 @@
+/**
+ * The session engine — the one write path that matters.
+ *
+ * Logging a stint is the central action of the application, and it has to be
+ * ATOMIC: the raw session, the merged coverage, the cached aggregates, the XP
+ * ledger, momentum, challenges, achievements, milestones, mastery,
+ * collections, the season pass and the awards all move together or not at all.
+ * Everything below therefore runs inside a single interactive transaction, and
+ * every engine it calls takes that transaction client.
+ *
+ * The result is a `SessionOutcome`, which is exactly what the stint summary
+ * screen renders — because every session matters, including a short one.
+ */
+
+import type { Tx } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
+import { STORY_CONFIG, XP_CONFIG, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
+import { addInterval, coverageSeconds, fromRows } from '@/lib/domain/intervals';
+import { clampSpeed, realSecondsFor, timelineSecondsFor } from '@/lib/domain/playback';
+import { storyCompleteBonus, xpForSession } from '@/lib/domain/progression';
+import { stintHeading } from '@/lib/copy/tone';
+import type { SessionInput } from '@/lib/validation/schemas';
+import type { SessionOutcome } from './contracts';
+import { awardXp } from './xp-ledger';
+import { computeCareerMetrics } from './metrics';
+import { recomputeRaceAggregates } from './race-engine';
+
+import { applyMomentumForSession, updateStreak } from './momentum-engine';
+import { addSeasonXp, getOrCreateCurrentPass } from './season-pass-engine';
+import { evaluateChallenges } from './challenge-engine';
+import { syncAchievements, syncMilestones } from './achievement-engine';
+import { ensureMasteryTrees, syncMastery, recomputeRaceMasteries, getMasteryForChampionship } from './mastery-engine';
+import { ensureSeasonCollections, syncCollections } from './collection-engine';
+import { syncAwards } from './awards-engine';
+import { recordedHoursInRange, getBudgetSnapshot } from './budget-engine';
+
+/**
+ * Prisma's default interactive-transaction timeout is far too short for this
+ * much orchestration. These are generous on purpose: correctness of a single
+ * logged session beats shaving milliseconds off it.
+ */
+const TRANSACTION_OPTIONS = { maxWait: 15_000, timeout: 60_000 } as const;
+
+/**
+ * Resolve the stint's timeline window from either input mode.
+ *
+ * RANGE:    the user knows where they stopped — `02:47:31` — and the real time
+ *           spent follows from the playback speed.
+ * DURATION: the user knows how long they sat there, and the end position
+ *           follows from the speed instead.
+ */
+export function resolveSessionWindow(
+  input: Pick<SessionInput, 'mode' | 'startTimestamp' | 'endTimestamp' | 'realMinutes' | 'playbackSpeed'>,
+  runtimeSec: number,
+): { startSec: number; endSec: number; timelineSeconds: number; realSeconds: number; playbackSpeed: number } {
+  const playbackSpeed = clampSpeed(input.playbackSpeed);
+  const startSec = Math.max(0, Math.min(Math.round(input.startTimestamp), runtimeSec));
+
+  let endSec: number;
+  if (input.mode === 'DURATION') {
+    const realSeconds = Math.round((input.realMinutes ?? 0) * 60);
+    endSec = Math.min(runtimeSec, startSec + timelineSecondsFor(realSeconds, playbackSpeed));
+  } else {
+    endSec = Math.max(startSec, Math.min(Math.round(input.endTimestamp ?? startSec), runtimeSec));
+  }
+
+  const timelineSeconds = Math.max(0, endSec - startSec);
+  return {
+    startSec,
+    endSec,
+    timelineSeconds,
+    // Real time always follows from the timeline actually covered, so a stint
+    // clipped at the end of the race does not bill for time never spent.
+    realSeconds: realSecondsFor(timelineSeconds, playbackSpeed),
+    playbackSpeed,
+  };
+}
+
+export async function logViewingSession(
+  userId: string,
+  input: SessionInput,
+  now: Date = new Date(),
+): Promise<SessionOutcome> {
+  const watchedAt = input.watchedAt ?? now;
+
+  return prisma.$transaction(async (tx) => {
+    const db = tx as Tx;
+
+    // -- 1. The race, and where we already are in it -----------------------
+    const race = await db.race.findFirstOrThrow({
+      where: { id: input.raceId, userId },
+      select: {
+        id: true, name: true, runtimeSec: true, isMajorEvent: true, storyCompletedAt: true,
+        championshipId: true, seasonId: true,
+        championship: { select: { id: true, name: true } },
+      },
+    });
+
+    const existingRows = await db.watchedInterval.findMany({
+      where: { raceId: race.id },
+      select: { startSec: true, endSec: true },
+    });
+    const existing = fromRows(existingRows);
+    const coverageBefore = coverageSeconds(existing);
+
+    const window = resolveSessionWindow(input, race.runtimeSec);
+
+    // -- 2. Merge the new interval into the canonical coverage -------------
+    //
+    // `addedSeconds` is the timeline that had never been watched before. This
+    // is the number that keeps re-watching honest: it increases real viewing
+    // statistics without increasing unique completion twice.
+    const { intervals: mergedIntervals, addedSeconds } = addInterval(existing, {
+      start: window.startSec,
+      end: window.endSec,
+    }, { limit: race.runtimeSec, gapTolerance: STORY_CONFIG.gapToleranceSeconds });
+
+    const session = await db.raceViewingSession.create({
+      data: {
+        raceId: race.id,
+        userId,
+        startTimestampSec: window.startSec,
+        endTimestampSec: window.endSec,
+        playbackSpeed: window.playbackSpeed,
+        timelineSeconds: window.timelineSeconds,
+        realSeconds: window.realSeconds,
+        newCoverageSeconds: addedSeconds,
+        coverageBeforeSec: coverageBefore,
+        coverageAfterSec: coverageSeconds(mergedIntervals),
+        watchedAt,
+        note: input.note ?? null,
+      },
+      select: { id: true },
+    });
+
+    // The merged set is rewritten wholesale — it is a derived set, not a log.
+    // The append-only log is `RaceViewingSession`, which is never rewritten.
+    await db.watchedInterval.deleteMany({ where: { raceId: race.id } });
+    if (mergedIntervals.length > 0) {
+      await db.watchedInterval.createMany({
+        data: mergedIntervals.map((interval) => ({
+          raceId: race.id,
+          startSec: interval.start,
+          endSec: interval.end,
+          sessionId: session.id,
+        })),
+      });
+    }
+
+    // -- 3. Rebuild the race's cached aggregates ---------------------------
+    const aggregates = await recomputeRaceAggregates(db, race.id, now);
+
+    // -- 4. XP for the stint ----------------------------------------------
+    const profileBefore = await db.careerProfile.findUniqueOrThrow({ where: { userId } });
+    const levelBefore = profileBefore.level;
+
+    const sessionXp = xpForSession({
+      timelineSeconds: window.timelineSeconds,
+      newCoverageSeconds: addedSeconds,
+      playbackSpeed: window.playbackSpeed,
+    });
+
+    const xpBreakdown: { label: string; amount: number }[] = [];
+    let careerXpAwarded = 0;
+    let seasonXpAwarded = 0;
+
+    if (sessionXp.careerXp > 0) {
+      const viewing = await awardXp(db, userId, {
+        source: addedSeconds > 0 ? 'VIEWING' : 'REWATCH',
+        amount: sessionXp.careerXp,
+        seasonAmount: sessionXp.seasonXp,
+        description: addedSeconds > 0 ? 'Viewing time' : 'Re-watched section',
+        sourceRef: race.id,
+        sessionId: session.id,
+        // Deliberately no dedupeKey: viewing XP is bounded by the session it
+        // belongs to, and each logged stint is its own row.
+      });
+      careerXpAwarded += viewing.granted;
+      seasonXpAwarded += sessionXp.seasonXp;
+      xpBreakdown.push({ label: addedSeconds > 0 ? 'Viewing time' : 'Re-watch', amount: viewing.granted });
+    }
+
+    // -- 5. Story Complete -------------------------------------------------
+    let storyBonusAwarded = 0;
+    if (aggregates.becameStoryComplete) {
+      const bonus = storyCompleteBonus(race.runtimeSec, race.isMajorEvent);
+      const award = await awardXp(db, userId, {
+        source: 'STORY_COMPLETE',
+        amount: bonus.careerXp,
+        seasonAmount: bonus.seasonXp,
+        description: `Story Complete — ${race.name}`,
+        sourceRef: race.id,
+        sessionId: session.id,
+        // One-shot: the unique dedupeKey is what makes this structurally
+        // impossible to award twice, however often the engine re-runs.
+        dedupeKey: `story-complete:${race.id}`,
+      });
+      storyBonusAwarded = award.granted;
+      careerXpAwarded += award.granted;
+      seasonXpAwarded += award.duplicate ? 0 : bonus.seasonXp;
+      if (award.granted > 0) {
+        xpBreakdown.push({ label: `Story Complete (${bonus.label})`, amount: award.granted });
+      }
+    }
+
+    // -- 6. Momentum and streaks ------------------------------------------
+    const momentum = await applyMomentumForSession(db, userId, window.realSeconds, now);
+    const streak = await updateStreak(db, userId, watchedAt);
+
+    // -- 7. Structures that may have grown since the last session ----------
+    await ensureMasteryTrees(db, userId, now);
+    await ensureSeasonCollections(db, userId, now);
+    await recomputeRaceMasteries(db, userId, now);
+
+    // -- 8. Collections, mastery, challenges -------------------------------
+    const collections = await syncCollections(db, userId, now);
+    for (const completed of collections.completedCollections) {
+      if (completed.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Season Complete — ${completed.name}`, amount: completed.xpAwarded });
+        careerXpAwarded += completed.xpAwarded;
+      }
+    }
+
+    const mastery = await syncMastery(db, userId, now);
+    for (const node of mastery) {
+      if (node.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Mastery — ${node.nodeName}`, amount: node.xpAwarded });
+        careerXpAwarded += node.xpAwarded;
+      }
+    }
+
+    const challenges = await evaluateChallenges(db, userId, now);
+    for (const challenge of challenges) {
+      if (challenge.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Challenge — ${challenge.title}`, amount: challenge.xpAwarded });
+        careerXpAwarded += challenge.xpAwarded;
+      }
+      seasonXpAwarded += challenge.seasonXpAwarded;
+    }
+
+    // -- 9. Achievements and milestones ------------------------------------
+    //
+    // Metrics are read through the TRANSACTION client so they include the
+    // session that was just written.
+    const metrics = await computeCareerMetrics(userId, db);
+    const achievements = await syncAchievements(db, userId, metrics, now);
+    for (const achievement of achievements) {
+      if (achievement.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Achievement — ${achievement.name}`, amount: achievement.xpAwarded });
+        careerXpAwarded += achievement.xpAwarded;
+      }
+    }
+
+    const milestones = await syncMilestones(db, userId, metrics, now);
+    for (const milestone of milestones) {
+      if (milestone.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Milestone — ${milestone.label}`, amount: milestone.xpAwarded });
+        careerXpAwarded += milestone.xpAwarded;
+      }
+    }
+
+    // -- 10. Season pass ---------------------------------------------------
+    //
+    // Momentum's bonus applies to the quarterly currency only. It can never
+    // make permanent career progression easier.
+    await getOrCreateCurrentPass(db, userId, now);
+    const boostedSeasonXp = Math.round(seasonXpAwarded * (1 + momentum.seasonXpBonus));
+    const seasonPassTiers = await addSeasonXp(db, userId, boostedSeasonXp, now, {
+      description: `Stint — ${race.name}`,
+      sourceRef: race.id,
+    });
+
+    // -- 11. Trophies and the Hall of Fame ---------------------------------
+    const profileAfter = await db.careerProfile.findUniqueOrThrow({ where: { userId } });
+    // Metrics are reused rather than recomputed: `computeCareerMetrics` is
+    // eight queries, and the only figures that moved since it ran are ones we
+    // already know exactly. Re-querying inside an open transaction to learn
+    // numbers we are holding would be a waste of a long lock.
+    const metricsAfter = {
+      ...metrics,
+      achievementsUnlocked: metrics.achievementsUnlocked + achievements.length,
+      masteryNodesUnlocked: metrics.masteryNodesUnlocked + mastery.length,
+      level: profileAfter.level,
+      prestige: profileAfter.prestige,
+      careerXp: Number(profileAfter.careerXp),
+      careerXpMillions: Math.round((Number(profileAfter.careerXp) / 1_000_000) * 100) / 100,
+    };
+
+    const awards = await syncAwards(
+      db,
+      userId,
+      {
+        metrics: metricsAfter,
+        storyCompletedRace: aggregates.becameStoryComplete
+          ? { id: race.id, name: race.name, runtimeSec: race.runtimeSec, isMajorEvent: race.isMajorEvent }
+          : undefined,
+        completedCollections: collections.completedCollections,
+        masteryUnlocks: mastery,
+        achievementUnlocks: achievements,
+        levelAfter: profileAfter.level,
+        levelsGained: profileAfter.level - levelBefore,
+        prestigeGained: profileAfter.prestige - profileBefore.prestige,
+        seasonPassCompleted: seasonPassTiers.some((t) => t.tier >= 100),
+      },
+      now,
+    );
+
+    // -- 12. Assemble the stint summary ------------------------------------
+    const championshipMastery = race.championshipId
+      ? await getMasteryForChampionship(userId, race.championshipId).catch(() => null)
+      : null;
+
+    const runtime = Math.max(1, race.runtimeSec);
+    const realMinutes = window.realSeconds / 60;
+
+    return {
+      sessionId: session.id,
+      raceId: race.id,
+      raceName: race.name,
+
+      realSeconds: window.realSeconds,
+      timelineSeconds: window.timelineSeconds,
+      newCoverageSeconds: addedSeconds,
+      playbackSpeed: window.playbackSpeed,
+
+      coverageBeforePercent: Math.round((coverageBefore / runtime) * 1000) / 10,
+      coverageAfterPercent: Math.round((aggregates.coverageSec / runtime) * 1000) / 10,
+
+      careerXpAwarded,
+      seasonXpAwarded: boostedSeasonXp,
+      xpBreakdown,
+
+      levelBefore,
+      levelAfter: profileAfter.level,
+      levelsGained: profileAfter.level - levelBefore,
+      newTitle: profileAfter.level > levelBefore ? profileAfter.titleKey : null,
+      prestigeGained: profileAfter.prestige - profileBefore.prestige,
+
+      storyCompleted: aggregates.becameStoryComplete,
+      storyCompleteBonus: storyBonusAwarded,
+
+      achievements,
+      milestones,
+      mastery,
+      challenges,
+      seasonPassTiers,
+      collections,
+      trophies: awards.trophies,
+      hallOfFame: awards.hallOfFame,
+
+      momentum,
+      streak,
+
+      weekActualHours: 0,
+      weekRecommendedHours: 0,
+
+      championshipMastery: championshipMastery
+        ? { name: championshipMastery.name, percent: championshipMastery.completionPercent }
+        : null,
+
+      heading: stintHeading(realMinutes),
+      celebrate: chooseCelebration({
+        storyCompleted: aggregates.becameStoryComplete,
+        runtimeSec: race.runtimeSec,
+        seasonCompleted: collections.completedCollections.length > 0,
+        masteryTreeCompleted: mastery.some((m) => m.treeCompleted),
+        prestigeGained: profileAfter.prestige - profileBefore.prestige,
+        rareUnlock: achievements.some((a) => a.rarity === 'LEGENDARY' || a.rarity === 'MYTHIC'),
+        levelsGained: profileAfter.level - levelBefore,
+      }),
+    } satisfies SessionOutcome;
+  }, TRANSACTION_OPTIONS).then(async (outcome) => {
+    // The weekly budget figures are read outside the transaction: they are
+    // presentation, not progression, and keeping them out keeps the atomic
+    // section as small as it can be.
+    const budget = await getBudgetSnapshot(userId, now).catch(() => null);
+    return budget
+      ? { ...outcome, weekActualHours: budget.weekActualHours, weekRecommendedHours: budget.weekRecommendedHours }
+      : outcome;
+  });
+}
+
+/**
+ * Decide how loudly to celebrate.
+ *
+ * Ordinary stints get a quiet, satisfying panel. The full-screen treatment is
+ * reserved for the genuinely rare: a completed 24-hour race, a finished
+ * season, a completed mastery tree, a prestige rank. Over-celebrating an
+ * ordinary session is what turns a hobby into a slot machine.
+ */
+export function chooseCelebration(facts: {
+  storyCompleted: boolean;
+  runtimeSec: number;
+  seasonCompleted: boolean;
+  masteryTreeCompleted: boolean;
+  prestigeGained: number;
+  rareUnlock: boolean;
+  levelsGained: number;
+}): 'QUIET' | 'NOTABLE' | 'SPECTACULAR' {
+  const isLongHaul = facts.runtimeSec >= TWENTY_FOUR_HOUR_CONFIG.longHaulThresholdSec;
+  if (
+    facts.prestigeGained > 0 ||
+    facts.seasonCompleted ||
+    facts.masteryTreeCompleted ||
+    (facts.storyCompleted && isLongHaul)
+  ) {
+    return 'SPECTACULAR';
+  }
+  if (facts.storyCompleted || facts.rareUnlock || facts.levelsGained > 0) return 'NOTABLE';
+  return 'QUIET';
+}
+
+/**
+ * Remove a logged session.
+ *
+ * Coverage is rebuilt from the REMAINING sessions rather than by subtracting
+ * the deleted interval, because intervals merge and subtraction would not be
+ * sound. XP already granted is deliberately left in the ledger: there is no
+ * negative XP in this application, and a correction should never feel like a
+ * punishment for fixing a typo.
+ */
+export async function deleteViewingSession(userId: string, sessionId: string, now: Date = new Date()): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    const db = tx as Tx;
+    const session = await db.raceViewingSession.findFirstOrThrow({
+      where: { id: sessionId, userId },
+      select: { id: true, raceId: true },
+    });
+
+    await db.raceViewingSession.delete({ where: { id: session.id } });
+
+    const remaining = await db.raceViewingSession.findMany({
+      where: { raceId: session.raceId },
+      select: { startTimestampSec: true, endTimestampSec: true },
+      orderBy: { watchedAt: 'asc' },
+    });
+
+    const race = await db.race.findUniqueOrThrow({
+      where: { id: session.raceId },
+      select: { runtimeSec: true },
+    });
+
+    let rebuilt: { start: number; end: number }[] = [];
+    for (const row of remaining) {
+      rebuilt = addInterval(rebuilt, { start: row.startTimestampSec, end: row.endTimestampSec }, {
+        limit: race.runtimeSec,
+        gapTolerance: STORY_CONFIG.gapToleranceSeconds,
+      }).intervals;
+    }
+
+    await db.watchedInterval.deleteMany({ where: { raceId: session.raceId } });
+    if (rebuilt.length > 0) {
+      await db.watchedInterval.createMany({
+        data: rebuilt.map((interval) => ({
+          raceId: session.raceId,
+          startSec: interval.start,
+          endSec: interval.end,
+        })),
+      });
+    }
+
+    await recomputeRaceAggregates(db, session.raceId, now);
+  }, TRANSACTION_OPTIONS);
+}
+
+/** Real viewing hours logged in a window. Re-exported for the dashboard. */
+export { recordedHoursInRange };
+
+/** Exposed so the stint summary can show the XP rate the user is earning at. */
+export const XP_PER_REAL_MINUTE = XP_CONFIG.xpPerRealMinute;

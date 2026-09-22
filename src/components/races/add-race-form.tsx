@@ -1,0 +1,295 @@
+'use client';
+
+/**
+ * The Add Race form.
+ *
+ * Adding a race should take seconds. Choosing a race type fills in the
+ * duration; naming a circuit is enough; a championship can be created inline
+ * rather than sending the user away to make one first. Everything beyond the
+ * name, type and duration is optional and tucked into a second section.
+ */
+
+import * as React from 'react';
+import { useRouter } from 'next/navigation';
+import { Plus, Star } from 'lucide-react';
+import { Button, Field, Input, Select, Textarea, Toggle } from '@/components/ui/controls';
+import { Panel, PanelBody, PanelHeader } from '@/components/ui/primitives';
+import { MAJOR_EVENT_SUGGESTIONS, RACE_TYPE_PRESETS } from '@/lib/config/championships';
+import { formatTimestamp } from '@/lib/domain/time';
+import { createRaceAction } from '@/lib/server/actions';
+import { cn } from '@/lib/utils';
+
+export interface ChampionshipOption {
+  id: string;
+  name: string;
+  shortName: string | null;
+  accentColor: string;
+  seasons: { id: string; year: number; raceCount: number }[];
+}
+
+export function AddRaceForm({
+  championships, iconicKeysInUse, redirectTo = '/races',
+}: {
+  championships: ChampionshipOption[];
+  iconicKeysInUse: { key: string; count: number }[];
+  redirectTo?: string;
+}) {
+  const router = useRouter();
+  const [pending, startTransition] = React.useTransition();
+  const [errors, setErrors] = React.useState<Record<string, string>>({});
+  const [message, setMessage] = React.useState<string | null>(null);
+
+  const [raceType, setRaceType] = React.useState<string>('H6');
+  const [duration, setDuration] = React.useState(formatTimestamp(6 * 3600));
+  const [championshipId, setChampionshipId] = React.useState('');
+  const [creatingChampionship, setCreatingChampionship] = React.useState(false);
+  const [isMajorEvent, setIsMajorEvent] = React.useState(false);
+  const [iconicKey, setIconicKey] = React.useState('');
+  const [showOptional, setShowOptional] = React.useState(false);
+  const [excitement, setExcitement] = React.useState(3);
+
+  /** Picking a race type fills in the nominal duration, but never locks it. */
+  function onRaceTypeChange(type: string) {
+    setRaceType(type);
+    const preset = RACE_TYPE_PRESETS.find((p) => p.type === type);
+    if (preset && type !== 'CUSTOM') setDuration(formatTimestamp(preset.defaultHours * 3600));
+  }
+
+  const knownIconicKeys = React.useMemo(() => {
+    const keys = new Map(MAJOR_EVENT_SUGGESTIONS.map((s) => [s.key, s.name]));
+    for (const used of iconicKeysInUse) if (!keys.has(used.key)) keys.set(used.key, used.key);
+    return [...keys.entries()];
+  }, [iconicKeysInUse]);
+
+  function onSubmit(formData: FormData) {
+    startTransition(async () => {
+      const result = await createRaceAction(formData);
+      if (result.ok && result.data) {
+        router.push(`${redirectTo}?added=${result.data.id}`);
+        router.refresh();
+      } else {
+        setErrors(result.errors ?? {});
+        setMessage(result.message ?? null);
+      }
+    });
+  }
+
+  return (
+    <form action={onSubmit} className="space-y-4">
+      <Panel>
+        <PanelHeader title="The race" />
+        <PanelBody className="space-y-4">
+          <Field label="Race name" required error={errors.name} hint="For example, 6 Hours of Fuji">
+            <Input name="name" placeholder="6 Hours of Fuji" required autoFocus />
+          </Field>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Race type" error={errors.raceType}>
+              <Select name="raceType" value={raceType} onChange={(e) => onRaceTypeChange(e.target.value)}>
+                {RACE_TYPE_PRESETS.map((preset) => (
+                  <option key={preset.type} value={preset.type}>{preset.label}</option>
+                ))}
+              </Select>
+            </Field>
+
+            <Field
+              label="Scheduled duration"
+              required
+              error={errors.scheduledDuration}
+              hint="HH:MM:SS, or a number of hours"
+            >
+              <Input
+                name="scheduledDuration"
+                value={duration}
+                onChange={(e) => setDuration(e.target.value)}
+                className="timing"
+                required
+              />
+            </Field>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Championship" error={errors.championshipId}>
+              {creatingChampionship ? (
+                <div className="flex gap-2">
+                  <Input name="newChampionshipName" placeholder="Championship name" autoFocus />
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setCreatingChampionship(false)}>
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <Select
+                    name="championshipId"
+                    value={championshipId}
+                    onChange={(e) => setChampionshipId(e.target.value)}
+                  >
+                    <option value="">Unassigned</option>
+                    {championships.map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </Select>
+                  <Button
+                    type="button"
+                    variant="subtle"
+                    size="sm"
+                    onClick={() => { setCreatingChampionship(true); setChampionshipId(''); }}
+                    title="Create a championship"
+                  >
+                    <Plus size={13} />
+                  </Button>
+                </div>
+              )}
+            </Field>
+
+            <Field
+              label="Season year"
+              error={errors.seasonYear}
+              hint="Groups this race into a collectible season"
+            >
+              <Input name="seasonYear" type="number" inputMode="numeric" placeholder={`${new Date().getFullYear()}`} className="timing" />
+            </Field>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Circuit" error={errors.circuit}>
+              <Input name="circuit" placeholder="Fuji Speedway" />
+            </Field>
+            <Field label="Country" error={errors.country}>
+              <Input name="country" placeholder="Japan" />
+            </Field>
+            <Field label="Race date" error={errors.raceDate}>
+              <Input name="raceDate" type="date" className="timing" />
+            </Field>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-5 border-t border-hairline pt-4">
+            <Toggle
+              checked={isMajorEvent}
+              onChange={setIsMajorEvent}
+              label="Major event"
+            />
+            <input type="hidden" name="isMajorEvent" value={isMajorEvent ? 'true' : 'false'} />
+
+            <div className="flex items-center gap-2">
+              <span className="label">Excitement</span>
+              <div className="flex gap-0.5">
+                {[1, 2, 3, 4, 5].map((level) => (
+                  <button
+                    key={level}
+                    type="button"
+                    onClick={() => setExcitement(level)}
+                    aria-label={`Excitement ${level} of 5`}
+                    className="p-0.5"
+                  >
+                    <Star
+                      size={14}
+                      className={cn(level <= excitement ? 'text-[var(--accent)]' : 'text-ink-faint')}
+                      fill={level <= excitement ? 'currentColor' : 'none'}
+                    />
+                  </button>
+                ))}
+              </div>
+              <input type="hidden" name="excitement" value={excitement} />
+            </div>
+          </div>
+
+          {isMajorEvent ? (
+            <Field
+              label="Recurring event"
+              hint="Links editions of the same event together, so it builds a lifetime history"
+            >
+              <Input
+                name="iconicKey"
+                value={iconicKey}
+                onChange={(e) => setIconicKey(e.target.value)}
+                list="iconic-keys"
+                placeholder="le-mans-24"
+              />
+              <datalist id="iconic-keys">
+                {knownIconicKeys.map(([key, name]) => (
+                  <option key={key} value={key}>{name}</option>
+                ))}
+              </datalist>
+            </Field>
+          ) : null}
+        </PanelBody>
+      </Panel>
+
+      <Panel>
+        <PanelHeader
+          title="Everything else"
+          action={
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowOptional((v) => !v)}>
+              {showOptional ? 'Hide' : 'Show'}
+            </Button>
+          }
+        />
+        {showOptional ? (
+          <PanelBody className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="Status">
+                <Select name="status" defaultValue="UNWATCHED">
+                  <option value="UNWATCHED">Unwatched</option>
+                  <option value="QUEUED">Queued</option>
+                  <option value="WATCHING">Watching</option>
+                  <option value="PAUSED">Paused</option>
+                  <option value="ARCHIVED">Archived</option>
+                </Select>
+              </Field>
+              <Field label="Priority">
+                <Select name="priority" defaultValue="NORMAL">
+                  <option value="LOW">Low</option>
+                  <option value="NORMAL">Normal</option>
+                  <option value="HIGH">High</option>
+                  <option value="MUST_WATCH">Must watch</option>
+                </Select>
+              </Field>
+              <Field
+                label="Actual duration"
+                error={errors.actualDuration}
+                hint="If it ran short — red flags, a shortened race"
+              >
+                <Input name="actualDuration" placeholder="—" className="timing" />
+              </Field>
+            </div>
+
+            <Field
+              label="Races in this season"
+              error={errors.plannedRaceCount}
+              hint="You decide what a complete season is. Leave blank for “whatever I add”."
+            >
+              <Input name="plannedRaceCount" type="number" min={1} max={100} className="timing" />
+            </Field>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Replay URL" error={errors.replayUrl}>
+                <Input name="replayUrl" type="url" placeholder="https://" />
+              </Field>
+              <Field label="Poster image URL" error={errors.posterUrl}>
+                <Input name="posterUrl" type="url" placeholder="https://" />
+              </Field>
+            </div>
+
+            <Field label="Notes" hint="Optional. You never have to write down what happened.">
+              <Textarea name="notes" rows={3} />
+            </Field>
+          </PanelBody>
+        ) : null}
+      </Panel>
+
+      {message ? (
+        <p className="rounded-md border border-hairline-strong bg-panel-2 px-3 py-2 text-sm text-ink-muted">
+          {message}
+        </p>
+      ) : null}
+
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="ghost" onClick={() => router.back()}>Cancel</Button>
+        <Button type="submit" variant="primary" disabled={pending}>
+          {pending ? 'Adding…' : 'Add to library'}
+        </Button>
+      </div>
+    </form>
+  );
+}
