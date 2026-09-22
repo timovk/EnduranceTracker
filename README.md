@@ -27,7 +27,15 @@ back. Ready for another stint?"* and nothing else.
 
 ## Running it
 
-Requires Node.js 20.9+ and PostgreSQL.
+Requires Node.js 20.9 or newer, and a PostgreSQL server.
+
+If you do not already run PostgreSQL, there is a compose file for one:
+
+```bash
+docker compose up -d              # starts PostgreSQL on :5432
+```
+
+Then, from the project directory:
 
 ```bash
 npm install                       # also generates the Prisma client
@@ -36,6 +44,16 @@ npm run db:migrate                # create the schema
 npm run db:seed                   # an empty career, ready for real races
 npm run dev                       # http://localhost:3000
 ```
+
+If you used the compose file, the line to put in `.env` is:
+
+```
+DATABASE_URL="postgresql://endurance:endurance@localhost:5432/endurance?schema=public"
+```
+
+Using your own PostgreSQL instead? Create an empty database first
+(`createdb endurance`) and point `DATABASE_URL` at it with a user that can
+create tables.
 
 To see everything working before adding anything of your own:
 
