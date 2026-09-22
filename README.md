@@ -45,6 +45,12 @@ npm run db:seed                   # an empty career, ready for real races
 npm run dev                       # http://localhost:3000
 ```
 
+On Windows, `cp` is `copy`:
+
+```
+copy .env.example .env
+```
+
 If you used the compose file, the line to put in `.env` is:
 
 ```

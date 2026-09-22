@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 
 const ROOT = resolve(process.cwd());
 
@@ -34,7 +34,14 @@ const COMPONENT_FILES = walk(join(ROOT, 'src/components'), /\.tsx?$/);
 const APP_FILES = walk(join(ROOT, 'src/app'), /\.tsx?$/);
 const ALL_SOURCE = [...ENGINE_FILES, ...DOMAIN_FILES, ...COMPONENT_FILES, ...APP_FILES];
 
-const rel = (file: string) => relative(ROOT, file);
+/**
+ * A repository-relative path, always with forward slashes.
+ *
+ * `relative()` returns backslashes on Windows, which would stop the literals
+ * below from ever matching and turn this whole file into false failures on a
+ * Windows checkout.
+ */
+const rel = (file: string) => relative(ROOT, file).split(sep).join('/');
 
 describe('the progression economy stays re-balanceable', () => {
   it('keeps every engine reading its constants from configuration', () => {
