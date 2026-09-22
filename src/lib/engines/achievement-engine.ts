@@ -39,7 +39,7 @@ import {
   type AchievementDef,
   type MilestoneDef,
 } from '@/lib/config';
-import { prisma, type Tx } from '@/lib/db/client';
+import { createManySkippingDuplicates, prisma, type Tx } from '@/lib/db/client';
 import { RARITY_ORDER, type Rarity } from '@/lib/domain/types';
 import type { AchievementUnlock, MilestoneUnlock } from '@/lib/engines/contracts';
 import { computeCareerMetrics, type CareerMetrics } from '@/lib/engines/metrics';
@@ -463,7 +463,7 @@ export async function syncAchievements(
   if (creates.length > 0) {
     // `skipDuplicates` guards the one race worth guarding: two writers
     // creating the first progress row for the same achievement at once.
-    await tx.achievementProgress.createMany({ data: creates, skipDuplicates: true });
+    await createManySkippingDuplicates(tx.achievementProgress, creates);
   }
 
   for (const update of updates) {

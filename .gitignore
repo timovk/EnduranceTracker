@@ -51,3 +51,9 @@ next-env.d.ts
 /.claude
 /.windsurf
 /skills-lock.json
+
+# The database. Your viewing history lives here — it is yours, not the repo's.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

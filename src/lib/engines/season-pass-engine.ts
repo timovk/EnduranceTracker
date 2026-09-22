@@ -39,7 +39,7 @@
 
 import type { SeasonPass } from '@/generated/prisma/client';
 import type { Tx } from '@/lib/db/client';
-import { prisma } from '@/lib/db/client';
+import { createManySkippingDuplicates, prisma } from '@/lib/db/client';
 import type { RewardDef } from '@/lib/config';
 import { MILESTONE_REWARDS, SEASON_PASS_CONFIG, SEASON_PASS_SHAPE, STANDARD_REWARDS } from '@/lib/config';
 import { ARCHIVED_PASS_NOTE } from '@/lib/copy/tone';
@@ -395,8 +395,7 @@ async function ensureTierRows(tx: Tx, seasonPassId: string): Promise<number> {
   }
   if (missing.length === 0) return 0;
 
-  const result = await tx.seasonPassProgress.createMany({ data: missing, skipDuplicates: true });
-  return result.count;
+  return createManySkippingDuplicates(tx.seasonPassProgress, missing);
 }
 
 /**

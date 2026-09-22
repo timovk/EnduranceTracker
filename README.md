@@ -27,51 +27,26 @@ back. Ready for another stint?"* and nothing else.
 
 ## Running it
 
-Requires Node.js 20.9 or newer, and a PostgreSQL server.
+**Windows, the short way.** Install [Node.js](https://nodejs.org) (take the LTS
+installer), download this repository as a ZIP from the green *Code* button,
+unzip it, and double-click **`start.bat`**. That is the whole procedure. The
+first run installs and sets up; every run after that just opens the
+application.
 
-If you do not already run PostgreSQL, there is a compose file for one:
-
-```bash
-docker compose up -d              # starts PostgreSQL on :5432
-```
-
-Then, from the project directory:
+**Everywhere else**, or if you would rather see what is happening:
 
 ```bash
-npm install                       # also generates the Prisma client
-cp .env.example .env              # then point DATABASE_URL at your database
-npm run db:migrate                # create the schema
+npm install                       # also generates the database client
+cp .env.example .env              # the default value works as-is
+npm run db:migrate                # create the database
 npm run db:seed                   # an empty career, ready for real races
 npm run dev                       # http://localhost:3000
 ```
 
-On Windows, `cp` is `copy`:
-
-```
-copy .env.example .env
-```
-
-If you used the compose file, the line to put in `.env` is:
-
-```
-DATABASE_URL="postgresql://endurance:endurance@localhost:5432/endurance?schema=public"
-```
-
-Using your own PostgreSQL instead? Create an empty database first
-(`createdb endurance`) and point `DATABASE_URL` at it with a user that can
-create tables.
-
-To see everything working before adding anything of your own:
-
-```bash
-npm run db:seed:demo              # a fictional career, ~70 hours of viewing
-npm run db:unseed:demo            # remove every trace of it
-```
-
-The demonstration data is entirely invented — no calendar is imported and there
-is no external API. It is built by logging stints through the real session
-engine, so what you see is produced by exactly the code path a genuine career
-would use.
+There is nothing else to install. The database is SQLite — a single
+`endurance.db` file next to the code. No server to run, nothing in the
+background, and your whole viewing history is one file you can copy to back
+up or move to another machine.
 
 ### The other commands
 
@@ -179,7 +154,7 @@ src/
 tests/
   domain/                 pure logic
   engines/                the pure core of each engine
-  integration/            against a real PostgreSQL database
+  integration/            against a real database
 ```
 
 Three rules keep it maintainable:
@@ -199,8 +174,13 @@ one logged stint is one atomic write across every system it touches.
 
 ### Stack
 
-Next.js 16 · React 19 · TypeScript (strict) · Tailwind CSS 4 · PostgreSQL ·
+Next.js 16 · React 19 · TypeScript (strict) · Tailwind CSS 4 · SQLite ·
 Prisma 7 · Zod · Vitest
+
+SQLite rather than a database server, deliberately: this is a single-user
+application whose entire history lives on one machine, so a file next to the
+code is the right shape for it — nothing to install, nothing to keep running,
+and the whole career is one file you can copy.
 
 ---
 
@@ -222,12 +202,12 @@ rather than on the places where one would look untidy:
 - collection completion against the user's own season definition
 - end-to-end session logging against a real database
 
-Integration tests need a database; `.env.test` points at a separate one so a
-test run can never touch a real viewing history.
+Integration tests run against a real database rather than a fake, because
+progression integrity is exactly the sort of thing a fake would let through.
+They use a separate file so a test run can never touch a real viewing history,
+and it is created automatically:
 
 ```bash
-createdb endurance_test
-DATABASE_URL="postgresql://…/endurance_test" npx prisma migrate deploy
 npm run test
 ```
 

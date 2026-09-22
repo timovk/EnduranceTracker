@@ -35,7 +35,7 @@
 
 import type { Challenge } from '@/generated/prisma/client';
 import type { Tx } from '@/lib/db/client';
-import { prisma } from '@/lib/db/client';
+import { createManySkippingDuplicates, prisma } from '@/lib/db/client';
 import { CHALLENGE_CONFIG, CHALLENGE_NOMINALS, CHALLENGE_SHAPE } from '@/lib/config';
 import { EXPIRED_CHALLENGE_NOTE } from '@/lib/copy/tone';
 import { periodForScope, type Period } from '@/lib/domain/periods';
@@ -1780,8 +1780,9 @@ export async function ensureChallenges(
   );
 
   if (generated.length > 0) {
-    await db.challenge.createMany({
-      data: generated.map((challenge) => ({
+    await createManySkippingDuplicates(
+      db.challenge,
+      generated.map((challenge) => ({
         userId,
         scope: challenge.scope,
         templateKey: challenge.templateKey,
@@ -1795,8 +1796,7 @@ export async function ensureChallenges(
         periodStart: challenge.periodStart,
         periodEnd: challenge.periodEnd,
       })),
-      skipDuplicates: true,
-    });
+    );
   }
 
   const rows = await db.challenge.findMany({
@@ -1816,10 +1816,10 @@ export async function ensureChallenges(
   const known = new Set(withProgress.map((row) => row.challengeId));
   const missing = rows.filter((row) => !known.has(row.id));
   if (missing.length > 0) {
-    await db.challengeProgress.createMany({
-      data: missing.map((row) => ({ challengeId: row.id, value: 0, state: 'ACTIVE' as const })),
-      skipDuplicates: true,
-    });
+    await createManySkippingDuplicates(
+      db.challengeProgress,
+      missing.map((row) => ({ challengeId: row.id, value: 0, state: 'ACTIVE' as const })),
+    );
   }
 
   return rows.sort(
@@ -1947,16 +1947,15 @@ export async function expireStaleChallenges(
   }
 
   if (toRecord.length > 0) {
-    const result = await db.challengeProgress.createMany({
-      data: toRecord.map((challenge) => ({
+    changed += await createManySkippingDuplicates(
+      db.challengeProgress,
+      toRecord.map((challenge) => ({
         challengeId: challenge.id,
         value: 0,
         state: 'EXPIRED' as const,
         expiredAt: now,
       })),
-      skipDuplicates: true,
-    });
-    changed += result.count;
+    );
   }
 
   return changed;

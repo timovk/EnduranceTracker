@@ -65,12 +65,15 @@ export async function listRaces(userId: string, filter: RaceFilter = {}): Promis
       ...(filter.majorOnly ? { isMajorEvent: true } : {}),
       ...(filter.storyCompleteOnly ? { storyCompletedAt: { not: null } } : {}),
       ...(filter.unfinishedOnly ? { storyCompletedAt: null, status: { notIn: ['ARCHIVED', 'ABANDONED'] } } : {}),
+      // SQLite has no `mode: 'insensitive'`, but its LIKE is already
+      // case-insensitive for ASCII, which is what `contains` compiles to. So
+      // searching for "fuji" still finds "6 Hours of Fuji".
       ...(filter.search
         ? {
             OR: [
-              { name: { contains: filter.search, mode: 'insensitive' as const } },
-              { circuit: { contains: filter.search, mode: 'insensitive' as const } },
-              { country: { contains: filter.search, mode: 'insensitive' as const } },
+              { name: { contains: filter.search } },
+              { circuit: { contains: filter.search } },
+              { country: { contains: filter.search } },
             ],
           }
         : {}),

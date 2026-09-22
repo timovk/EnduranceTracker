@@ -23,7 +23,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
 }
 
 // ===========================================================================
@@ -550,7 +550,9 @@ model Challenge {
   metric      String
   target      Float
   /// Template-specific parameters (race ids, championship ids, minimum length).
-  params      Json           @default("{}")
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  params      Json
 
   xpReward       Int @default(0)
   seasonXpReward Int @default(0)
@@ -768,7 +770,9 @@ model Trophy {
   accentColor String         @default("#c8a45c")
 
   /// Frozen statistics shown when the trophy is opened.
-  metadata Json @default("{}")
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  metadata Json
 
   awardedAt DateTime @default(now())
 
@@ -795,7 +799,9 @@ model HallOfFameEntry {
   seasonLabel      String?
 
   /// Career statistics frozen at the moment it happened.
-  snapshot Json @default("{}")
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  snapshot Json
 
   occurredAt DateTime @default(now())
 
@@ -843,7 +849,9 @@ model BudgetWeek {
   /// What the adaptive engine suggested for this week.
   recommendedHours Float @default(0)
   /// Why it suggested that (human readable factors).
-  rationale        Json  @default("[]")
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  rationale        Json
   /// Deliberate rest week — recommendation drops to zero and redistributes.
   isRestWeek       Boolean @default(false)
 

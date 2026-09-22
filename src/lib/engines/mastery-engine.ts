@@ -43,7 +43,7 @@
  */
 
 import { MAJOR_EVENT_SUGGESTIONS, MASTERY_CONFIG, MASTERY_SHAPE } from '@/lib/config';
-import { prisma, type Tx } from '@/lib/db/client';
+import { createManySkippingDuplicates, prisma, type Tx } from '@/lib/db/client';
 import { RARITY_ORDER, type MasteryKind, type Rarity, type RaceStatus } from '@/lib/domain/types';
 import type { MasteryUnlock } from '@/lib/engines/contracts';
 import { longestRun } from '@/lib/engines/metrics';
@@ -669,10 +669,10 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
         },
         select: { id: true },
       });
-      await tx.masteryNode.createMany({
-        data: tree.nodes.map((template, index) => nodeData(row.id, template, index)),
-        skipDuplicates: true,
-      });
+      await createManySkippingDuplicates(
+        tx.masteryNode,
+        tree.nodes.map((template, index) => nodeData(row.id, template, index)),
+      );
       created += 1;
       continue;
     }
@@ -720,7 +720,7 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
     }
 
     if (missing.length > 0) {
-      await tx.masteryNode.createMany({ data: missing, skipDuplicates: true });
+      await createManySkippingDuplicates(tx.masteryNode, missing);
     }
   }
 
@@ -959,7 +959,7 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
   if (creates.length > 0) {
     // `skipDuplicates` guards the one race worth guarding: two writers
     // creating the first progress row for the same node at once.
-    await tx.masteryProgress.createMany({ data: creates, skipDuplicates: true });
+    await createManySkippingDuplicates(tx.masteryProgress, creates);
   }
 
   for (const update of updates) {
