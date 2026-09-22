@@ -16,6 +16,8 @@ import { existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { config } from 'dotenv';
 
+const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
 const root = process.cwd();
 const testEnv = resolve(root, '.env.test');
 config({ path: existsSync(testEnv) ? testEnv : resolve(root, '.env'), quiet: true });
@@ -36,9 +38,16 @@ const file = databaseFile(process.env.DATABASE_URL);
 // A missing or empty file means the schema has never been applied. Applying it
 // is cheap and idempotent, so there is no reason to make the user do it.
 if (file !== null && (!existsSync(file) || statSync(file).size === 0)) {
-  execFileSync('npx', ['prisma', 'migrate', 'deploy'], {
+  // `npm run`, never `npx`. npx falls back to fetching the registry's
+  // `latest` when it cannot resolve a local binary, and prisma's `latest` is
+  // currently a release candidate for the NEXT major version with a different
+  // command set — which fails with a baffling "unknown command" error. Going
+  // through the npm script resolves node_modules/.bin and nothing else.
+  execFileSync(NPM, ['run', 'db:deploy'], {
     cwd: root,
     env: { ...process.env },
     stdio: 'ignore',
+    // npm is a .cmd on Windows, which execFile cannot launch directly.
+    shell: process.platform === 'win32',
   });
 }

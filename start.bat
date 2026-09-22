@@ -35,7 +35,10 @@ if not exist "node_modules" (
 )
 
 echo   Preparing your career database...
-call npx prisma migrate deploy
+REM `npm run`, never `npx`: npx falls back to the registry's `latest` when it
+REM cannot resolve the local copy, and that is currently a release candidate
+REM for the next major version with a different command set.
+call npm run db:deploy
 if errorlevel 1 goto failed
 
 if not exist "endurance.db" goto seed
@@ -58,7 +61,7 @@ echo     Press Ctrl+C here to stop.
 echo   ===============================================================
 echo.
 REM Open the browser a few seconds from now, once the server is listening.
-start /min "" cmd /c "timeout /t 6 /nobreak >nul & start "" http://localhost:3000"
+start "" /min cmd /c "timeout /t 6 /nobreak >nul && start http://localhost:3000"
 call npm run dev
 goto end
 
