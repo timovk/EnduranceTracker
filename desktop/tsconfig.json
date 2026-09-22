@@ -1,0 +1,26 @@
+{
+  // The desktop shell is a separate program from the web application: it runs
+  // in Electron's main process, on CommonJS, with no bundler and no DOM. It
+  // therefore gets its own compiler settings rather than inheriting the Next
+  // ones, and deliberately has no `@/*` path alias — `desktop/**` must never
+  // import from `src/**`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "rootDir": "./src",
+    "outDir": "./out",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "declaration": false,
+    "noEmitOnError": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,14 +1,18 @@
 /**
- * Installation bootstrap.
+ * Account bootstrap.
  *
- * This is a single-user application, so there is exactly one User and one
- * CareerProfile. Everything else — the budget year, the season pass, the
- * mastery trees, the collections — is created lazily the first time it is
- * needed, so the application is usable the moment it starts.
+ * Every account owns exactly one CareerProfile. Everything else — the budget
+ * year, the season pass, the mastery trees, the collections — is created
+ * lazily the first time it is needed, so an account is usable the moment it
+ * is made.
+ *
+ * Accounts themselves are created in exactly one place, `createAccount` in
+ * src/lib/auth/accounts.ts. That is deliberate: the display name is unique,
+ * and a second route into `user.create` is a second route into a duplicate.
  */
 
 import type { Tx } from '@/lib/db/client';
-import { prisma, USER_ID } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
 import { BUDGET_CONFIG, CHAMPIONSHIP_PRESETS } from '@/lib/config';
 
 export interface BootstrapResult {
@@ -17,30 +21,27 @@ export interface BootstrapResult {
 }
 
 /**
- * Ensure the career exists. Idempotent, and cheap enough to call on any page.
+ * Ensure an account's career exists. Idempotent, and cheap enough to call on
+ * any page.
+ *
+ * The account itself must already exist: the caller's id comes from a signed-in
+ * session, so an id with no row behind it is a bug worth hearing about rather
+ * than a cue to invent an account.
  */
-export async function ensureCareer(db: Tx = prisma): Promise<BootstrapResult> {
+export async function ensureCareer(userId: string, db: Tx = prisma): Promise<BootstrapResult> {
   const existing = await db.user.findUnique({
-    where: { id: USER_ID },
+    where: { id: userId },
     select: { id: true, careerProfile: { select: { id: true } } },
   });
 
-  if (existing?.careerProfile) return { userId: existing.id, created: false };
-
-  if (!existing) {
-    await db.user.create({
-      data: {
-        id: USER_ID,
-        name: 'Driver',
-        careerProfile: { create: {} },
-      },
-    });
-  } else {
-    await db.careerProfile.create({ data: { userId: USER_ID } });
+  if (existing === null) {
+    throw new Error(`No account with id ${userId}. Accounts are created through createAccount().`);
   }
+  if (existing.careerProfile) return { userId: existing.id, created: false };
 
-  await ensureBudgetYearRow(USER_ID, new Date().getFullYear(), db);
-  return { userId: USER_ID, created: true };
+  await db.careerProfile.create({ data: { userId } });
+  await ensureBudgetYearRow(userId, new Date().getFullYear(), db);
+  return { userId, created: true };
 }
 
 /**

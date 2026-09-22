@@ -2195,8 +2195,11 @@ export async function getStatistics(
     prisma.raceMastery.findMany({ where: { userId }, select: { key: true, name: true } }),
     filter.seasonId === undefined
       ? Promise.resolve(null)
-      : prisma.championshipSeason.findUnique({
-          where: { id: filter.seasonId },
+      // Scoped through the championship, which is where a season's ownership
+      // lives: this id is the raw `?season=` query parameter, so an unscoped
+      // read would put another career's season in this one's header.
+      : prisma.championshipSeason.findFirst({
+          where: { id: filter.seasonId, championship: { userId } },
           select: { year: true, label: true, championship: { select: { name: true } } },
         }),
   ]);

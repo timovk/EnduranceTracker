@@ -64,11 +64,21 @@ export async function disconnectDb(): Promise<void> {
   if (globalForPrisma.prisma) await globalForPrisma.prisma.$disconnect();
 }
 
-/** The single-user id this installation operates as. */
-export const USER_ID = process.env.ENDURANCE_USER_ID ?? '00000000-0000-4000-8000-000000000001';
-
 /** A Prisma transaction client, for engines that must write atomically. */
 export type Tx = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$extends'>;
+
+/**
+ * How a caller identifies the rows that are already there.
+ *
+ * `keyOf` turns a candidate row into the unique constraint's identity, and
+ * `findExisting` answers which of those identities the database already holds.
+ * The caller does the asking because only the caller knows which `where`
+ * clause is cheap — usually one it was about to run anyway.
+ */
+export interface SkipDuplicatesFilter<T> {
+  keyOf: (row: T) => string;
+  findExisting: (candidates: readonly T[]) => Iterable<string> | Promise<Iterable<string>>;
+}
 
 /**
  * `createMany` that ignores rows which already exist.
@@ -78,10 +88,19 @@ export type Tx = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$trans
  * `ensureChallenges`, `ensureMasteryTrees` and friends stay idempotent, and
  * calling one of them twice must not fail.
  *
- * The fast path is a single statement. Only when that hits a unique-constraint
- * violation does it fall back to inserting row by row and skipping the ones
- * that conflict — so the cost is paid exactly when there is a duplicate, which
- * in a single-user application is almost never.
+ * Pass a `filter` and the duplicates are removed before anything is sent, so
+ * the steady state — everything already there, nothing to insert — costs one
+ * read and no failing statement. That matters beyond speed: Prisma logs every
+ * constraint violation as `prisma:error` before rejecting, and a healthy
+ * desktop application must not fill the user's log with errors it caused
+ * itself and then swallowed.
+ *
+ * Without a filter, the fast path is a single statement and a unique-constraint
+ * violation falls back to inserting row by row, skipping the ones that
+ * conflict. The fallback stays either way: it is the backstop for a genuine
+ * race between two callers, which a read-then-write pre-filter cannot close.
+ *
+ * Returns the number of rows actually inserted.
  */
 export async function createManySkippingDuplicates<T>(
   delegate: {
@@ -89,18 +108,22 @@ export async function createManySkippingDuplicates<T>(
     create: (args: { data: T }) => Promise<unknown>;
   },
   data: T[],
+  filter?: SkipDuplicatesFilter<T>,
 ): Promise<number> {
   if (data.length === 0) return 0;
 
+  const pending = filter === undefined ? data : await withoutExisting(data, filter);
+  if (pending.length === 0) return 0;
+
   try {
-    const result = await delegate.createMany({ data });
+    const result = await delegate.createMany({ data: pending });
     return result.count;
   } catch (error) {
     if (!isUniqueConstraintViolation(error)) throw error;
   }
 
   let created = 0;
-  for (const row of data) {
+  for (const row of pending) {
     try {
       await delegate.create({ data: row });
       created += 1;
@@ -109,6 +132,25 @@ export async function createManySkippingDuplicates<T>(
     }
   }
   return created;
+}
+
+/**
+ * The candidates the database does not already hold.
+ *
+ * Also drops repeats within `data` itself: two candidates sharing a key would
+ * violate the same constraint, and the point of the filter is that the insert
+ * it produces cannot fail.
+ */
+async function withoutExisting<T>(data: T[], filter: SkipDuplicatesFilter<T>): Promise<T[]> {
+  const seen = new Set(await filter.findExisting(data));
+  const pending: T[] = [];
+  for (const row of data) {
+    const key = filter.keyOf(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pending.push(row);
+  }
+  return pending;
 }
 
 /** Prisma reports a unique-constraint violation as P2002 on every provider. */

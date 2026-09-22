@@ -41,6 +41,11 @@ export interface RaceAggregates {
  *
  * Runs inside the caller's transaction so a session write and the aggregate it
  * implies can never be separated.
+ *
+ * PRECONDITION: `raceId` belongs to the account the caller is acting for. This
+ * takes no user id on purpose — it is also called for a whole library at once
+ * — so every caller must have established ownership first. Passing an
+ * unchecked id from a form would let one account rewrite another's coverage.
  */
 export async function recomputeRaceAggregates(
   tx: Tx,

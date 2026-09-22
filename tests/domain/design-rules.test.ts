@@ -32,6 +32,14 @@ const ENGINE_FILES = walk(join(ROOT, 'src/lib/engines'), /\.ts$/);
 const DOMAIN_FILES = walk(join(ROOT, 'src/lib/domain'), /\.ts$/);
 const COMPONENT_FILES = walk(join(ROOT, 'src/components'), /\.tsx?$/);
 const APP_FILES = walk(join(ROOT, 'src/app'), /\.tsx?$/);
+const SERVER_FILES = walk(join(ROOT, 'src/lib/server'), /\.ts$/);
+const AUTH_FILES = walk(join(ROOT, 'src/lib/auth'), /\.ts$/);
+/**
+ * The desktop shell. Only `src` is walked: `desktop/out` is build output, and
+ * scanning a compiled copy of a file would report every rule twice.
+ */
+const DESKTOP_FILES = walk(join(ROOT, 'desktop/src'), /\.ts$/);
+const PAGE_FILES = walk(join(ROOT, 'src/app'), /^page\.tsx$/);
 const ALL_SOURCE = [...ENGINE_FILES, ...DOMAIN_FILES, ...COMPONENT_FILES, ...APP_FILES];
 
 /**
@@ -65,6 +73,57 @@ describe('the progression economy stays re-balanceable', () => {
   it('never repeats the annual budget figure outside configuration', () => {
     const offenders = ALL_SOURCE.filter((file) => /\b336\b/.test(codeOf(file)));
     expect(offenders.map(rel)).toEqual([]);
+  });
+});
+
+describe('a career belongs to whoever is signed in', () => {
+  /**
+   * A user id written into the source rather than resolved from the session.
+   *
+   * Either shape is the same mistake: the application had exactly one tenant
+   * for as long as it had a constant to name it, and re-introducing one would
+   * quietly hand every account the same career.
+   */
+  const HARD_CODED_ID = /USER_ID|['"`][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['"`]/i;
+
+  it('never names a user id in a page, a route, a server module or the auth layer', () => {
+    const offenders = [...APP_FILES, ...SERVER_FILES, ...AUTH_FILES].filter((file) =>
+      HARD_CODED_ID.test(codeOf(file)),
+    );
+    expect(offenders.map(rel)).toEqual([]);
+  });
+
+  it('exports no user id from the database client', () => {
+    const code = codeOf(join(ROOT, 'src/lib/db/client.ts'));
+    expect(code).not.toMatch(/export\s+const\s+USER_ID/);
+    expect(code).not.toMatch(HARD_CODED_ID);
+  });
+
+  it('resolves the account from the session on every page', () => {
+    // The session is the only source of an identity. A page that renders
+    // career data without asking for one is a page that would render
+    // somebody's career to whoever happened to open it.
+    const signedOut = new Set([
+      'src/app/welcome/page.tsx',
+      'src/app/accounts/page.tsx',
+      'src/app/accounts/new/page.tsx',
+      'src/app/accounts/[id]/sign-in/page.tsx',
+    ]);
+    for (const file of PAGE_FILES) {
+      if (signedOut.has(rel(file))) continue;
+      expect(codeOf(file), `${rel(file)} should resolve the signed-in account`)
+        .toMatch(/requireUserId\(\)/);
+    }
+  });
+
+  it('keeps every page out of the full-route cache', () => {
+    // `revalidatePath` is process-wide, not per-account. Nothing is cached
+    // across a sign-in today because every page is dynamic; drop one of these
+    // and one account's dashboard could be served to another.
+    for (const file of PAGE_FILES) {
+      expect(codeOf(file), `${rel(file)} should export dynamic = 'force-dynamic'`)
+        .toMatch(/export\s+const\s+dynamic\s*=\s*'force-dynamic'/);
+    }
   });
 });
 
@@ -193,6 +252,53 @@ describe('completion percentages are always scoped', () => {
       const source = readFileSync(file, 'utf8').toLowerCase();
       expect(source, rel(file)).not.toMatch(/global\s*completion\s*percent/);
       expect(source, rel(file)).not.toMatch(/overall\s*completion\s*of\s*all/);
+    }
+  });
+});
+
+describe('the desktop shell is a separate program', () => {
+  /** Every module specifier a file imports, however it imports it. */
+  function importsOf(file: string): string[] {
+    const code = codeOf(file);
+    return [...code.matchAll(/(?:\bfrom|\brequire\(|\bimport\()\s*['"]([^'"]+)['"]/g)].map(
+      (match) => match[1] ?? '',
+    );
+  }
+
+  it('finds the shell where it is supposed to be', () => {
+    // If this ever reads zero, every rule below passes for the wrong reason.
+    expect(DESKTOP_FILES.length).toBeGreaterThan(0);
+  });
+
+  it('never imports from the web application', () => {
+    // `desktop/` runs in Electron's main process, on CommonJS, compiled by its
+    // own tsconfig with no `@` alias and no bundler. An import from `src/`
+    // would either fail to resolve or drag React and Prisma into the process
+    // that is supposed to be supervising them.
+    for (const file of DESKTOP_FILES) {
+      for (const specifier of importsOf(file)) {
+        expect(specifier.startsWith('@/'), `${rel(file)} imports ${specifier}`).toBe(false);
+        expect(/(^|\/)src\//.test(specifier), `${rel(file)} imports ${specifier}`).toBe(false);
+      }
+    }
+  });
+
+  it('never lets the career server listen beyond this machine', () => {
+    // The Next server the shell spawns is an ordinary HTTP server with no
+    // authentication in front of it. Bound to 0.0.0.0 it would hand every
+    // career on the machine to anyone sharing the wifi.
+    for (const file of DESKTOP_FILES) {
+      expect(codeOf(file), rel(file)).not.toContain('0.0.0.0');
+    }
+    expect(codeOf(join(ROOT, 'desktop/src/server.ts'))).toContain('127.0.0.1');
+  });
+
+  it('keeps the web application out of the shell’s reach as well', () => {
+    // The other direction: nothing the Next build compiles may reach into the
+    // Electron process, or the application would stop working in a browser.
+    for (const file of ALL_SOURCE) {
+      expect(codeOf(file), rel(file)).not.toMatch(/from\s+['"][^'"]*\bdesktop\//);
+      expect(codeOf(file), rel(file)).not.toMatch(/from\s+['"]electron['"]/);
     }
   });
 });

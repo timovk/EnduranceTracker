@@ -839,7 +839,9 @@ export async function recomputeRaceMasteries(tx: Tx, userId: string, now: Date =
 
     const toLink = editions.filter((edition) => edition.raceMasteryId !== row.id).map((edition) => edition.id);
     if (toLink.length > 0) {
-      await tx.race.updateMany({ where: { id: { in: toLink } }, data: { raceMasteryId: row.id } });
+      // The ids were derived from this account's races; repeating the userId
+      // here makes the statement safe to read on its own.
+      await tx.race.updateMany({ where: { id: { in: toLink }, userId }, data: { raceMasteryId: row.id } });
     }
   }
 

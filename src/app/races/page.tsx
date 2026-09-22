@@ -7,7 +7,7 @@ import { RaceCard } from '@/components/races/race-card';
 import { RaceFilterBar } from '@/components/races/race-filter-bar';
 import { getChampionshipOptions, listRaces, type RaceFilter } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 import { backlogFraming } from '@/lib/copy/tone';
 import type { RaceStatus } from '@/lib/domain/types';
 
@@ -15,7 +15,8 @@ export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Race library' };
 
 export default async function RacesPage(props: PageProps<'/races'>) {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const params = await props.searchParams;
 
   const filter: RaceFilter = {
@@ -29,8 +30,8 @@ export default async function RacesPage(props: PageProps<'/races'>) {
   };
 
   const [races, championships] = await Promise.all([
-    listRaces(USER_ID, filter),
-    getChampionshipOptions(USER_ID),
+    listRaces(userId, filter),
+    getChampionshipOptions(userId),
   ]);
 
   const unwatched = races.filter((r) => r.coverageSec === 0 && !r.storyComplete).length;

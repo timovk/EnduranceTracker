@@ -10,14 +10,15 @@ import {
 import { Button } from '@/components/ui/controls';
 import { getDashboard } from '@/lib/server/dashboard';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 import { backlogFraming } from '@/lib/copy/tone';
 
 export const dynamic = 'force-dynamic';
 
 export default async function DashboardPage() {
-  await ensureCareer();
-  const data = await getDashboard(USER_ID);
+  const userId = await requireUserId();
+  await ensureCareer(userId);
+  const data = await getDashboard(userId);
 
   return (
     <div className="mx-auto max-w-6xl space-y-4">

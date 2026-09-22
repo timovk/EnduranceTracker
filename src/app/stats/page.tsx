@@ -2,14 +2,15 @@ import { PageHeader } from '@/components/layout/page-header';
 import { StatisticsView } from '@/components/dashboard/statistics-view';
 import { getFilterOptions, getStatistics, type StatsFilter } from '@/lib/engines/stats-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 import type { RaceStatus, RaceType } from '@/lib/domain/types';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Statistics' };
 
 export default async function StatsPage(props: PageProps<'/stats'>) {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const params = await props.searchParams;
 
   const filter: StatsFilter = {
@@ -25,8 +26,8 @@ export default async function StatsPage(props: PageProps<'/stats'>) {
   };
 
   const [stats, options] = await Promise.all([
-    getStatistics(USER_ID, filter),
-    getFilterOptions(USER_ID),
+    getStatistics(userId, filter),
+    getFilterOptions(userId),
   ]);
 
   return (

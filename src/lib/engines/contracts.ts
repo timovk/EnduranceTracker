@@ -209,6 +209,34 @@ export interface Recommendation {
 }
 
 // ---------------------------------------------------------------------------
+// Session removal — what deleting a stint took back
+// ---------------------------------------------------------------------------
+
+/**
+ * The result of removing a logged stint.
+ *
+ * Everything here is reported so the UI can state it plainly. Removing a stint
+ * is a correction, and a correction the user cannot see the effect of is
+ * indistinguishable from a bug — which is exactly how the previous behaviour,
+ * where the coverage fell but the XP silently stayed, read to the person using
+ * it.
+ */
+export interface SessionRemoval {
+  raceId: string;
+  /** Career XP the stint is taking back with it. Never negative. */
+  careerXpRemoved: number;
+  seasonXpRemoved: number;
+  /** True when the race stopped being Story Complete, so its bonus went too. */
+  storyBonusRemoved: boolean;
+  levelBefore: number;
+  levelAfter: number;
+  careerXpBefore: number;
+  careerXpAfter: number;
+  /** Stints still logged against this race afterwards. */
+  remainingSessions: number;
+}
+
+// ---------------------------------------------------------------------------
 // Session result — what the stint summary screen renders
 // ---------------------------------------------------------------------------
 

@@ -7,12 +7,18 @@
  */
 
 import { NextResponse } from 'next/server';
-import { USER_ID } from '@/lib/db/client';
+import { getSessionUserId } from '@/lib/auth/session';
 import { buildOutcomeForSession } from '@/lib/server/session-summary';
 
 export async function GET(_request: Request, context: RouteContext<'/api/sessions/[id]/outcome'>) {
+  // This is fetched, not navigated to, so a missing session is answered with a
+  // status the caller can read. Redirecting would hand it a sign-in page to
+  // parse as JSON.
+  const userId = await getSessionUserId();
+  if (userId === null) return NextResponse.json({ error: 'Not signed in' }, { status: 401 });
+
   const { id } = await context.params;
-  const outcome = await buildOutcomeForSession(USER_ID, id);
+  const outcome = await buildOutcomeForSession(userId, id);
   if (!outcome) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   return NextResponse.json(outcome);
 }

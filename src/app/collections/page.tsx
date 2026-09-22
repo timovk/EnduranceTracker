@@ -4,19 +4,21 @@ import { CollectionGrid } from '@/components/dashboard/collection-grid';
 import { EmptyState, Panel } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 import { ensureSeasonCollections, getCollections } from '@/lib/engines/collection-engine';
-import { prisma, USER_ID } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
 import type { Tx } from '@/lib/db/client';
 import { ensureCareer } from '@/lib/server/bootstrap';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Collections' };
 
 export default async function CollectionsPage() {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
 
   // Reconciled on view so a race added a moment ago already has its card.
-  await prisma.$transaction((tx) => ensureSeasonCollections(tx as Tx, USER_ID), { timeout: 30_000 });
-  const collections = await getCollections(USER_ID);
+  await prisma.$transaction((tx) => ensureSeasonCollections(tx as Tx, userId), { timeout: 30_000 });
+  const collections = await getCollections(userId);
 
   return (
     <div className="mx-auto max-w-5xl">

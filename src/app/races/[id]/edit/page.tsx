@@ -3,19 +3,20 @@ import { PageHeader } from '@/components/layout/page-header';
 import { EditRaceForm } from '@/components/races/edit-race-form';
 import { getChampionshipOptions, getIconicKeysInUse, getRaceDetail } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Edit race' };
 
 export default async function EditRacePage(props: PageProps<'/races/[id]/edit'>) {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const { id } = await props.params;
 
   const [race, championships, iconicKeys] = await Promise.all([
-    getRaceDetail(USER_ID, id),
-    getChampionshipOptions(USER_ID),
-    getIconicKeysInUse(USER_ID),
+    getRaceDetail(userId, id),
+    getChampionshipOptions(userId),
+    getIconicKeysInUse(userId),
   ]);
   if (!race) notFound();
 

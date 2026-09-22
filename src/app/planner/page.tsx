@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/controls';
 import { getRecommendations } from '@/lib/engines/strategist-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 import { STRATEGIST_CONFIG } from '@/lib/config';
 import { formatDuration } from '@/lib/domain/time';
 import { formatHours } from '@/lib/utils';
@@ -16,14 +16,15 @@ export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Race Strategist' };
 
 export default async function PlannerPage(props: PageProps<'/planner'>) {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const params = await props.searchParams;
   const raw = Array.isArray(params.window) ? params.window[0] : params.window;
   const windowMinutes = clampWindow(raw ? Number.parseInt(raw, 10) : undefined);
 
   const [recommendations, budget] = await Promise.all([
-    getRecommendations(USER_ID, { windowMinutes }),
-    getBudgetSnapshot(USER_ID).catch(() => null),
+    getRecommendations(userId, { windowMinutes }),
+    getBudgetSnapshot(userId).catch(() => null),
   ]);
 
   return (

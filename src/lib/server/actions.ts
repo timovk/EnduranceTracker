@@ -7,11 +7,20 @@
  * engine that owns the write, then revalidate the affected routes. No engine
  * is ever called from a component directly, and no component is trusted to
  * have validated anything.
+ *
+ * Every action resolves the signed-in account first, before it looks at
+ * anything the client sent. An account id is never a parameter: one that
+ * arrived from the browser would be a request to act as somebody else. Where
+ * an action is handed an entity id — a race, a championship — that id is
+ * checked against the caller before it is written through, so a uuid belonging
+ * to another career reads as gone rather than as something to edit.
  */
 
 import { revalidatePath } from 'next/cache';
-import { prisma, USER_ID } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
 import type { Tx } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
+import { isAccountError, renameAccount } from '@/lib/auth/accounts';
 import {
   championshipInputSchema, raceInputSchema, raceUpdateSchema, restWeekSchema,
   seasonInputSchema, sessionDeleteSchema, sessionInputSchema, settingsSchema,
@@ -73,7 +82,8 @@ function raceFormToObject(form: FormData) {
 }
 
 export async function createRaceAction(form: FormData): Promise<ActionResult<{ id: string }>> {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const parsed = raceInputSchema.safeParse(raceFormToObject(form));
   if (!parsed.success) {
     return { ok: false, message: 'A couple of fields need a second look.', errors: fieldErrors(parsed.error.issues) };
@@ -82,11 +92,11 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
   const input = parsed.data;
   const race = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
-    const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, input);
+    const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, userId, input);
 
     return db.race.create({
       data: {
-        userId: USER_ID,
+        userId,
         name: input.name,
         championshipId,
         seasonId,
@@ -119,6 +129,7 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
 }
 
 export async function updateRaceAction(form: FormData): Promise<ActionResult<{ id: string }>> {
+  const userId = await requireUserId();
   const parsed = raceUpdateSchema.safeParse({
     ...raceFormToObject(form),
     id: formValue(form, 'id') ?? '',
@@ -128,9 +139,16 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
   }
 
   const input = parsed.data;
-  await prisma.$transaction(async (tx) => {
+  const updated = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
-    const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, input);
+
+    // The race id came from the form. Ownership is established inside the same
+    // transaction as the write, so there is no window in which it could change
+    // between the two.
+    const owned = await db.race.findFirst({ where: { id: input.id, userId }, select: { id: true } });
+    if (owned === null) return false;
+
+    const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, userId, input);
 
     await db.race.update({
       where: { id: input.id },
@@ -160,7 +178,10 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
     // have to be rebuilt rather than left pointing at the old length.
     const { recomputeRaceAggregates } = await import('@/lib/engines/race-engine');
     await recomputeRaceAggregates(db, input.id);
+    return true;
   });
+
+  if (!updated) return { ok: false, message: 'That race is no longer in the library.' };
 
   revalidatePath('/races');
   revalidatePath(`/races/${input.id}`);
@@ -176,16 +197,27 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
  */
 async function resolveChampionshipAndSeason(
   db: Tx,
+  userId: string,
   input: { championshipId: string | null; newChampionshipName?: string; seasonYear: number | null; plannedRaceCount: number | null },
 ): Promise<{ championshipId: string | null; seasonId: string | null }> {
   let championshipId = input.championshipId;
 
+  // The form supplies this id, and a ChampionshipSeason is owned through its
+  // championship rather than directly — so an id from another career has to be
+  // dropped here or the season upsert below would write into it. A race with no
+  // championship is a perfectly ordinary race, so this degrades rather than
+  // refusing.
+  if (championshipId !== null) {
+    const owned = await db.championship.findFirst({ where: { id: championshipId, userId }, select: { id: true } });
+    if (owned === null) championshipId = null;
+  }
+
   if (!championshipId && input.newChampionshipName) {
     const slug = championshipSlug(input.newChampionshipName);
     const championship = await db.championship.upsert({
-      where: { userId_slug: { userId: USER_ID, slug } },
+      where: { userId_slug: { userId, slug } },
       update: {},
-      create: { userId: USER_ID, slug, name: input.newChampionshipName, isCustom: true },
+      create: { userId, slug, name: input.newChampionshipName, isCustom: true },
       select: { id: true },
     });
     championshipId = championship.id;
@@ -210,15 +242,19 @@ async function resolveChampionshipAndSeason(
 }
 
 export async function setRaceStatusAction(raceId: string, status: string): Promise<ActionResult> {
+  const userId = await requireUserId();
   const allowed = ['UNWATCHED', 'QUEUED', 'WATCHING', 'PAUSED', 'COMPLETED', 'ABANDONED', 'ARCHIVED'] as const;
   if (!allowed.includes(status as (typeof allowed)[number])) {
     return { ok: false, message: 'That status is not one of the options.' };
   }
 
-  await prisma.race.update({
-    where: { id: raceId },
+  // updateMany rather than update: the userId in the `where` is what makes
+  // another account's race id a no-op instead of an edit.
+  const { count } = await prisma.race.updateMany({
+    where: { id: raceId, userId },
     data: { status: status as (typeof allowed)[number] },
   });
+  if (count === 0) return { ok: false, message: 'That race is no longer in the library.' };
 
   revalidatePath(`/races/${raceId}`);
   revalidatePath('/races');
@@ -226,10 +262,13 @@ export async function setRaceStatusAction(raceId: string, status: string): Promi
 }
 
 export async function deleteRaceAction(raceId: string): Promise<ActionResult> {
-  const race = await prisma.race.findFirst({ where: { id: raceId, userId: USER_ID }, select: { name: true } });
+  const userId = await requireUserId();
+  const race = await prisma.race.findFirst({ where: { id: raceId, userId }, select: { name: true } });
   if (!race) return { ok: false, message: 'That race is no longer in the library.' };
 
-  await prisma.race.delete({ where: { id: raceId } });
+  // Scoped here too, so the delete is safe on its own rather than because the
+  // check above happens to come first.
+  await prisma.race.deleteMany({ where: { id: raceId, userId } });
 
   revalidatePath('/races');
   revalidatePath('/');
@@ -242,6 +281,7 @@ export async function deleteRaceAction(raceId: string): Promise<ActionResult> {
 // ---------------------------------------------------------------------------
 
 export async function logSessionAction(form: FormData): Promise<ActionResult<{ sessionId: string; raceId: string }>> {
+  const userId = await requireUserId();
   const parsed = sessionInputSchema.safeParse({
     raceId: formValue(form, 'raceId') ?? '',
     mode: formValue(form, 'mode') ?? 'RANGE',
@@ -258,24 +298,25 @@ export async function logSessionAction(form: FormData): Promise<ActionResult<{ s
   }
 
   const { logViewingSession } = await import('@/lib/engines/session-engine');
-  const outcome = await logViewingSession(USER_ID, parsed.data);
+  const outcome = await logViewingSession(userId, parsed.data);
 
   revalidatePathsAfterSession(outcome.raceId);
   return { ok: true, data: { sessionId: outcome.sessionId, raceId: outcome.raceId } };
 }
 
 export async function deleteSessionAction(sessionId: string): Promise<ActionResult> {
+  const userId = await requireUserId();
   const parsed = sessionDeleteSchema.safeParse({ sessionId });
   if (!parsed.success) return { ok: false, message: 'That session could not be found.' };
 
   const session = await prisma.raceViewingSession.findFirst({
-    where: { id: sessionId, userId: USER_ID },
+    where: { id: sessionId, userId },
     select: { raceId: true },
   });
   if (!session) return { ok: false, message: 'That session is no longer recorded.' };
 
   const { deleteViewingSession } = await import('@/lib/engines/session-engine');
-  await deleteViewingSession(USER_ID, sessionId);
+  await deleteViewingSession(userId, sessionId);
 
   revalidatePathsAfterSession(session.raceId);
   return {
@@ -296,7 +337,8 @@ function revalidatePathsAfterSession(raceId: string): void {
 // ---------------------------------------------------------------------------
 
 export async function createChampionshipAction(form: FormData): Promise<ActionResult<{ id: string }>> {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const parsed = championshipInputSchema.safeParse({
     name: formValue(form, 'name') ?? '',
     shortName: formValue(form, 'shortName'),
@@ -307,10 +349,10 @@ export async function createChampionshipAction(form: FormData): Promise<ActionRe
   }
 
   const championship = await prisma.championship.upsert({
-    where: { userId_slug: { userId: USER_ID, slug: championshipSlug(parsed.data.name) } },
+    where: { userId_slug: { userId, slug: championshipSlug(parsed.data.name) } },
     update: { name: parsed.data.name, shortName: parsed.data.shortName ?? null, accentColor: parsed.data.accentColor },
     create: {
-      userId: USER_ID,
+      userId,
       slug: championshipSlug(parsed.data.name),
       name: parsed.data.name,
       shortName: parsed.data.shortName ?? null,
@@ -326,6 +368,7 @@ export async function createChampionshipAction(form: FormData): Promise<ActionRe
 }
 
 export async function upsertSeasonAction(form: FormData): Promise<ActionResult> {
+  const userId = await requireUserId();
   const parsed = seasonInputSchema.safeParse({
     championshipId: formValue(form, 'championshipId') ?? '',
     year: formValue(form, 'year') ?? '',
@@ -335,6 +378,14 @@ export async function upsertSeasonAction(form: FormData): Promise<ActionResult> 
   if (!parsed.success) {
     return { ok: false, errors: fieldErrors(parsed.error.issues), message: 'Check the season details.' };
   }
+
+  // A season has no userId of its own — it belongs to a championship — so the
+  // championship is what establishes whose season this is.
+  const championship = await prisma.championship.findFirst({
+    where: { id: parsed.data.championshipId, userId },
+    select: { id: true },
+  });
+  if (!championship) return { ok: false, message: 'That championship is no longer in the library.' };
 
   await prisma.championshipSeason.upsert({
     where: { championshipId_year: { championshipId: parsed.data.championshipId, year: parsed.data.year } },
@@ -353,8 +404,9 @@ export async function upsertSeasonAction(form: FormData): Promise<ActionResult> 
 }
 
 export async function seedPresetChampionshipsAction(): Promise<ActionResult<{ created: number }>> {
-  await ensureCareer();
-  const created = await ensureChampionshipPresets(USER_ID);
+  const userId = await requireUserId();
+  await ensureCareer(userId);
+  const created = await ensureChampionshipPresets(userId);
   revalidatePath('/races');
   revalidatePath('/settings');
   return { ok: true, data: { created }, message: `${created} championship${created === 1 ? '' : 's'} added.` };
@@ -365,7 +417,8 @@ export async function seedPresetChampionshipsAction(): Promise<ActionResult<{ cr
 // ---------------------------------------------------------------------------
 
 export async function updateSettingsAction(form: FormData): Promise<ActionResult> {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const parsed = settingsSchema.safeParse({
     name: formValue(form, 'name'),
     weekStart: formValue(form, 'weekStart'),
@@ -381,20 +434,28 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
   }
 
   const input = parsed.data;
+
+  // Renaming goes through the accounts module rather than being written here.
+  // The display name is what the account picker calls this career, so it is
+  // unique — and there should be exactly one place that knows how to check
+  // that, the same way there is exactly one place that creates an account.
+  if (input.name !== undefined) {
+    try {
+      await renameAccount(userId, input.name);
+    } catch (error) {
+      if (isAccountError(error)) return { ok: false, errors: { name: error.message }, message: error.message };
+      throw error;
+    }
+  }
+
   await prisma.$transaction(async (tx) => {
-    if (input.name !== undefined || input.weekStart !== undefined) {
-      await tx.user.update({
-        where: { id: USER_ID },
-        data: {
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          ...(input.weekStart !== undefined ? { weekStart: input.weekStart } : {}),
-        },
-      });
+    if (input.weekStart !== undefined) {
+      await tx.user.update({ where: { id: userId }, data: { weekStart: input.weekStart } });
     }
 
     if (input.themeKey !== undefined || input.raceCardKey !== undefined || input.titleKey !== undefined) {
       await tx.careerProfile.update({
-        where: { userId: USER_ID },
+        where: { userId },
         data: {
           ...(input.themeKey !== undefined ? { themeKey: input.themeKey } : {}),
           ...(input.raceCardKey !== undefined ? { raceCardKey: input.raceCardKey } : {}),
@@ -406,13 +467,13 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
     if (input.annualBudgetHours !== undefined || input.weeklyTargetHours !== undefined) {
       const year = new Date().getFullYear();
       await tx.budgetYear.upsert({
-        where: { userId_year: { userId: USER_ID, year } },
+        where: { userId_year: { userId, year } },
         update: {
           ...(input.annualBudgetHours !== undefined ? { annualBudgetHours: input.annualBudgetHours } : {}),
           ...(input.weeklyTargetHours !== undefined ? { weeklyTargetHours: input.weeklyTargetHours } : {}),
         },
         create: {
-          userId: USER_ID,
+          userId,
           year,
           annualBudgetHours: input.annualBudgetHours ?? 336,
           weeklyTargetHours: input.weeklyTargetHours ?? 8,
@@ -422,9 +483,9 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
 
     if (input.defaultPlaybackSpeed !== undefined) {
       await tx.configOverride.upsert({
-        where: { userId_key: { userId: USER_ID, key: 'defaultPlaybackSpeed' } },
+        where: { userId_key: { userId, key: 'defaultPlaybackSpeed' } },
         update: { value: input.defaultPlaybackSpeed },
-        create: { userId: USER_ID, key: 'defaultPlaybackSpeed', value: input.defaultPlaybackSpeed },
+        create: { userId, key: 'defaultPlaybackSpeed', value: input.defaultPlaybackSpeed },
       });
     }
   });
@@ -436,6 +497,7 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
 }
 
 export async function setRestWeekAction(form: FormData): Promise<ActionResult> {
+  const userId = await requireUserId();
   const parsed = restWeekSchema.safeParse({
     isoYear: formValue(form, 'isoYear') ?? '',
     isoWeek: formValue(form, 'isoWeek') ?? '',
@@ -444,7 +506,7 @@ export async function setRestWeekAction(form: FormData): Promise<ActionResult> {
   if (!parsed.success) return { ok: false, message: 'That week could not be read.' };
 
   const { setRestWeek } = await import('@/lib/engines/budget-engine');
-  await setRestWeek(USER_ID, parsed.data.isoYear, parsed.data.isoWeek, parsed.data.isRestWeek);
+  await setRestWeek(userId, parsed.data.isoYear, parsed.data.isoWeek, parsed.data.isRestWeek);
 
   revalidatePath('/budget');
   revalidatePath('/');

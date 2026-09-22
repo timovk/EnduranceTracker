@@ -152,13 +152,33 @@ enum HallOfFameCategory {
 
 model User {
   id        String   @id @default(uuid())
-  name      String   @default("Driver")
+  /// Display name, and the label on the account card. Unique so the picker is
+  /// unambiguous; uniqueness is also checked case-insensitively in the app
+  /// layer, which SQLite cannot express as a constraint.
+  name      String   @unique @default("Driver")
   timezone  String   @default("UTC")
   /// ISO weekday the viewing week starts on (1 = Monday).
   weekStart Int      @default(1)
+
+  /// Cosmetic identity for the account card. Resolved against config, never
+  /// free text, so a card can never render an unknown asset.
+  avatarKey String @default("helmet")
+  accentKey String @default("amber")
+
+  /// Optional local password. Both are null, or both are set — never one.
+  /// See src/lib/auth/password.ts for the format. This keeps a housemate out
+  /// of a career; it is not protection against someone holding the disk.
+  passwordHash String?
+  passwordSalt String?
+
+  /// Ordering hint for the account picker: the last account played comes
+  /// first, because that is almost always the one being opened again.
+  lastActiveAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  sessions          UserSession[]
   careerProfile     CareerProfile?
   championships     Championship[]
   races             Race[]
@@ -179,6 +199,25 @@ model User {
   configOverrides   ConfigOverride[]
 
   @@map("users")
+}
+
+/// A signed-in session on this machine.
+///
+/// The cookie holds only this row's opaque id; everything else is server-side,
+/// so signing out is a delete and "sign out everywhere" is a deleteMany. There
+/// is no remote attacker in this threat model — the point is that an account's
+/// career is not reachable by clicking around while someone else is signed in.
+model UserSession {
+  id         String   @id
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("user_sessions")
 }
 
 /// The permanent career. Never reset, not even by prestige.

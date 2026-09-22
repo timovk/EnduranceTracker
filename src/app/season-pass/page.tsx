@@ -3,26 +3,27 @@ import { SeasonPassTrack } from '@/components/dashboard/season-pass-track';
 import { EmptyState, Panel } from '@/components/ui/primitives';
 import { archiveExpiredPasses, getPassHistory, getSeasonPassView } from '@/lib/engines/season-pass-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Season Pass' };
 
 export default async function SeasonPassPage(props: PageProps<'/season-pass'>) {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const params = await props.searchParams;
 
   // Archival is neutral bookkeeping: a quarter that ended is simply closed.
-  await archiveExpiredPasses(USER_ID);
+  await archiveExpiredPasses(userId);
 
   const year = single(params.year);
   const quarter = single(params.quarter);
   const [pass, history] = await Promise.all([
-    getSeasonPassView(USER_ID, {
+    getSeasonPassView(userId, {
       year: year ? Number.parseInt(year, 10) : undefined,
       quarter: quarter ? Number.parseInt(quarter, 10) : undefined,
     }),
-    getPassHistory(USER_ID),
+    getPassHistory(userId),
   ]);
 
   return (

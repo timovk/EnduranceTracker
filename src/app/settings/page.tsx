@@ -1,8 +1,9 @@
 import { PageHeader } from '@/components/layout/page-header';
 import { SettingsForm } from '@/components/dashboard/settings-form';
 import { Panel, PanelBody, PanelHeader } from '@/components/ui/primitives';
-import { prisma, USER_ID } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
 import { ensureCareer, ensureBudgetYearRow } from '@/lib/server/bootstrap';
+import { requireUserId } from '@/lib/auth/session';
 import { BUDGET_CONFIG, LEVEL_TITLES, RACE_CARD_STYLES, THEMES, XP_CONFIG, STORY_CONFIG, SEASON_PASS_CONFIG } from '@/lib/config';
 import { levelFromXp, titleForLevel } from '@/lib/domain/progression';
 
@@ -10,19 +11,20 @@ export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Settings' };
 
 export default async function SettingsPage() {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const year = new Date().getFullYear();
-  await ensureBudgetYearRow(USER_ID, year);
+  await ensureBudgetYearRow(userId, year);
 
   const [user, profile, budgetYear, speedOverride, counts] = await Promise.all([
-    prisma.user.findUniqueOrThrow({ where: { id: USER_ID } }),
-    prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER_ID } }),
-    prisma.budgetYear.findUniqueOrThrow({ where: { userId_year: { userId: USER_ID, year } } }),
-    prisma.configOverride.findUnique({ where: { userId_key: { userId: USER_ID, key: 'defaultPlaybackSpeed' } } }),
+    prisma.user.findUniqueOrThrow({ where: { id: userId } }),
+    prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
+    prisma.budgetYear.findUniqueOrThrow({ where: { userId_year: { userId, year } } }),
+    prisma.configOverride.findUnique({ where: { userId_key: { userId, key: 'defaultPlaybackSpeed' } } }),
     Promise.all([
-      prisma.race.count({ where: { userId: USER_ID } }),
-      prisma.championship.count({ where: { userId: USER_ID } }),
-      prisma.raceViewingSession.count({ where: { userId: USER_ID } }),
+      prisma.race.count({ where: { userId } }),
+      prisma.championship.count({ where: { userId } }),
+      prisma.raceViewingSession.count({ where: { userId } }),
     ]),
   ]);
 

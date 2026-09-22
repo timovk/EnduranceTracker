@@ -2,16 +2,17 @@ import { PageHeader } from '@/components/layout/page-header';
 import { AddRaceForm } from '@/components/races/add-race-form';
 import { getChampionshipOptions, getIconicKeysInUse } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Add a race' };
 
 export default async function AddRacePage() {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
   const [championships, iconicKeys] = await Promise.all([
-    getChampionshipOptions(USER_ID),
-    getIconicKeysInUse(USER_ID),
+    getChampionshipOptions(userId),
+    getIconicKeysInUse(userId),
   ]);
 
   return (

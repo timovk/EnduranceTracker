@@ -23,7 +23,7 @@
 // Prisma client is lazy, so this only has to happen before the first query.
 import 'dotenv/config';
 
-import { disconnectDb, prisma, USER_ID } from '@/lib/db/client';
+import { disconnectDb, prisma } from '@/lib/db/client';
 import { ensureCareer, ensureChampionshipPresets } from '@/lib/server/bootstrap';
 import { syncAchievementDefinitions } from '@/lib/engines/achievement-engine';
 import { logViewingSession } from '@/lib/engines/session-engine';
@@ -35,6 +35,21 @@ import { formatDuration } from '@/lib/domain/time';
 
 /** Marks everything the demonstration creates, so removal is exact. */
 const DEMO_TAG = '[demo]';
+
+/**
+ * The account this script seeds.
+ *
+ * A script has no signed-in session, so the career it works on has to be named
+ * rather than inferred. By default that is one well-known demonstration
+ * account — fixed id, fixed name, no password — so running the seed twice
+ * refreshes a single career instead of growing a new one each time, and the
+ * account it leaves behind is one that can actually be opened from the picker.
+ *
+ *     npm run db:seed:demo                      the demonstration account
+ *     npm run db:seed:demo -- --account Alex     a career you already have
+ */
+const SEED_USER_ID = process.env.ENDURANCE_USER_ID ?? '00000000-0000-4000-8000-000000000001';
+const SEED_ACCOUNT_NAME = process.env.ENDURANCE_SEED_ACCOUNT ?? 'Demo Driver';
 
 const H = 3600;
 
@@ -139,16 +154,16 @@ const RACES: DemoRace[] = [
   },
 ];
 
-async function seedDemo(): Promise<void> {
-  await ensureCareer();
+async function seedDemo(userId: string): Promise<void> {
+  await ensureCareer(userId);
 
   // Running this twice should refresh the demonstration, not stack a second
   // copy of it on top of the first. Anything the user added themselves is
   // untouched by the removal, so this is safe to repeat.
-  const existing = await prisma.race.count({ where: { userId: USER_ID, notes: DEMO_TAG } });
+  const existing = await prisma.race.count({ where: { userId: userId, notes: DEMO_TAG } });
   if (existing > 0) {
     console.log(`Refreshing the demonstration career (${existing} races already present)…\n`);
-    await removeDemo({ quiet: true });
+    await removeDemo(userId, { quiet: true });
   } else {
     console.log('Building the demonstration career…\n');
   }
@@ -162,10 +177,10 @@ async function seedDemo(): Promise<void> {
   const championshipIds = new Map<string, string>();
   for (const preset of CHAMPIONSHIPS) {
     const championship = await prisma.championship.upsert({
-      where: { userId_slug: { userId: USER_ID, slug: preset.slug } },
+      where: { userId_slug: { userId: userId, slug: preset.slug } },
       update: {},
       create: {
-        userId: USER_ID,
+        userId: userId,
         slug: preset.slug,
         name: preset.name,
         shortName: preset.shortName,
@@ -209,7 +224,7 @@ async function seedDemo(): Promise<void> {
 
     const race = await prisma.race.create({
       data: {
-        userId: USER_ID,
+        userId: userId,
         name: demo.name,
         // The tag lives in the notes rather than the name, so the demonstration
         // library still reads like a real one.
@@ -264,7 +279,7 @@ async function seedDemo(): Promise<void> {
   const earliest = stints[0];
   if (earliest !== undefined) {
     await prisma.careerProfile.update({
-      where: { userId: USER_ID },
+      where: { userId: userId },
       data: { momentumUpdatedAt: daysAgo(earliest.when + 1), momentumPoints: 0, momentumTierKey: 'cold_tyres' },
     });
   }
@@ -273,7 +288,7 @@ async function seedDemo(): Promise<void> {
   for (const stint of stints) {
     const watchedAt = daysAgo(stint.when);
     await logViewingSession(
-      USER_ID,
+      userId,
       {
         raceId: stint.raceId,
         mode: 'RANGE',
@@ -290,10 +305,10 @@ async function seedDemo(): Promise<void> {
   console.log(`  ${sessionCount} stints logged, oldest first`);
 
   // -- Derived systems -----------------------------------------------------
-  await ensureChallenges(USER_ID);
-  await recomputeWeekAllocations(USER_ID);
+  await ensureChallenges(userId);
+  await recomputeWeekAllocations(userId);
 
-  await printSummary();
+  await printSummary(userId);
 }
 
 function raceTypeFor(hours: number) {
@@ -313,12 +328,12 @@ function raceTypeFor(hours: number) {
  * user added themselves is untouched. Cascades take the sessions, intervals and
  * collection cards with the races.
  */
-async function removeDemo(options: { quiet?: boolean } = {}): Promise<void> {
-  const say = (line: string) => { if (!options.quiet) say(line); };
+async function removeDemo(userId: string, options: { quiet?: boolean } = {}): Promise<void> {
+  const say = (line: string) => { if (!options.quiet) console.log(line); };
   say('Removing the demonstration data…\n');
 
   const races = await prisma.race.findMany({
-    where: { userId: USER_ID, notes: DEMO_TAG },
+    where: { userId: userId, notes: DEMO_TAG },
     select: { id: true },
   });
   const raceIds = races.map((r) => r.id);
@@ -328,25 +343,25 @@ async function removeDemo(options: { quiet?: boolean } = {}): Promise<void> {
     // history. That is deliberate: the ledger is append-only by design. The
     // demo's own entries are removed explicitly below.
     await prisma.xPTransaction.deleteMany({
-      where: { userId: USER_ID, sourceRef: { in: raceIds } },
+      where: { userId: userId, sourceRef: { in: raceIds } },
     });
     await prisma.race.deleteMany({ where: { id: { in: raceIds } } });
   }
 
   const championships = await prisma.championship.findMany({
-    where: { userId: USER_ID, name: { contains: DEMO_TAG } },
+    where: { userId: userId, name: { contains: DEMO_TAG } },
     select: { id: true },
   });
   const championshipIds = championships.map((c) => c.id);
 
   if (championshipIds.length > 0) {
-    await prisma.masteryTree.deleteMany({ where: { userId: USER_ID, championshipId: { in: championshipIds } } });
+    await prisma.masteryTree.deleteMany({ where: { userId: userId, championshipId: { in: championshipIds } } });
     await prisma.championship.deleteMany({ where: { id: { in: championshipIds } } });
   }
 
   // Anything that referenced only demonstration races is now orphaned.
-  await prisma.collection.deleteMany({ where: { userId: USER_ID, season: null, kind: 'SEASON' } });
-  await prisma.raceMastery.deleteMany({ where: { userId: USER_ID, races: { none: {} } } });
+  await prisma.collection.deleteMany({ where: { userId: userId, season: null, kind: 'SEASON' } });
+  await prisma.raceMastery.deleteMany({ where: { userId: userId, races: { none: {} } } });
 
   say(`  ${raceIds.length} races and ${championshipIds.length} championships removed`);
 
@@ -355,25 +370,25 @@ async function removeDemo(options: { quiet?: boolean } = {}): Promise<void> {
   // real career started afterwards. If there are genuine races as well, the
   // permanent record is left exactly alone — progression is never destroyed to
   // tidy something up.
-  const realRacesLeft = await prisma.race.count({ where: { userId: USER_ID } });
+  const realRacesLeft = await prisma.race.count({ where: { userId: userId } });
 
   if (realRacesLeft === 0) {
     await prisma.$transaction([
-      prisma.xPTransaction.deleteMany({ where: { userId: USER_ID } }),
-      prisma.achievementProgress.deleteMany({ where: { userId: USER_ID } }),
-      prisma.milestoneProgress.deleteMany({ where: { userId: USER_ID } }),
-      prisma.masteryProgress.deleteMany({ where: { userId: USER_ID } }),
-      prisma.masteryTree.deleteMany({ where: { userId: USER_ID } }),
-      prisma.collection.deleteMany({ where: { userId: USER_ID } }),
-      prisma.trophy.deleteMany({ where: { userId: USER_ID } }),
-      prisma.hallOfFameEntry.deleteMany({ where: { userId: USER_ID } }),
-      prisma.challenge.deleteMany({ where: { userId: USER_ID } }),
-      prisma.seasonPass.deleteMany({ where: { userId: USER_ID } }),
-      prisma.momentumHistory.deleteMany({ where: { userId: USER_ID } }),
-      prisma.budgetYear.deleteMany({ where: { userId: USER_ID } }),
-      prisma.raceMastery.deleteMany({ where: { userId: USER_ID } }),
+      prisma.xPTransaction.deleteMany({ where: { userId: userId } }),
+      prisma.achievementProgress.deleteMany({ where: { userId: userId } }),
+      prisma.milestoneProgress.deleteMany({ where: { userId: userId } }),
+      prisma.masteryProgress.deleteMany({ where: { userId: userId } }),
+      prisma.masteryTree.deleteMany({ where: { userId: userId } }),
+      prisma.collection.deleteMany({ where: { userId: userId } }),
+      prisma.trophy.deleteMany({ where: { userId: userId } }),
+      prisma.hallOfFameEntry.deleteMany({ where: { userId: userId } }),
+      prisma.challenge.deleteMany({ where: { userId: userId } }),
+      prisma.seasonPass.deleteMany({ where: { userId: userId } }),
+      prisma.momentumHistory.deleteMany({ where: { userId: userId } }),
+      prisma.budgetYear.deleteMany({ where: { userId: userId } }),
+      prisma.raceMastery.deleteMany({ where: { userId: userId } }),
       prisma.careerProfile.update({
-        where: { userId: USER_ID },
+        where: { userId: userId },
         data: {
           careerXp: BigInt(0), level: 1, prestige: 0, titleKey: null,
           currentStreakDays: 0, longestStreakDays: 0,
@@ -393,24 +408,24 @@ async function removeDemo(options: { quiet?: boolean } = {}): Promise<void> {
   }
 }
 
-async function printSummary(): Promise<void> {
+async function printSummary(userId: string): Promise<void> {
   const [profile, races, sessions, trophies, hallOfFame, momentum] = await Promise.all([
-    prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER_ID } }),
+    prisma.careerProfile.findUniqueOrThrow({ where: { userId: userId } }),
     prisma.race.aggregate({
-      where: { userId: USER_ID },
+      where: { userId: userId },
       _count: true,
       _sum: { coverageSec: true, realViewingSec: true },
     }),
-    prisma.raceViewingSession.count({ where: { userId: USER_ID } }),
-    prisma.trophy.count({ where: { userId: USER_ID } }),
-    prisma.hallOfFameEntry.count({ where: { userId: USER_ID } }),
+    prisma.raceViewingSession.count({ where: { userId: userId } }),
+    prisma.trophy.count({ where: { userId: userId } }),
+    prisma.hallOfFameEntry.count({ where: { userId: userId } }),
     // Read through the engine: momentum decays lazily, so the stored column is
     // whatever it was at the last stint, not what it is now.
-    getMomentum(USER_ID),
+    getMomentum(userId),
   ]);
 
   const storyComplete = await prisma.race.count({
-    where: { userId: USER_ID, storyCompletedAt: { not: null } },
+    where: { userId: userId, storyCompletedAt: { not: null } },
   });
 
   console.log('\nThe demonstration career');
@@ -428,24 +443,78 @@ async function printSummary(): Promise<void> {
   console.log('Remove it again with `npm run db:unseed:demo`.');
 }
 
+/** An existing account, by id or by the name on its card. Null when there is none. */
+async function findAccount(target: string | undefined): Promise<{ id: string; name: string } | null> {
+  const where = target === undefined
+    ? { OR: [{ id: SEED_USER_ID }, { name: SEED_ACCOUNT_NAME }] }
+    : { OR: [{ id: target }, { name: target }] };
+  return prisma.user.findFirst({ where, select: { id: true, name: true } });
+}
+
+/**
+ * The account to seed, created if it is not there yet.
+ *
+ * `ensureCareer` deliberately refuses to invent an account — creating one
+ * belongs to the account screens, so that a stale cookie can never resurrect a
+ * career that was deleted — which means this script has to create its own, and
+ * say so, rather than have a career appear from nowhere.
+ */
+async function resolveAccount(target: string | undefined): Promise<string> {
+  const existing = await findAccount(target);
+  if (existing !== null) {
+    if (target !== undefined) console.log(`Working on the account "${existing.name}".\n`);
+    return existing.id;
+  }
+
+  if (target !== undefined) {
+    throw new Error(
+      `There is no account called "${target}". Create it in the application first, `
+      + 'or leave --account off to use the demonstration account.',
+    );
+  }
+
+  // No password: a demonstration career that cannot be opened from the picker
+  // would demonstrate nothing.
+  const created = await prisma.user.create({
+    data: { id: SEED_USER_ID, name: SEED_ACCOUNT_NAME },
+    select: { id: true },
+  });
+  console.log(`Created the account "${SEED_ACCOUNT_NAME}". It has no password, so it opens`);
+  console.log('straight from the account picker.\n');
+  return created.id;
+}
+
 async function main(): Promise<void> {
-  const args = new Set(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = new Set(argv);
+
+  const flag = argv.indexOf('--account');
+  const target = flag === -1 ? undefined : argv[flag + 1];
+  if (flag !== -1 && (target === undefined || target.startsWith('--'))) {
+    throw new Error('--account needs the name or the id of an account after it.');
+  }
 
   if (args.has('--remove-demo')) {
-    await removeDemo();
+    const account = await findAccount(target);
+    if (account === null) {
+      console.log('There is no seeded account, so there is nothing to remove.');
+      return;
+    }
+    await removeDemo(account.id);
     return;
   }
 
-  await ensureCareer();
+  const userId = await resolveAccount(target);
+  await ensureCareer(userId);
 
   if (args.has('--demo')) {
-    await seedDemo();
+    await seedDemo(userId);
     return;
   }
 
   // The plain seed: an empty career, ready to have real races added to it.
   await syncAchievementDefinitions();
-  const created = await ensureChampionshipPresets(USER_ID);
+  const created = await ensureChampionshipPresets(userId);
   console.log('Career ready.');
   console.log(`  ${created} preset championships added (delete any you do not want).`);
   console.log('\n  Add your first race at /races/new, or run `npm run db:seed:demo`');

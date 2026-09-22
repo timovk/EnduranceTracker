@@ -586,6 +586,46 @@ export async function addSeasonXp(
 // ---------------------------------------------------------------------------
 
 /**
+ * Rebuild every pass's `seasonXp` from the ledger.
+ *
+ * Season XP is a running total in the same way career XP is, and it drifts for
+ * the same reason: a transaction that no longer exists has already been added
+ * to it. Each pass owns a quarter, and `seasonAmount` on the transactions
+ * inside that window is what the pass is worth — so the window is the join.
+ *
+ * Tiers already stamped with `unlockedAt` are deliberately left alone. A
+ * rebuilt total can be lower than the tier someone reached, and that is the
+ * correct outcome: the currency follows the data, the reward stays earned.
+ * Nothing in this application takes back something it has already given.
+ *
+ * Returns the number of passes whose total had to be corrected.
+ */
+export async function rebuildSeasonXpFromLedger(tx: Tx, userId: string): Promise<number> {
+  const passes = await tx.seasonPass.findMany({
+    where: { userId },
+    select: { id: true, startsAt: true, endsAt: true, seasonXp: true },
+  });
+
+  let corrected = 0;
+  for (const pass of passes) {
+    const agg = await tx.xPTransaction.aggregate({
+      where: { userId, createdAt: { gte: pass.startsAt, lt: pass.endsAt } },
+      _sum: { seasonAmount: true },
+    });
+    const total = Math.max(0, agg._sum.seasonAmount ?? 0);
+    if (total === pass.seasonXp) continue;
+
+    await tx.seasonPass.update({
+      where: { id: pass.id },
+      data: { seasonXp: total, tier: tierForXp(total).tier },
+    });
+    corrected += 1;
+  }
+
+  return corrected;
+}
+
+/**
  * Archive every pass whose quarter has ended.
  *
  * This is bookkeeping and nothing else. Tiers that were not reached stay

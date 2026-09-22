@@ -20,13 +20,19 @@ import { clampSpeed, realSecondsFor, timelineSecondsFor } from '@/lib/domain/pla
 import { storyCompleteBonus, xpForSession } from '@/lib/domain/progression';
 import { stintHeading } from '@/lib/copy/tone';
 import type { SessionInput } from '@/lib/validation/schemas';
-import type { SessionOutcome } from './contracts';
-import { awardXp } from './xp-ledger';
+import type { SessionOutcome, SessionRemoval } from './contracts';
+import {
+  awardXp,
+  purgeOrphanedSessionXp,
+  rebuildCareerTotals,
+  revokeSessionXp,
+  revokeXpByDedupeKey,
+} from './xp-ledger';
 import { computeCareerMetrics } from './metrics';
 import { recomputeRaceAggregates } from './race-engine';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
-import { addSeasonXp, getOrCreateCurrentPass } from './season-pass-engine';
+import { addSeasonXp, getOrCreateCurrentPass, rebuildSeasonXpFromLedger } from './season-pass-engine';
 import { evaluateChallenges } from './challenge-engine';
 import { syncAchievements, syncMilestones } from './achievement-engine';
 import { ensureMasteryTrees, syncMastery, recomputeRaceMasteries, getMasteryForChampionship } from './mastery-engine';
@@ -415,17 +421,45 @@ export function chooseCelebration(facts: {
  *
  * Coverage is rebuilt from the REMAINING sessions rather than by subtracting
  * the deleted interval, because intervals merge and subtraction would not be
- * sound. XP already granted is deliberately left in the ledger: there is no
- * negative XP in this application, and a correction should never feel like a
- * punishment for fixing a typo.
+ * sound.
+ *
+ * XP FOLLOWS THE DATA. Deleting a stint deletes the XP that stint earned, and
+ * every total is then rebuilt from the ledger. An earlier version of this
+ * function deliberately left the XP in place, reasoning that there is no
+ * negative XP in this application and that correcting a typo should never feel
+ * like a punishment. The reasoning was sound; the conclusion was not. It left
+ * the career contradicting itself — the race reading "not started" while the
+ * career kept the XP for watching it — and it made test data permanent, since
+ * nothing short of deleting the database could take it back.
+ *
+ * The distinction that resolves it: "never punish" forbids taking XP away as a
+ * PENALTY — for a missed week, a broken streak, a budget overrun. None of that
+ * exists here and none of it ever will. Removing an entry the user is deleting
+ * on purpose is not a penalty, it is the truth catching up. And it is still
+ * done without a single negative number: the ledger rows cease to exist and the
+ * totals are recomputed from what remains.
+ *
+ * What is NOT taken back: achievements, trophies, mastery nodes, collections,
+ * Hall of Fame entries, unlocked season-pass rewards, streaks and momentum.
+ * Those are landmarks rather than balances, and nothing in this application
+ * revokes something it has already given.
  */
-export async function deleteViewingSession(userId: string, sessionId: string, now: Date = new Date()): Promise<void> {
-  await prisma.$transaction(async (tx) => {
+export async function deleteViewingSession(
+  userId: string,
+  sessionId: string,
+  now: Date = new Date(),
+): Promise<SessionRemoval> {
+  return prisma.$transaction(async (tx) => {
     const db = tx as Tx;
     const session = await db.raceViewingSession.findFirstOrThrow({
       where: { id: sessionId, userId },
       select: { id: true, raceId: true },
     });
+
+    // Before the row goes: the XPTransaction relation is `onDelete: SetNull`,
+    // so deleting the session first would strand its awards with a null
+    // sessionId and no way left to identify them.
+    const revoked = await revokeSessionXp(db, userId, session.id);
 
     await db.raceViewingSession.delete({ where: { id: session.id } });
 
@@ -459,7 +493,36 @@ export async function deleteViewingSession(userId: string, sessionId: string, no
       });
     }
 
-    await recomputeRaceAggregates(db, session.raceId, now);
+    const aggregates = await recomputeRaceAggregates(db, session.raceId, now);
+
+    // The Story Complete bonus is keyed to the RACE, not to whichever stint
+    // happened to finish it, so it is governed by whether the race is still
+    // complete rather than by which session was removed. Deleting the row is
+    // what frees the unique dedupeKey — without that, a race that dropped below
+    // the threshold could never award the bonus again, because re-completing it
+    // would be silently swallowed as a duplicate.
+    const storyBonus =
+      aggregates.storyCompletedAt === null
+        ? await revokeXpByDedupeKey(db, userId, `story-complete:${session.raceId}`)
+        : { transactions: 0, careerXp: 0, seasonXp: 0 };
+
+    // Rebuild rather than decrement. Career XP, level, prestige, title and the
+    // per-transaction running totals the XP graph is drawn from all come back
+    // out of the ledger, which is the only thing that was ever authoritative.
+    const ledger = await rebuildCareerTotals(db, userId);
+    await rebuildSeasonXpFromLedger(db, userId);
+
+    return {
+      raceId: session.raceId,
+      careerXpRemoved: revoked.careerXp + storyBonus.careerXp,
+      seasonXpRemoved: revoked.seasonXp + storyBonus.seasonXp,
+      storyBonusRemoved: storyBonus.transactions > 0,
+      levelBefore: ledger.levelBefore,
+      levelAfter: ledger.levelAfter,
+      careerXpBefore: ledger.careerXpBefore,
+      careerXpAfter: ledger.careerXpAfter,
+      remainingSessions: aggregates.sessionCount,
+    };
   }, TRANSACTION_OPTIONS);
 }
 
@@ -468,3 +531,73 @@ export { recordedHoursInRange };
 
 /** Exposed so the stint summary can show the XP rate the user is earning at. */
 export const XP_PER_REAL_MINUTE = XP_CONFIG.xpPerRealMinute;
+
+/** What a ledger repair put right. */
+export interface LedgerRepair {
+  /** Viewing awards whose stint had already been deleted. */
+  orphanedTransactions: number;
+  /** Story Complete bonuses held by races that are no longer complete. */
+  staleStoryBonuses: number;
+  careerXpBefore: number;
+  careerXpAfter: number;
+  levelBefore: number;
+  levelAfter: number;
+}
+
+/**
+ * Put a career's XP back in step with its data.
+ *
+ * Two things can leave a ledger overstated, and both predate the rule that XP
+ * follows the data:
+ *
+ *   1. Viewing XP left behind by a stint that was deleted. Those rows still
+ *      count towards the career total even though the stint they describe is
+ *      gone — which is exactly how a career ends up permanently inflated by
+ *      data that was entered to try the app out and then removed.
+ *   2. A Story Complete bonus still held by a race that is no longer complete.
+ *      Worse than the XP, its unique dedupeKey blocks the bonus from ever being
+ *      earned again.
+ *
+ * Both are repaired by deletion, never by a negative adjustment, and the totals
+ * are then rebuilt from what remains. Running it on a healthy career changes
+ * nothing, so it is safe to run whenever.
+ */
+export async function repairXpLedger(userId: string): Promise<LedgerRepair> {
+  return prisma.$transaction(async (tx) => {
+    const db = tx as Tx;
+
+    const orphaned = await purgeOrphanedSessionXp(db, userId);
+
+    const bonuses = await db.xPTransaction.findMany({
+      where: { userId, source: 'STORY_COMPLETE', dedupeKey: { startsWith: 'story-complete:' } },
+      select: { id: true, dedupeKey: true },
+    });
+
+    let staleStoryBonuses = 0;
+    for (const bonus of bonuses) {
+      const raceId = bonus.dedupeKey?.slice('story-complete:'.length);
+      if (!raceId) continue;
+      const race = await db.race.findFirst({
+        where: { id: raceId, userId },
+        select: { storyCompletedAt: true },
+      });
+      // A missing race means the bonus outlived what earned it just as surely
+      // as an incomplete one does.
+      if (race && race.storyCompletedAt !== null) continue;
+      await db.xPTransaction.delete({ where: { id: bonus.id } });
+      staleStoryBonuses += 1;
+    }
+
+    const ledger = await rebuildCareerTotals(db, userId);
+    await rebuildSeasonXpFromLedger(db, userId);
+
+    return {
+      orphanedTransactions: orphaned.transactions,
+      staleStoryBonuses,
+      careerXpBefore: ledger.careerXpBefore,
+      careerXpAfter: ledger.careerXpAfter,
+      levelBefore: ledger.levelBefore,
+      levelAfter: ledger.levelAfter,
+    };
+  }, TRANSACTION_OPTIONS);
+}

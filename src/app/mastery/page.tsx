@@ -4,20 +4,22 @@ import { EmptyState, Panel } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 import Link from 'next/link';
 import { getMasteryOverview, ensureMasteryTrees } from '@/lib/engines/mastery-engine';
-import { prisma, USER_ID } from '@/lib/db/client';
+import { prisma } from '@/lib/db/client';
 import type { Tx } from '@/lib/db/client';
 import { ensureCareer } from '@/lib/server/bootstrap';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Mastery' };
 
 export default async function MasteryPage() {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
 
   // Trees are created lazily so a championship added five minutes ago already
   // has one, including a custom championship the user invented themselves.
-  await prisma.$transaction((tx) => ensureMasteryTrees(tx as Tx, USER_ID), { timeout: 30_000 });
-  const trees = await getMasteryOverview(USER_ID);
+  await prisma.$transaction((tx) => ensureMasteryTrees(tx as Tx, userId), { timeout: 30_000 });
+  const trees = await getMasteryOverview(userId);
 
   return (
     <div className="mx-auto max-w-5xl">

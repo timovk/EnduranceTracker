@@ -1,5 +1,5 @@
 /**
- * End-to-end progression integrity, against a real PostgreSQL database.
+ * End-to-end progression integrity, against a real SQLite database.
  *
  * These are the tests that would catch a corrupted career: overlapping
  * sessions double-counting coverage, a Story Complete bonus paid twice, a
@@ -11,7 +11,7 @@
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { prisma, disconnectDb } from '@/lib/db/client';
-import { logViewingSession, deleteViewingSession } from '@/lib/engines/session-engine';
+import { logViewingSession, deleteViewingSession, repairXpLedger } from '@/lib/engines/session-engine';
 import { recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { awardXp, recalculateCareerXp } from '@/lib/engines/xp-ledger';
 import { coverageSeconds, fromRows } from '@/lib/domain/intervals';
@@ -376,7 +376,7 @@ describe('deleting a session', () => {
     expect(await coverageOf(raceId)).toBe(2 * H);
   });
 
-  it('leaves the XP already earned alone', async () => {
+  it('takes back the XP the stint earned', async () => {
     const raceId = await makeRace();
     const session = await logViewingSession(USER, {
       raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 2 * H,
@@ -384,11 +384,144 @@ describe('deleting a session', () => {
     });
 
     const before = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
-    await deleteViewingSession(USER, session.sessionId);
+    const viewing = await prisma.xPTransaction.aggregate({
+      where: { userId: USER, sessionId: session.sessionId, source: { in: ['VIEWING', 'REWATCH'] } },
+      _sum: { amount: true },
+    });
+    expect(viewing._sum.amount ?? 0).toBeGreaterThan(0);
+
+    const removal = await deleteViewingSession(USER, session.sessionId);
     const after = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
 
-    // Correcting a typo is not a punishment: there is no negative XP anywhere.
-    expect(Number(after.careerXp)).toBe(Number(before.careerXp));
+    // XP follows the data: the stint is gone, so the XP it earned is gone with
+    // it. The race reading "not started" while the career kept the XP for
+    // watching it was the contradiction this replaced.
+    expect(removal.careerXpRemoved).toBe(viewing._sum.amount ?? 0);
+    expect(Number(after.careerXp)).toBe(Number(before.careerXp) - removal.careerXpRemoved);
+  });
+
+  it('leaves the profile agreeing with the ledger', async () => {
+    const raceId = await makeRace();
+    const session = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 2 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    await deleteViewingSession(USER, session.sessionId);
+
+    const profile = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+    const ledger = await prisma.xPTransaction.aggregate({
+      where: { userId: USER },
+      _sum: { amount: true },
+    });
+
+    // The ledger is the only authoritative thing. Anything else is a cache.
+    expect(Number(profile.careerXp)).toBe(ledger._sum.amount ?? 0);
+  });
+
+  it('frees the Story Complete bonus so the race can earn it again', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    const bonusKey = `story-complete:${raceId}`;
+
+    const first = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(1);
+
+    const removal = await deleteViewingSession(USER, first.sessionId);
+    expect(removal.storyBonusRemoved).toBe(true);
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(0);
+
+    // The dedupeKey is UNIQUE, so a bonus row outliving the completion it was
+    // awarded for would block the race from ever earning it again — the next
+    // award would be silently swallowed as a duplicate.
+    await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(1);
+  });
+
+  it('keeps the Story Complete bonus while the race is still complete', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    const bonusKey = `story-complete:${raceId}`;
+
+    const first = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    // A second pass over the whole race: coverage now survives the first going.
+    await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+
+    // The bonus row belongs to the FIRST session, which is the one being
+    // deleted — but the bonus is keyed to the race, not to whichever stint
+    // happened to finish it, so it must survive.
+    const removal = await deleteViewingSession(USER, first.sessionId);
+
+    const race = await prisma.race.findUniqueOrThrow({ where: { id: raceId } });
+    expect(race.storyCompletedAt).not.toBeNull();
+    expect(removal.storyBonusRemoved).toBe(false);
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(1);
+  });
+
+  it('re-stamps the running totals so the XP graph stays true', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    const logged = [];
+    for (const [from, to] of [[0, 1], [2, 3], [4, 5]] as const) {
+      logged.push(await logViewingSession(USER, {
+        raceId, mode: 'RANGE', startTimestamp: from * H, endTimestamp: to * H,
+        playbackSpeed: 1, watchedAt: null, note: undefined,
+      }));
+    }
+
+    await deleteViewingSession(USER, logged[1].sessionId);
+
+    const rows = await prisma.xPTransaction.findMany({
+      where: { userId: USER },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: { amount: true, careerXpAfter: true },
+    });
+
+    // `careerXpAfter` is the snapshot the career XP graph is drawn from.
+    // Remove a row from the middle of the history and every snapshot after it
+    // describes a career that no longer happened unless they are replayed.
+    let running = 0;
+    for (const row of rows) {
+      running += row.amount;
+      expect(Number(row.careerXpAfter)).toBe(running);
+    }
+
+    const profile = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+    expect(Number(profile.careerXp)).toBe(running);
+  });
+
+  it('never revokes a landmark, only a balance', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    const session = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+
+    const before = await Promise.all([
+      prisma.achievementProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }),
+      prisma.trophy.count({ where: { userId: USER } }),
+      prisma.masteryProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }),
+    ]);
+
+    await deleteViewingSession(USER, session.sessionId);
+
+    const after = await Promise.all([
+      prisma.achievementProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }),
+      prisma.trophy.count({ where: { userId: USER } }),
+      prisma.masteryProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }),
+    ]);
+
+    // Achievements, trophies and mastery nodes are landmarks, not balances.
+    // Nothing here takes back something it has already given.
+    expect(after).toEqual(before);
   });
 
   it('steps a completed race back to in progress', async () => {
@@ -503,5 +636,77 @@ describe('nothing in the application can reduce progression', () => {
       previousXp = Number(profile.careerXp);
       previousLevel = profile.level;
     }
+  });
+});
+
+describe('repairing a career written before deletion took its XP back', () => {
+  it('removes viewing XP whose stint no longer exists', async () => {
+    const raceId = await makeRace();
+    const session = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 2 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+
+    const inflated = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+
+    // Delete the session row directly, which is exactly what the old
+    // behaviour left behind: `onDelete: SetNull` cuts the award loose and the
+    // career keeps XP for a stint that is gone.
+    await prisma.raceViewingSession.delete({ where: { id: session.sessionId } });
+    const orphaned = await prisma.xPTransaction.count({
+      where: { userId: USER, sessionId: null, source: { in: ['VIEWING', 'REWATCH'] } },
+    });
+    expect(orphaned).toBeGreaterThan(0);
+
+    const repair = await repairXpLedger(USER);
+
+    expect(repair.orphanedTransactions).toBe(orphaned);
+    expect(repair.careerXpAfter).toBeLessThan(Number(inflated.careerXp));
+    expect(await prisma.xPTransaction.count({
+      where: { userId: USER, sessionId: null, source: { in: ['VIEWING', 'REWATCH'] } },
+    })).toBe(0);
+
+    const profile = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+    const ledger = await prisma.xPTransaction.aggregate({ where: { userId: USER }, _sum: { amount: true } });
+    expect(Number(profile.careerXp)).toBe(ledger._sum.amount ?? 0);
+  });
+
+  it('releases a Story Complete bonus held by a race that is no longer complete', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    const bonusKey = `story-complete:${raceId}`;
+
+    const session = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(1);
+
+    // Strip the coverage the way the old deletion path did — the race falls
+    // back to incomplete while the bonus, and its unique key, stay behind.
+    await prisma.raceViewingSession.delete({ where: { id: session.sessionId } });
+    await prisma.watchedInterval.deleteMany({ where: { raceId } });
+    await prisma.race.update({ where: { id: raceId }, data: { storyCompletedAt: null, coverageSec: 0 } });
+
+    const repair = await repairXpLedger(USER);
+
+    expect(repair.staleStoryBonuses).toBe(1);
+    expect(await prisma.xPTransaction.count({ where: { dedupeKey: bonusKey } })).toBe(0);
+  });
+
+  it('changes nothing in a healthy career', async () => {
+    const raceId = await makeRace();
+    await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 2 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+
+    const before = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+    const repair = await repairXpLedger(USER);
+    const after = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } });
+
+    expect(repair.orphanedTransactions).toBe(0);
+    expect(repair.staleStoryBonuses).toBe(0);
+    expect(Number(after.careerXp)).toBe(Number(before.careerXp));
+    expect(after.level).toBe(before.level);
   });
 });

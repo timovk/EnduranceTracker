@@ -5,6 +5,12 @@
  *
  * A persistent rail on desktop (the primary experience) that collapses to a
  * scrollable top bar on tablets and phones.
+ *
+ * The two are breakpoint halves of one navigation rather than a rail plus a
+ * header, so the account control has to appear in both: the rail's footer on
+ * desktop, the wordmark row on everything narrower. The layout resolves the
+ * session and passes the account down, because neither of these can read a
+ * cookie from the client.
  */
 
 import Link from 'next/link';
@@ -13,6 +19,7 @@ import {
   Award, BarChart3, BookOpen, CalendarClock, Gauge, Landmark, Layers,
   ListChecks, Settings, Ticket, Trophy, Waypoints, Target,
 } from 'lucide-react';
+import { AccountMenu, type AccountChip } from '@/components/accounts/account-menu';
 import { cn } from '@/lib/utils';
 
 const NAV = [
@@ -37,7 +44,7 @@ function isActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
-export function SideNav() {
+export function SideNav({ user }: { user: AccountChip }) {
   const pathname = usePathname();
 
   return (
@@ -78,20 +85,25 @@ export function SideNav() {
         </ul>
       </div>
 
-      <p className="border-t border-hairline px-5 py-3 text-[0.6875rem] leading-relaxed text-ink-faint">
+      <div className="border-t border-hairline p-2.5">
+        <AccountMenu user={user} />
+      </div>
+
+      <p className="px-5 pb-3 text-[0.6875rem] leading-relaxed text-ink-faint">
         Experience the complete story.
       </p>
     </nav>
   );
 }
 
-export function TopNav() {
+export function TopNav({ user }: { user: AccountChip }) {
   const pathname = usePathname();
 
   return (
     <div className="sticky top-0 z-30 border-b border-hairline bg-base/92 backdrop-blur lg:hidden">
-      <div className="flex items-center gap-3 px-4 py-2.5">
+      <div className="flex items-center justify-between gap-3 px-4 py-2.5">
         <Link href="/"><Wordmark compact /></Link>
+        <AccountMenu user={user} compact />
       </div>
       <nav aria-label="Main" className="-mb-px flex gap-1 overflow-x-auto px-3 pb-2">
         {NAV.map((item) => {

@@ -7,7 +7,7 @@ import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { xpBySource } from '@/lib/engines/xp-ledger';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 import { welcomeBack, momentumNote } from '@/lib/copy/tone';
 import { formatHours, formatNumber } from '@/lib/utils';
 
@@ -15,15 +15,16 @@ export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Career' };
 
 export default async function CareerPage() {
-  await ensureCareer();
+  const userId = await requireUserId();
+  await ensureCareer(userId);
 
   const [career, ledger, momentum, streak, metrics, bySource] = await Promise.all([
-    getCareerView(USER_ID),
-    getXpLedger(USER_ID),
-    getMomentum(USER_ID).catch(() => null),
-    getStreak(USER_ID).catch(() => null),
-    computeCareerMetrics(USER_ID),
-    xpBySource(USER_ID),
+    getCareerView(userId),
+    getXpLedger(userId),
+    getMomentum(userId).catch(() => null),
+    getStreak(userId).catch(() => null),
+    computeCareerMetrics(userId),
+    xpBySource(userId),
   ]);
 
   return (

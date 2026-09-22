@@ -2,14 +2,15 @@ import { PageHeader } from '@/components/layout/page-header';
 import { HallOfFameTimeline } from '@/components/dashboard/hall-of-fame';
 import { getHallOfFame } from '@/lib/engines/awards-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
-import { USER_ID } from '@/lib/db/client';
+import { requireUserId } from '@/lib/auth/session';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Hall of Fame' };
 
 export default async function HallOfFamePage() {
-  await ensureCareer();
-  const hall = await getHallOfFame(USER_ID);
+  const userId = await requireUserId();
+  await ensureCareer(userId);
+  const hall = await getHallOfFame(userId);
 
   return (
     <div className="mx-auto max-w-4xl">

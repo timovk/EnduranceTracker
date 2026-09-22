@@ -10,8 +10,8 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     globals: false,
     setupFiles: ['./tests/setup.ts'],
-    // The integration tests share one PostgreSQL database, so they must not
-    // race each other across worker processes.
+    // The integration tests share one SQLite file, so they must not race each
+    // other across worker processes.
     fileParallelism: false,
     coverage: {
       provider: 'v8',
