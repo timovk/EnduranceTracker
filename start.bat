@@ -34,6 +34,11 @@ if not exist "node_modules" (
   if errorlevel 1 goto failed
 )
 
+REM Whether this is a first run has to be decided BEFORE the migration runs,
+REM because applying migrations is itself what creates the database file.
+set FIRSTRUN=0
+if not exist "endurance.db" set FIRSTRUN=1
+
 echo   Preparing your career database...
 REM `npm run`, never `npx`: npx falls back to the registry's `latest` when it
 REM cannot resolve the local copy, and that is currently a release candidate
@@ -41,14 +46,11 @@ REM for the next major version with a different command set.
 call npm run db:deploy
 if errorlevel 1 goto failed
 
-if not exist "endurance.db" goto seed
-goto run
+if "%FIRSTRUN%"=="1" (
+  echo   Setting up a new career...
+  call npm run db:seed
+)
 
-:seed
-echo   Setting up a new career...
-call npm run db:seed
-
-:run
 echo.
 echo   ===============================================================
 echo     Endurance Racing Career Mode is starting.
