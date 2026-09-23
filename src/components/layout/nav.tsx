@@ -44,7 +44,7 @@ function isActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
-export function SideNav({ user }: { user: AccountChip }) {
+export function SideNav({ user, version }: { user: AccountChip; version: string }) {
   const pathname = usePathname();
 
   return (
@@ -89,9 +89,17 @@ export function SideNav({ user }: { user: AccountChip }) {
         <AccountMenu user={user} />
       </div>
 
-      <p className="px-5 pb-3 text-[0.6875rem] leading-relaxed text-ink-faint">
-        Experience the complete story.
-      </p>
+      <div className="flex items-baseline justify-between gap-3 px-5 pb-3">
+        <p className="text-[0.6875rem] leading-relaxed text-ink-faint">Experience the complete story.</p>
+        <Link
+          href="/changelog"
+          title="Update log"
+          aria-current={isActive(pathname, '/changelog') ? 'page' : undefined}
+          className="timing shrink-0 text-[0.6875rem] text-ink-faint transition-colors hover:text-[var(--accent)]"
+        >
+          v{version}
+        </Link>
+      </div>
     </nav>
   );
 }

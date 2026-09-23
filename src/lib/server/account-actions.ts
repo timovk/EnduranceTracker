@@ -33,6 +33,7 @@ import {
   ACCOUNT_GONE_NOTE, PASSWORDS_DIFFER_NOTE, WRONG_PASSWORD_NOTE,
 } from '@/components/accounts/copy';
 import type { ActionResult } from '@/lib/server/actions';
+import { markReleaseNotesSeen } from '@/lib/server/whats-new';
 
 // ---------------------------------------------------------------------------
 // Getting in
@@ -268,4 +269,11 @@ function passwordFrom(form: FormData, key: string): string | null {
   const value = form.get(key);
   if (typeof value !== 'string' || value === '') return null;
   return value;
+}
+
+/** Close the "What's new" panel for good — for this account, for this version. */
+export async function dismissReleaseNotesAction(): Promise<void> {
+  const userId = await requireUserId();
+  await markReleaseNotesSeen(userId);
+  revalidatePath('/', 'layout');
 }

@@ -25,18 +25,22 @@
  *   --keep         leave the throwaway user-data folder behind to look at
  *   --headed       ignored; kept so the command reads the same as Playwright's
  *
- * This has been run, against the compiled shell and a real standalone build
- * on Linux under xvfb: 17 checks, all passing, in about forty seconds. It is
- * not a paper exercise.
+ * This has been run against the packaged Linux build under xvfb: 29 checks,
+ * including a simulated update from 0.2.0, all passing in about a minute and
+ * a half. It is not a paper exercise.
  */
 
 import { _electron as electron } from 'playwright';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
+const require = createRequire(import.meta.url);
+const VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
 
 const argv = process.argv.slice(2);
 const packagedApp = valueOf('--app');
@@ -235,6 +239,65 @@ try {
       check(amount > 0, `career XP awarded was ${amount}`);
     });
 
+    section(`Version ${VERSION}`);
+
+    await step('puts the version in the title bar', async () => {
+      const titles = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map((w) => w.getTitle()));
+      check(
+        titles.some((title) => title.startsWith(`Endurance Racing Career ${VERSION}`)),
+        `no window title carried the version: ${JSON.stringify(titles)}`,
+      );
+    });
+
+    await step('shows no "What\'s new" to an account created on this version', async () => {
+      await go(page, '/');
+      await page.waitForSelector('text=Dashboard', { timeout: ACTION_TIMEOUT_MS });
+      check(!(await page.isVisible("text=What's new in")), 'the update notes were shown to a brand-new account');
+    });
+
+    await step('opens the update log from the version in the sidebar', async () => {
+      await page.click(`a:has-text("v${VERSION}")`);
+      await waitForPath(page, (path) => path === '/changelog');
+      const body = (await page.textContent('body')) ?? '';
+      check(body.includes('Update log') && body.includes(VERSION), 'the update log did not show this version');
+    });
+
+    await step('draws the app in Graphite, the one theme every account has', async () => {
+      const theme = await page.evaluate(() => document.documentElement.dataset.theme);
+      check(theme === 'graphite', `the dashboard theme was ${theme}`);
+    });
+
+    await step('offers only earned themes in Settings', async () => {
+      await go(page, '/settings');
+      const picker = page.locator('[data-picker="Dashboard theme"]');
+      await picker.waitFor({ timeout: ACTION_TIMEOUT_MS });
+      check(await picker.locator('button:has-text("Graphite")').isEnabled(), 'Graphite could not be chosen');
+      check(await picker.locator('button:has-text("Midnight")').isDisabled(), 'Midnight could be chosen unearned');
+    });
+
+    await step('logs a stint by the time left on the clock', async () => {
+      await go(page, `/races/${raceId}`);
+      await page.click('button:has-text("Log a stint")');
+      await page.click('button:has-text("Time left")');
+      // The resume point, 02:00:00 in, reads as 04:00:00 left on a six-hour clock.
+      const start = page.locator('input[placeholder="06:00:00"]');
+      check((await start.inputValue()) === '04:00:00', `the start read ${await start.inputValue()}`);
+      await page.fill('input[placeholder="05:30:00"]', '03:30:00');
+      await page.waitForSelector('text=/In race time that is\\s*02:00:00\\s*to\\s*02:30:00/', { timeout: ACTION_TIMEOUT_MS });
+      await page.click('button:has-text("Log stint")');
+      await page.waitForSelector('text=/33% → 42%/', { timeout: ACTION_TIMEOUT_MS });
+    });
+
+    await step('remembers "Time left" for the next stint', async () => {
+      await go(page, `/races/${raceId}`);
+      await page.click('button:has-text("Log a stint")');
+      const selected = await page.getAttribute('button:has-text("Time left")', 'aria-selected');
+      check(selected === 'true', 'the form did not open on Time left');
+      const start = await page.inputValue('input[placeholder="06:00:00"]');
+      check(start === '03:30:00', `the resume point read ${start}`);
+      await page.keyboard.press('Escape');
+    });
+
     section('A second account');
 
     await step('signs out', async () => {
@@ -299,6 +362,64 @@ try {
   await step('quits without leaving the server child behind', async () => {
     await app.close();
   });
+}
+
+section('Updating from an earlier version');
+
+const markerFile = join(userDataDir, 'last-version.json');
+const backupDir = join(userDataDir, 'backups');
+let updated = null;
+
+try {
+  await step('recorded this version once it had started', async () => {
+    const marker = JSON.parse(readFileSync(markerFile, 'utf8'));
+    check(marker.version === VERSION, `the marker says ${marker.version}`);
+    check(!existsSync(backupDir) || readdirSync(backupDir).length === 0, 'a first install took a backup of nothing');
+  });
+
+  await step('is made to look like 0.2.0 was the last version here', async () => {
+    // 0.2.0 kept no version marker and knew nothing of release notes, so an
+    // update from it looks exactly like this.
+    rmSync(markerFile);
+    const script = join(userDataDir, 'forget-notes.cjs');
+    writeFileSync(script, `
+      const Database = require(${JSON.stringify(join(ROOT, 'node_modules', 'better-sqlite3'))});
+      const db = new Database(${JSON.stringify(join(userDataDir, 'data', 'endurance.db'))});
+      db.prepare("DELETE FROM config_overrides WHERE key = 'lastSeenVersion'").run();
+      db.close();
+    `);
+    const electronBinary = packagedApp ? resolve(packagedApp) : require('electron');
+    const result = spawnSync(electronBinary, [script], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, encoding: 'utf8' });
+    check(result.status === 0, `could not edit the database: ${result.stderr}`);
+  });
+
+  updated = await electron.launch({ ...launchOptions, timeout: BOOT_TIMEOUT_MS });
+  const page = await waitForApplicationWindow(updated);
+
+  await step('saved a copy of the career before touching it', async () => {
+    const copies = existsSync(backupDir) ? readdirSync(backupDir).filter((name) => name.startsWith(`pre-update-${VERSION}-`)) : [];
+    check(copies.length === 1, `expected one pre-update copy, found ${JSON.stringify(copies)}`);
+  });
+
+  await step('shows "What\'s new" once, and not again after it is closed', async () => {
+    if (pathOf(page).startsWith('/accounts')) {
+      await page.click(`button:has-text("${FIRST_ACCOUNT}")`);
+      await waitForPath(page, (path) => path === '/');
+    }
+    await page.waitForSelector(`text=What's new in ${VERSION}`, { timeout: ACTION_TIMEOUT_MS });
+    await page.click('button:has-text("Got it")');
+    await page.waitForSelector(`text=What's new in ${VERSION}`, { state: 'hidden', timeout: ACTION_TIMEOUT_MS });
+    await page.waitForTimeout(500);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Dashboard', { timeout: ACTION_TIMEOUT_MS });
+    check(!(await page.isVisible(`text=What's new in ${VERSION}`)), 'the notes came back after being closed');
+  });
+} finally {
+  if (updated) {
+    await step('quits cleanly after the update', async () => {
+      await updated.close();
+    });
+  }
 
   if (!keepUserData) rmSync(userDataDir, { recursive: true, force: true });
   else process.stdout.write(`Kept ${userDataDir}\n`);

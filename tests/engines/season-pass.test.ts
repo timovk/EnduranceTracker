@@ -10,8 +10,13 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { cumulativeXpForTier, rewardForTier, tierCost, tierForXp } from '@/lib/engines/season-pass-engine';
-import { SEASON_PASS_CONFIG, XP_CONFIG, BUDGET_CONFIG, MILESTONE_REWARDS, STANDARD_REWARDS } from '@/lib/config';
+import {
+  cumulativeXpForTier, nextPassAppearance, nextSeason, rewardForTier, tierCost, tierForXp,
+} from '@/lib/engines/season-pass-engine';
+import {
+  SEASON_PASS_CONFIG, XP_CONFIG, BUDGET_CONFIG, MILESTONE_REWARDS, STANDARD_REWARDS, THEMES, THEME_REWARDS,
+  DEFAULT_THEME_KEY,
+} from '@/lib/config';
 
 const TIERS = SEASON_PASS_CONFIG.tierCount;
 
@@ -182,3 +187,72 @@ describe('rewards', () => {
     }
   });
 });
+
+describe('themes rotate by quarter', () => {
+  const Q3_2026 = { year: 2026, quarter: 3 };
+  const Q4_2026 = { year: 2026, quarter: 4 };
+  const Q1_2027 = { year: 2027, quarter: 1 };
+
+  function themesIn(season: { year: number; quarter: number }): string[] {
+    const keys: string[] = [];
+    for (let tier = 1; tier <= TIERS; tier += 1) {
+      const reward = rewardForTier(tier, SEASON_PASS_CONFIG, season);
+      if (reward.type === 'THEME') keys.push(reward.key);
+    }
+    return keys;
+  }
+
+  it('offers two themes a quarter, in the same two slots', () => {
+    expect(themesIn(Q4_2026)).toHaveLength(2);
+    expect(themesIn(Q1_2027)).toHaveLength(2);
+  });
+
+  it('starts the rotation with Sarthe and Daytona in the Q4 2026 pass', () => {
+    expect(themesIn(Q4_2026)).toEqual(['theme_sarthe', 'theme_daytona']);
+    expect(themesIn(Q1_2027)).toEqual(['theme_nordschleife', 'theme_midnight']);
+  });
+
+  it('offers every earnable theme within any two consecutive quarters', () => {
+    const earnable = THEMES.filter((theme) => theme.key !== DEFAULT_THEME_KEY).map((theme) => `theme_${theme.key}`);
+    let season = Q3_2026;
+    for (let i = 0; i < 8; i += 1) {
+      const next = nextSeason(season);
+      const offered = new Set([...themesIn(season), ...themesIn(next)]);
+      for (const key of earnable) expect(offered, `${season.year} Q${season.quarter}`).toContain(key);
+      season = next;
+    }
+  });
+
+  it('never offers the theme every account already has', () => {
+    let season = Q3_2026;
+    for (let i = 0; i < 8; i += 1) {
+      expect(themesIn(season)).not.toContain(`theme_${DEFAULT_THEME_KEY}`);
+      season = nextSeason(season);
+    }
+    expect(Object.values(THEME_REWARDS).map((r) => r.key)).not.toContain(`theme_${DEFAULT_THEME_KEY}`);
+  });
+
+  it('changes nothing but the theme slots from one quarter to the next', () => {
+    for (let tier = 1; tier <= TIERS; tier += 1) {
+      const a = rewardForTier(tier, SEASON_PASS_CONFIG, Q4_2026);
+      const b = rewardForTier(tier, SEASON_PASS_CONFIG, Q1_2027);
+      if (a.type === 'THEME') expect(b.type).toBe('THEME');
+      else expect(b.key, `tier ${tier}`).toBe(a.key);
+    }
+  });
+
+  it('can say where each theme is next on offer', () => {
+    for (const reward of Object.values(THEME_REWARDS)) {
+      const found = nextPassAppearance(reward.key, Q4_2026);
+      expect(found, reward.key).not.toBeNull();
+      expect(rewardForTier(found!.tier, SEASON_PASS_CONFIG, found!.season).key).toBe(reward.key);
+    }
+    expect(nextPassAppearance('theme_does_not_exist', Q4_2026)).toBeNull();
+  });
+
+  it('rolls the year over after the fourth quarter', () => {
+    expect(nextSeason(Q4_2026)).toEqual({ year: 2027, quarter: 1 });
+    expect(nextSeason(Q3_2026)).toEqual(Q4_2026);
+  });
+});
+

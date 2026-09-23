@@ -18,6 +18,7 @@ import {
   MASTERY_CONFIG, MASTERY_SHAPE, MILESTONE_CONFIG, MILESTONE_REWARDS, MOMENTUM_CONFIG,
   MOMENTUM_SHAPE, PRESTIGE_CONFIG, RACE_CARD_STYLES, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG,
   SEASON_PASS_SHAPE, STANDARD_REWARDS, STATS_CONFIG, STORY_CONFIG, STRATEGIST_CONFIG, STRATEGIST_SHAPE, THEMES,
+  THEME_ROTATION, DEFAULT_THEME_KEY, DEFAULT_RACE_CARD_KEY,
   TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG,
 } from '@/lib/config';
 
@@ -221,6 +222,17 @@ describe('the season pass', () => {
   it('has unique reward keys', () => {
     const all = [...STANDARD_REWARDS, ...MILESTONE_REWARDS];
     expect(new Set(all.map((r) => r.key)).size).toBe(all.length);
+  });
+
+  it('offers only real themes, and never the one every account has', () => {
+    const themeKeys = new Set(THEMES.map((theme) => theme.key));
+    const offered = [...MILESTONE_REWARDS, ...THEME_ROTATION.flat()].filter((r) => r.type === 'THEME');
+    for (const reward of offered) {
+      expect(themeKeys, reward.key).toContain(reward.key.replace(/^theme_/, ''));
+      expect(reward.key).not.toBe(`theme_${DEFAULT_THEME_KEY}`);
+    }
+    expect(themeKeys).toContain(DEFAULT_THEME_KEY);
+    expect(new Set(RACE_CARD_STYLES.map((c) => c.key))).toContain(DEFAULT_RACE_CARD_KEY);
   });
 });
 

@@ -52,7 +52,7 @@ export function AccentPicker({
 }: { value: string; onChange: (key: string) => void }) {
   return (
     <div>
-      <div className="label mb-1.5">Accent</div>
+      <div className="label mb-1.5">Card colour</div>
       <div className="flex flex-wrap gap-2">
         {ACCOUNT_ACCENTS.map((option) => (
           <button
@@ -73,6 +73,9 @@ export function AccentPicker({
           </button>
         ))}
       </div>
+      <p className="mt-1.5 text-[0.6875rem] text-ink-faint">
+        Colours your account card and avatar. The rest of the app takes its colour from your dashboard theme.
+      </p>
       <input type="hidden" name="accentKey" value={value} />
     </div>
   );

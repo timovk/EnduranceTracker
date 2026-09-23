@@ -7,6 +7,12 @@
  * see immediately what "02:47:31 / 06:00:00" means: 46.5% complete, 3h 12m of
  * race left, and what that will cost in real time at your playback speed.
  *
+ * Three ways to say where a stint was. Timestamps and Duration are the race's
+ * own elapsed clock; Time left is the countdown the broadcast shows, typed
+ * exactly as it appeared — 05:30:00 half an hour into the 6 Hours of Imola —
+ * and converted to elapsed time here, before anything is sent. The server and
+ * the session engine never know the difference.
+ *
  * Notes are optional and always will be. The application never asks the user
  * to write down what happened in the race.
  */
@@ -16,6 +22,7 @@ import { CheckCircle2, Clock3, Gauge } from 'lucide-react';
 import { Button, Field, Input, Segmented, Textarea } from '@/components/ui/controls';
 import { Badge } from '@/components/ui/primitives';
 import { formatDuration, formatTimestamp, tryParseTimestamp } from '@/lib/domain/time';
+import { elapsedToRemaining, remainingToElapsed, type StintEntryMode } from '@/lib/domain/race-clock';
 import { PLAYBACK_SPEEDS, realSecondsFor, timelineSecondsFor } from '@/lib/domain/playback';
 import { addInterval, coverageSeconds } from '@/lib/domain/intervals';
 import type { Interval } from '@/lib/domain/types';
@@ -25,16 +32,20 @@ export interface LogSessionFormProps {
   raceId: string;
   raceName: string;
   runtimeSec: number;
+  /** The length the broadcast clock counts down from. */
+  scheduledSec: number;
   intervals: Interval[];
   /** Where the engine thinks you should pick up: the start of the first gap. */
   resumeAtSec: number;
   defaultSpeed: number;
+  /** How this account entered its last stint. */
+  defaultMode?: StintEntryMode;
   action: (formData: FormData) => void | Promise<void>;
   onCancel?: () => void;
   pending?: boolean;
 }
 
-type Mode = 'RANGE' | 'DURATION';
+type Mode = StintEntryMode;
 
 /** What the live preview works out from the current form state. */
 interface StintPreview {
@@ -55,18 +66,47 @@ interface StintPreview {
 }
 
 export function LogSessionForm({
-  raceId, raceName, runtimeSec, intervals, resumeAtSec, defaultSpeed, action, onCancel, pending,
+  raceId, raceName, runtimeSec, scheduledSec, intervals, resumeAtSec, defaultSpeed, defaultMode = 'RANGE',
+  action, onCancel, pending,
 }: LogSessionFormProps) {
-  const [mode, setMode] = React.useState<Mode>('RANGE');
-  const [start, setStart] = React.useState(formatTimestamp(resumeAtSec));
+  const clock = { scheduledSec, runtimeSec };
+  const [mode, setMode] = React.useState<Mode>(defaultMode);
+  // The resume point, in whichever direction the chosen mode reads the clock.
+  const [start, setStart] = React.useState(() =>
+    formatTimestamp(defaultMode === 'REMAINING' ? elapsedToRemaining(resumeAtSec, clock) : resumeAtSec),
+  );
   const [end, setEnd] = React.useState('');
   const [minutes, setMinutes] = React.useState('');
   const [speed, setSpeed] = React.useState(defaultSpeed);
   const [note, setNote] = React.useState('');
 
-  const startSec = tryParseTimestamp(start);
-  const endSec = mode === 'RANGE' ? tryParseTimestamp(end) : null;
+  const remaining = mode === 'REMAINING';
+  const startTyped = tryParseTimestamp(start);
+  const endTyped = mode === 'DURATION' ? null : tryParseTimestamp(end);
+  // Everything below works in elapsed seconds, whatever was typed.
+  const startSec = startTyped === null ? null : remaining ? remainingToElapsed(startTyped, clock) : startTyped;
+  const endSec = endTyped === null ? null : remaining ? remainingToElapsed(endTyped, clock) : endTyped;
   const realMinutes = mode === 'DURATION' ? Number.parseFloat(minutes) : Number.NaN;
+
+  /**
+   * Change mode, carrying what has been typed across. Moving between elapsed
+   * and remaining rewrites both fields in the new direction, so switching to
+   * look at the other reading never loses the one you had.
+   */
+  function changeMode(next: Mode) {
+    if ((next === 'REMAINING') !== remaining) {
+      const convert = (value: string): string => {
+        const parsed = tryParseTimestamp(value);
+        if (parsed === null) return value;
+        if (next === 'REMAINING') return formatTimestamp(elapsedToRemaining(parsed, clock));
+        const elapsed = remainingToElapsed(parsed, clock);
+        return elapsed === null ? value : formatTimestamp(elapsed);
+      };
+      setStart(convert);
+      setEnd(convert);
+    }
+    setMode(next);
+  }
 
   const preview = React.useMemo<StintPreview | null>(() => {
     if (startSec === null) return null;
@@ -105,19 +145,44 @@ export function LogSessionForm({
     };
   }, [startSec, endSec, realMinutes, mode, speed, intervals, runtimeSec]);
 
-  const startError = start.trim() !== '' && startSec === null ? 'Use HH:MM:SS, for example 02:47:31.' : null;
-  const endError =
-    mode === 'RANGE' && end.trim() !== '' && (endSec === null || (startSec !== null && endSec <= startSec))
-      ? endSec === null ? 'Use HH:MM:SS.' : 'The stint has to end after it starts.'
-      : null;
+  const clockStart = formatTimestamp(scheduledSec);
+  const startError = (() => {
+    if (start.trim() === '') return null;
+    if (startTyped === null) return `Use HH:MM:SS, for example ${remaining ? '05:30:00' : '02:47:31'}.`;
+    if (remaining && startSec === null) return `The clock starts at ${clockStart}.`;
+    return null;
+  })();
+  const endError = (() => {
+    if (mode === 'DURATION' || end.trim() === '') return null;
+    if (endTyped === null) return 'Use HH:MM:SS.';
+    if (remaining && endSec === null) return `The clock starts at ${clockStart}.`;
+    if (startSec !== null && endSec !== null && endSec <= startSec) {
+      return remaining
+        ? 'The clock counts down, so this should be lower than where you started.'
+        : 'The stint has to end after it starts.';
+    }
+    return null;
+  })();
 
   return (
     <form action={action} className="space-y-4">
       <input type="hidden" name="raceId" value={raceId} />
-      <input type="hidden" name="mode" value={mode} />
+      {/* A countdown reading is sent as the elapsed range it describes. */}
+      <input type="hidden" name="mode" value={mode === 'DURATION' ? 'DURATION' : 'RANGE'} />
+      <input type="hidden" name="entryMode" value={mode} />
       <input type="hidden" name="playbackSpeed" value={speed} />
-      <input type="hidden" name="startTimestamp" value={start} />
-      {mode === 'RANGE' ? <input type="hidden" name="endTimestamp" value={end} /> : null}
+      <input
+        type="hidden"
+        name="startTimestamp"
+        value={remaining ? (startSec === null ? '' : formatTimestamp(startSec)) : start}
+      />
+      {mode !== 'DURATION' ? (
+        <input
+          type="hidden"
+          name="endTimestamp"
+          value={remaining ? (endSec === null ? '' : formatTimestamp(endSec)) : end}
+        />
+      ) : null}
       {mode === 'DURATION' ? <input type="hidden" name="realMinutes" value={minutes} /> : null}
       <input type="hidden" name="note" value={note} />
 
@@ -129,32 +194,45 @@ export function LogSessionForm({
         <Segmented
           size="sm"
           value={mode}
-          onChange={(value) => setMode(value)}
+          onChange={(value) => changeMode(value)}
           options={[
             { value: 'RANGE', label: 'Timestamps', title: 'I know where I stopped' },
+            { value: 'REMAINING', label: 'Time left', title: 'I know what the race clock said' },
             { value: 'DURATION', label: 'Duration', title: 'I know how long I watched' },
           ]}
         />
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Started at" error={startError} hint="Race timeline position">
+        <Field
+          label={remaining ? 'Clock when you started' : 'Started at'}
+          error={startError}
+          hint={remaining ? 'Time remaining, as the broadcast showed it' : 'Race timeline position'}
+        >
           <Input
             value={start}
             onChange={(e) => setStart(e.target.value)}
-            placeholder="01:35:20"
+            placeholder={remaining ? clockStart : '01:35:20'}
             inputMode="numeric"
             className="timing"
             autoFocus
           />
         </Field>
 
-        {mode === 'RANGE' ? (
-          <Field label="Stopped at" error={endError} hint={`Race runtime ${formatTimestamp(runtimeSec)}`}>
+        {mode !== 'DURATION' ? (
+          <Field
+            label={remaining ? 'Clock when you stopped' : 'Stopped at'}
+            error={endError}
+            hint={
+              remaining
+                ? `Counts down from ${clockStart} · 00:00:00 is the chequered flag`
+                : `Race runtime ${formatTimestamp(runtimeSec)}`
+            }
+          >
             <Input
               value={end}
               onChange={(e) => setEnd(e.target.value)}
-              placeholder="02:47:31"
+              placeholder={remaining ? formatTimestamp(Math.max(0, scheduledSec - 1800)) : '02:47:31'}
               inputMode="numeric"
               className="timing"
             />
@@ -174,6 +252,14 @@ export function LogSessionForm({
           </Field>
         )}
       </div>
+
+      {remaining && startSec !== null && endSec !== null && endSec > startSec ? (
+        <p className="-mt-1 text-xs text-ink-dim">
+          In race time that is{' '}
+          <span className="timing text-ink-muted">{formatTimestamp(startSec)}</span> to{' '}
+          <span className="timing text-ink-muted">{formatTimestamp(endSec)}</span>.
+        </p>
+      ) : null}
 
       <div>
         <div className="label mb-1.5 flex items-center gap-1.5">

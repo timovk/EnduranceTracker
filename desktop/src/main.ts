@@ -20,6 +20,8 @@ import { backUpCareer } from './backup';
 import { createLogger, describe, type Logger } from './log';
 import { applyApplicationMenu } from './menu';
 import { runMigrations } from './migrate';
+import { recordVersion, takePreUpdateSnapshot } from './update-snapshot';
+import { composeWindowTitle } from './window-title';
 import { directoriesToCreate, environmentFlags, resolvePaths, type DesktopPaths } from './paths';
 import { startServer, type ServerHandle } from './server';
 import { createSplash, showErrorWindow, type Splash } from './splash';
@@ -122,6 +124,27 @@ async function boot(): Promise<void> {
     await splashPainted(splash);
 
     splash.setStatus('Preparing your career database…');
+
+    // Before the migrations, and before the server has the file open: the
+    // first start of a new version keeps a copy of the career as it was.
+    if (paths.mode !== 'dev') {
+      try {
+        const snapshot = takePreUpdateSnapshot({
+          databaseFile: paths.databaseFile,
+          backupDir: paths.backupDir,
+          markerFile: paths.versionMarkerFile,
+          currentVersion: applicationVersion(),
+        });
+        if (snapshot.taken) logger.info(`saved a copy of the career before updating: ${snapshot.taken}`);
+        else logger.info(`no pre-update copy needed: ${snapshot.skipped}`);
+        for (const name of snapshot.pruned) logger.info(`removed an older pre-update copy: ${name}`);
+      } catch (error) {
+        // A copy that could not be written is worth a line in the log, not a
+        // career that will not open. Every migration is still transactional.
+        logger.error(`could not save a copy before updating; carrying on: ${describe(error)}`);
+      }
+    }
+
     const migrations = runMigrations(paths.databaseFile, paths.migrationsDir);
     logger.info(
       migrations.applied.length === 0
@@ -164,7 +187,7 @@ async function openMainWindow(url: string): Promise<void> {
     // Shown only once it has something to show; the splash covers the gap.
     show: false,
     backgroundColor: BACKGROUND,
-    title: 'Endurance Racing Career',
+    title: composeWindowTitle(applicationVersion(), null),
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -175,6 +198,12 @@ async function openMainWindow(url: string): Promise<void> {
   });
   mainWindow = window;
   if (state.maximised) window.maximize();
+
+  // Every page sets its own <title>; keep the version in front of it.
+  window.on('page-title-updated', (event, pageTitle) => {
+    event.preventDefault();
+    window.setTitle(composeWindowTitle(applicationVersion(), pageTitle));
+  });
 
   window.on('resize', rememberWindowLater);
   window.on('move', rememberWindowLater);
@@ -189,6 +218,14 @@ async function openMainWindow(url: string): Promise<void> {
   splash?.close();
   splash = null;
   logger?.info('the window is open');
+
+  // Only now does this version count as having started here. Recorded any
+  // earlier, an update that failed to start would not take its snapshot again.
+  try {
+    recordVersion(paths!.versionMarkerFile, applicationVersion());
+  } catch (error) {
+    logger?.warn(`could not record the version that started: ${describe(error)}`);
+  }
 }
 
 /**

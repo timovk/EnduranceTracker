@@ -3,11 +3,12 @@ import { Plus } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/controls';
 import { EmptyState, Panel } from '@/components/ui/primitives';
-import { RaceCard } from '@/components/races/race-card';
+import { RaceCard, raceCardVariantOf } from '@/components/races/race-card';
 import { RaceFilterBar } from '@/components/races/race-filter-bar';
 import { getChampionshipOptions, listRaces, type RaceFilter } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
+import { getEffectiveCosmetics } from '@/lib/server/cosmetics';
 import { backlogFraming } from '@/lib/copy/tone';
 import type { RaceStatus } from '@/lib/domain/types';
 
@@ -29,10 +30,12 @@ export default async function RacesPage(props: PageProps<'/races'>) {
     majorOnly: single(params.view) === 'major',
   };
 
-  const [races, championships] = await Promise.all([
+  const [races, championships, cosmetics] = await Promise.all([
     listRaces(userId, filter),
     getChampionshipOptions(userId),
+    getEffectiveCosmetics(userId),
   ]);
+  const cardVariant = raceCardVariantOf(cosmetics.raceCardKey);
 
   const unwatched = races.filter((r) => r.coverageSec === 0 && !r.storyComplete).length;
 
@@ -63,7 +66,7 @@ export default async function RacesPage(props: PageProps<'/races'>) {
         </Panel>
       ) : (
         <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {races.map((race) => <RaceCard key={race.id} race={race} />)}
+          {races.map((race) => <RaceCard key={race.id} race={race} variant={cardVariant} />)}
         </div>
       )}
     </div>

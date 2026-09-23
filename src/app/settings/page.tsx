@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import { PageHeader } from '@/components/layout/page-header';
 import { SettingsForm } from '@/components/dashboard/settings-form';
 import { AccountSettings } from '@/components/accounts/account-settings';
@@ -6,8 +7,10 @@ import { prisma } from '@/lib/db/client';
 import { ensureCareer, ensureBudgetYearRow } from '@/lib/server/bootstrap';
 import { MAX_ACCOUNT_NAME_LENGTH, describeAccountLosses, getAccount } from '@/lib/auth/accounts';
 import { requireUserId } from '@/lib/auth/session';
-import { BUDGET_CONFIG, LEVEL_TITLES, RACE_CARD_STYLES, THEMES, XP_CONFIG, STORY_CONFIG, SEASON_PASS_CONFIG } from '@/lib/config';
-import { levelFromXp, titleForLevel } from '@/lib/domain/progression';
+import { BUDGET_CONFIG, XP_CONFIG, STORY_CONFIG, SEASON_PASS_CONFIG } from '@/lib/config';
+import { getCosmeticState } from '@/lib/server/cosmetics';
+import { APP_VERSION } from '@/lib/version';
+import { formatReleaseDate, releaseNotesFor } from '@/lib/changelog';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Settings' };
@@ -18,9 +21,8 @@ export default async function SettingsPage() {
   const year = new Date().getFullYear();
   await ensureBudgetYearRow(userId, year);
 
-  const [user, profile, budgetYear, speedOverride, counts, account, losses] = await Promise.all([
+  const [user, budgetYear, speedOverride, counts, account, losses, cosmetics] = await Promise.all([
     prisma.user.findUniqueOrThrow({ where: { id: userId } }),
-    prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
     prisma.budgetYear.findUniqueOrThrow({ where: { userId_year: { userId, year } } }),
     prisma.configOverride.findUnique({ where: { userId_key: { userId, key: 'defaultPlaybackSpeed' } } }),
     Promise.all([
@@ -30,10 +32,9 @@ export default async function SettingsPage() {
     ]),
     getAccount(userId),
     describeAccountLosses(userId),
+    getCosmeticState(userId),
   ]);
-
-  const level = levelFromXp(Number(profile.careerXp)).level;
-  const unlockedTitles = LEVEL_TITLES.filter((t) => t.level <= level);
+  const notes = releaseNotesFor(APP_VERSION);
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
@@ -47,13 +48,8 @@ export default async function SettingsPage() {
         weekStart={user.weekStart}
         annualBudgetHours={budgetYear.annualBudgetHours}
         weeklyTargetHours={budgetYear.weeklyTargetHours}
-        themeKey={profile.themeKey}
-        raceCardKey={profile.raceCardKey}
-        titleKey={profile.titleKey ?? titleForLevel(level).title}
         defaultPlaybackSpeed={typeof speedOverride?.value === 'number' ? speedOverride.value : 1}
-        themes={[...THEMES]}
-        raceCards={[...RACE_CARD_STYLES]}
-        titles={unlockedTitles.map((t) => t.title)}
+        cosmetics={cosmetics}
         libraryCounts={{ races: counts[0], championships: counts[1], sessions: counts[2] }}
       />
 
@@ -67,6 +63,21 @@ export default async function SettingsPage() {
           losses={losses ?? { races: 0, hours: 0, achievements: 0 }}
         />
       )}
+
+      <Panel>
+        <PanelHeader title="About this app" />
+        <PanelBody className="flex flex-wrap items-center justify-between gap-3 text-sm">
+          <div>
+            <div className="timing text-ink">Endurance Racing Career {APP_VERSION}</div>
+            <div className="mt-0.5 text-xs text-ink-dim">
+              {notes ? `${notes.title} · released ${formatReleaseDate(notes.date)}` : 'A development build'}
+            </div>
+          </div>
+          <Link href="/changelog" className="text-xs text-ink-dim underline-offset-2 hover:text-ink hover:underline">
+            Update log
+          </Link>
+        </PanelBody>
+      </Panel>
 
       <Panel>
         <PanelHeader title="Progression economy" />

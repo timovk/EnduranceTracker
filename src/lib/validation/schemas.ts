@@ -213,7 +213,11 @@ export const settingsSchema = z.object({
   weeklyTargetHours: z.coerce.number().positive().max(168).optional(),
   themeKey: z.string().trim().max(40).optional(),
   raceCardKey: z.string().trim().max(40).optional(),
-  titleKey: z.string().trim().max(80).nullish(),
+  badgeKey: z.string().trim().max(60).optional(),
+  bannerKey: z.string().trim().max(60).optional(),
+  // A prefixed choice — `level:<title>` or `pass:<reward key>` — rather than a
+  // bare title, because the two sources could one day share a name.
+  displayTitle: z.string().trim().max(120).optional(),
   defaultPlaybackSpeed: z.coerce.number().min(MIN_PLAYBACK_SPEED).max(MAX_PLAYBACK_SPEED).optional(),
 });
 export type SettingsInput = z.infer<typeof settingsSchema>;

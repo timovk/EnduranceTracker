@@ -54,13 +54,30 @@ online.
 backups, moving a career to another PC, and what to do when something does not
 work.
 
+### Updating
+
+Download the newer `Endurance Racing Career Setup <version>.exe` and run it over
+the top of the one you have. Your career is kept: it lives outside the program
+folder, and the installer never touches it.
+
+The first time a new version opens it does three things for you:
+
+- saves a copy of your career to `backups\pre-update-<version>-<date>.db`
+  before it changes anything (the last five are kept);
+- shows what changed, once;
+- puts its version in the title bar and at the bottom of the sidebar, which
+  opens the full [update log](CHANGELOG.md).
+
 ### Your career, and where it lives
 
 ```
 %APPDATA%\Endurance Racing Career\
   data\endurance.db        your entire career, in one file
   logs\main.log            what the application did on start-up
-  backups\                 where "Back up career…" suggests saving
+  backups\                 where "Back up career…" suggests saving, and
+                           where each update keeps its copy
+  last-version.json        the last version that started — how an update
+                           is recognised
 ```
 
 Uninstalling deliberately does **not** delete that folder. Reinstall later and
@@ -112,11 +129,15 @@ Worth saying out loud, because "it builds" and "it works" are different claims:
   cannot see the first account's races, a wrong password, a right one, and a
   clean quit with no server process left behind. That is the Linux package of
   exactly the code the Windows job builds.
-- The Windows installer is produced by the CI workflow above. At the time of
-  writing, no one had yet run the resulting `.exe` on a Windows machine — the
-  packaging itself is verified, the Windows-specific parts (NSIS, shortcuts,
-  SmartScreen) are not. If you are the first,
-  [docs/releasing.md](docs/releasing.md) lists what to check.
+- The same packaged binary has been through a **simulated update**: started
+  once, then made to look like a copy of 0.2.0 and started again, to check that
+  it takes exactly one copy of the career before touching it and shows what
+  changed exactly once.
+- The Windows installer is produced by the CI workflow above. The 0.2.0
+  installer has been installed and used on Windows. Installing a newer version
+  over an existing one has so far only been simulated on the Linux package,
+  not done on Windows; [docs/releasing.md](docs/releasing.md) lists what to
+  check.
 - Nothing here is code-signed, so Windows will show a "Windows protected your
   PC" warning on first run. It looks like a virus warning and is not one:
   choose **More info → Run anyway**.

@@ -1,6 +1,6 @@
 {
   "name": "endurance-racing-career",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "description": "A career mode for watching endurance racing — your library, your hours, your record.",
   "author": "Endurance Racing Career",
@@ -34,7 +34,8 @@
     "db:seed:demo": "tsx scripts/seed.ts --demo",
     "db:unseed:demo": "tsx scripts/seed.ts --remove-demo",
     "db:recompute": "tsx scripts/recompute.ts",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "changelog": "tsx scripts/changelog.ts"
   },
   "dependencies": {
     "@prisma/adapter-better-sqlite3": "^7.10.0",

@@ -61,6 +61,8 @@ export interface DesktopPaths {
   logFile: string;
   backupDir: string;
   windowStateFile: string;
+  /** The version that last started successfully — how an update is recognised. */
+  versionMarkerFile: string;
   /** Directory of `<timestamp>_name/migration.sql` directories. */
   migrationsDir: string;
   server: ServerRuntime;
@@ -142,6 +144,7 @@ export function resolvePaths(environment: PathEnvironment): DesktopPaths {
     logFile: join(logDir, 'main.log'),
     backupDir: join(userData, 'backups'),
     windowStateFile: join(userData, 'window-state.json'),
+    versionMarkerFile: join(userData, 'last-version.json'),
     migrationsDir:
       mode === 'packaged'
         ? join(environment.resourcesPath, 'migrations')

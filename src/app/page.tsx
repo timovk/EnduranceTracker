@@ -14,6 +14,7 @@ import { requireUserId } from '@/lib/auth/session';
 import { backlogFraming } from '@/lib/copy/tone';
 
 export const dynamic = 'force-dynamic';
+export const metadata = { title: 'Dashboard' };
 
 export default async function DashboardPage() {
   const userId = await requireUserId();

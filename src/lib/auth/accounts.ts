@@ -14,6 +14,8 @@
 import { prisma } from '@/lib/db/client';
 import { hashPassword, passwordProblem, verifyPassword } from '@/lib/auth/password';
 import { ensureCareer } from '@/lib/server/bootstrap';
+import { DISPLAY_TITLE_KEY, resolveDisplayTitle } from '@/lib/domain/cosmetics';
+import { markReleaseNotesSeen } from '@/lib/server/whats-new';
 
 export const MAX_ACCOUNT_NAME_LENGTH = 32;
 
@@ -92,6 +94,8 @@ const ACCOUNT_SELECT = {
   passwordHash: true,
   lastActiveAt: true,
   careerProfile: { select: { level: true, careerXp: true, titleKey: true } },
+  // The title the account has chosen to display, if any. See resolveDisplayTitle.
+  configOverrides: { where: { key: DISPLAY_TITLE_KEY }, select: { value: true } },
 } as const;
 
 /**
@@ -181,6 +185,10 @@ export async function createAccount(input: NewAccountInput): Promise<string> {
   }
 
   await ensureCareer(id);
+  // Someone creating an account has not just been updated. Without this their
+  // first sight of the app would be a list of changes to a version they never
+  // had.
+  await markReleaseNotesSeen(id);
   return id;
 }
 
@@ -301,6 +309,7 @@ type AccountRow = {
   passwordHash: string | null;
   lastActiveAt: Date | null;
   careerProfile: { level: number; careerXp: bigint; titleKey: string | null } | null;
+  configOverrides: { value: unknown }[];
 };
 
 function toSummary(user: AccountRow, racesCompleted: number, watchedSeconds: number): AccountSummary {
@@ -312,7 +321,9 @@ function toSummary(user: AccountRow, racesCompleted: number, watchedSeconds: num
     hasPassword: user.passwordHash !== null,
     level: user.careerProfile?.level ?? 1,
     careerXp: Number(user.careerProfile?.careerXp ?? 0),
-    titleKey: user.careerProfile?.titleKey ?? null,
+    // The title as displayed — the one chosen in Settings while it is still
+    // available, otherwise the level ladder's.
+    titleKey: resolveDisplayTitle(user.configOverrides[0]?.value, user.careerProfile?.level ?? 1),
     racesCompleted,
     hoursWatched: hoursFrom(watchedSeconds),
     lastActiveAt: user.lastActiveAt,

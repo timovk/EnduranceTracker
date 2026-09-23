@@ -4,9 +4,9 @@
  * Settings.
  *
  * The viewing plan (annual budget, weekly anchor, week start) and the cosmetic
- * choices unlocked through the season pass. Changing the annual budget only
- * affects the current year — past years keep their own figure, so history is
- * never rewritten.
+ * choices unlocked through the season pass, which AppearancePicker draws.
+ * Changing the annual budget only affects the current year — past years keep
+ * their own figure, so history is never rewritten.
  */
 
 import * as React from 'react';
@@ -15,6 +15,8 @@ import { Button, Field, Input, Select } from '@/components/ui/controls';
 import { Panel, PanelBody, PanelHeader, Stat } from '@/components/ui/primitives';
 import { PLAYBACK_SPEEDS } from '@/lib/domain/playback';
 import { seedPresetChampionshipsAction, updateSettingsAction } from '@/lib/server/actions';
+import type { CosmeticState } from '@/lib/server/cosmetics';
+import { AppearancePicker } from '@/components/dashboard/appearance-picker';
 import { formatNumber } from '@/lib/utils';
 
 const WEEKDAYS = [
@@ -24,25 +26,18 @@ const WEEKDAYS = [
 ];
 
 export function SettingsForm({
-  weekStart, annualBudgetHours, weeklyTargetHours, themeKey, raceCardKey,
-  titleKey, defaultPlaybackSpeed, themes, raceCards, titles, libraryCounts,
+  weekStart, annualBudgetHours, weeklyTargetHours, defaultPlaybackSpeed, cosmetics, libraryCounts,
 }: {
   weekStart: number;
   annualBudgetHours: number;
   weeklyTargetHours: number;
-  themeKey: string;
-  raceCardKey: string;
-  titleKey: string;
   defaultPlaybackSpeed: number;
-  themes: { key: string; name: string; description: string; accent: string }[];
-  raceCards: { key: string; name: string; description: string }[];
-  titles: string[];
+  cosmetics: CosmeticState;
   libraryCounts: { races: number; championships: number; sessions: number };
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
   const [notice, setNotice] = React.useState<string | null>(null);
-  const [theme, setTheme] = React.useState(themeKey);
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
@@ -116,47 +111,7 @@ export function SettingsForm({
         </PanelBody>
       </Panel>
 
-      <Panel>
-        <PanelHeader title="Appearance" />
-        <PanelBody className="space-y-4">
-          <div>
-            <div className="label mb-2">Dashboard theme</div>
-            <div className="flex flex-wrap gap-2">
-              {themes.map((option) => (
-                <button
-                  key={option.key}
-                  type="button"
-                  onClick={() => setTheme(option.key)}
-                  title={option.description}
-                  className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs transition-colors ${
-                    option.key === theme
-                      ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)] text-ink'
-                      : 'border-hairline-strong bg-panel-2 text-ink-dim hover:text-ink-muted'
-                  }`}
-                >
-                  <span className="h-3 w-3 rounded-full" style={{ background: option.accent }} />
-                  {option.name}
-                </button>
-              ))}
-            </div>
-            <input type="hidden" name="themeKey" value={theme} />
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Race card design">
-              <Select name="raceCardKey" defaultValue={raceCardKey}>
-                {raceCards.map((card) => <option key={card.key} value={card.key}>{card.name}</option>)}
-              </Select>
-            </Field>
-
-            <Field label="Displayed title" hint="Titles unlock with career level and are purely cosmetic.">
-              <Select name="titleKey" defaultValue={titleKey}>
-                {titles.map((title) => <option key={title} value={title}>{title}</option>)}
-              </Select>
-            </Field>
-          </div>
-        </PanelBody>
-      </Panel>
+      <AppearancePicker cosmetics={cosmetics} />
 
       <Panel>
         <PanelHeader title="Library" />

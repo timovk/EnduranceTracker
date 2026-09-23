@@ -8,6 +8,10 @@ import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { xpBySource } from '@/lib/engines/xp-ledger';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
+import { getAccount } from '@/lib/auth/accounts';
+import { getEffectiveCosmetics } from '@/lib/server/cosmetics';
+import { BadgeEmblem } from '@/components/cosmetics/badge-emblem';
+import { BannerArt } from '@/components/cosmetics/banner-art';
 import { welcomeBack, momentumNote } from '@/lib/copy/tone';
 import { formatHours, formatNumber } from '@/lib/utils';
 
@@ -18,13 +22,15 @@ export default async function CareerPage() {
   const userId = await requireUserId();
   await ensureCareer(userId);
 
-  const [career, ledger, momentum, streak, metrics, bySource] = await Promise.all([
+  const [career, ledger, momentum, streak, metrics, bySource, cosmetics, account] = await Promise.all([
     getCareerView(userId),
     getXpLedger(userId),
     getMomentum(userId).catch(() => null),
     getStreak(userId).catch(() => null),
     computeCareerMetrics(userId),
     xpBySource(userId),
+    getEffectiveCosmetics(userId),
+    getAccount(userId),
   ]);
 
   return (
@@ -36,6 +42,10 @@ export default async function CareerPage() {
       />
 
       <Panel>
+        {/* The banner earned through the season pass, chosen in Settings. */}
+        {cosmetics.bannerKey ? (
+          <BannerArt bannerKey={cosmetics.bannerKey} className="h-24 border-b border-hairline" />
+        ) : null}
         <PanelBody className="flex flex-wrap items-center gap-8">
           <ProgressRing progress={career.progress} size={116} stroke={7} ariaLabel={`Level ${career.level}`}>
             <div>
@@ -45,6 +55,12 @@ export default async function CareerPage() {
           </ProgressRing>
 
           <div className="min-w-0 flex-1 space-y-3">
+            {account ? (
+              <div className="flex items-center gap-2.5">
+                <span className="truncate text-xl font-semibold text-ink">{account.name}</span>
+                {cosmetics.badgeKey ? <BadgeEmblem badgeKey={cosmetics.badgeKey} size={28} /> : null}
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-lg font-medium text-ink">{career.title}</span>
               {career.prestige > 0 ? (

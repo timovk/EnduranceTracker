@@ -11,6 +11,7 @@ import {
   titleForLevel, totalXpForLevel, xpForNextLevel,
 } from '@/lib/domain/progression';
 import { PRESTIGE_CONFIG } from '@/lib/config';
+import { DISPLAY_TITLE_KEY, resolveDisplayTitle } from '@/lib/domain/cosmetics';
 import type { XPSource } from '@/lib/domain/types';
 
 export interface CareerView {
@@ -44,11 +45,16 @@ export interface CareerView {
 }
 
 export async function getCareerView(userId: string, now: Date = new Date()): Promise<CareerView> {
-  const profile = await prisma.careerProfile.findUniqueOrThrow({ where: { userId } });
+  const [profile, titleChoice] = await Promise.all([
+    prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
+    prisma.configOverride.findUnique({
+      where: { userId_key: { userId, key: DISPLAY_TITLE_KEY } },
+      select: { value: true },
+    }),
+  ]);
   const careerXp = Number(profile.careerXp);
   const state = levelFromXp(careerXp);
   const prestige = prestigeForLevel(state.level);
-  const title = titleForLevel(state.level);
 
   const nextPrestigeLevel = nextPrestigeThreshold(state.level);
 
@@ -65,7 +71,7 @@ export async function getCareerView(userId: string, now: Date = new Date()): Pro
     nextPrestigeLevel,
     nextPrestigeLabel: nextPrestigeLevel === null ? null : prestigeLabel(prestige + 1),
 
-    title: title.title,
+    title: resolveDisplayTitle(titleChoice?.value, state.level),
     nextTitle: nextTitleAfter(state.level),
 
     themeKey: profile.themeKey,

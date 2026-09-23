@@ -26,6 +26,9 @@ import {
 } from '@/lib/validation/schemas';
 import { circuitSlug } from '@/lib/engines/race-engine';
 import { championshipSlug, ensureCareer, ensureChampionshipPresets } from './bootstrap';
+import { DISPLAY_TITLE_KEY, getCosmeticState, isChoosable, type CosmeticKind } from './cosmetics';
+import { rememberStintEntryMode } from './preferences';
+import { isStintEntryMode } from '@/lib/domain/race-clock';
 
 export interface ActionResult<T = undefined> {
   ok: boolean;
@@ -299,6 +302,14 @@ export async function logSessionAction(form: FormData): Promise<ActionResult<{ s
   const { logViewingSession } = await import('@/lib/engines/session-engine');
   const outcome = await logViewingSession(userId, parsed.data);
 
+  // The way this stint was typed becomes the default for the next one. Only
+  // after the stint is safely logged: a preference is not worth failing a
+  // write over, and a failed write has not earned remembering.
+  const entryMode = formValue(form, 'entryMode');
+  if (isStintEntryMode(entryMode)) {
+    await rememberStintEntryMode(userId, entryMode).catch(() => undefined);
+  }
+
   revalidatePathsAfterSession(outcome.raceId);
   return { ok: true, data: { sessionId: outcome.sessionId, raceId: outcome.raceId } };
 }
@@ -424,7 +435,9 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
     weeklyTargetHours: formValue(form, 'weeklyTargetHours'),
     themeKey: formValue(form, 'themeKey'),
     raceCardKey: formValue(form, 'raceCardKey'),
-    titleKey: formValue(form, 'titleKey'),
+    badgeKey: formValue(form, 'badgeKey'),
+    bannerKey: formValue(form, 'bannerKey'),
+    displayTitle: formValue(form, 'displayTitle'),
     defaultPlaybackSpeed: formValue(form, 'defaultPlaybackSpeed'),
   });
   if (!parsed.success) {
@@ -433,19 +446,52 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
 
   const input = parsed.data;
 
+  // The pickers only offer what has been unlocked, but this action can be
+  // reached without them, so the rule is enforced here as well. Nothing is
+  // saved if any choice is not available — a half-applied look is worse than
+  // an unchanged one.
+  const cosmetics = await getCosmeticState(userId);
+  const choices: [CosmeticKind, string | undefined][] = [
+    ['theme', input.themeKey],
+    ['raceCard', input.raceCardKey],
+    ['badge', input.badgeKey],
+    ['banner', input.bannerKey],
+    ['title', input.displayTitle],
+  ];
+  for (const [kind, value] of choices) {
+    if (value !== undefined && value !== cosmetics[kind].chosen && !isChoosable(cosmetics, kind, value)) {
+      return { ok: false, message: "That one hasn't been unlocked yet, so nothing was changed." };
+    }
+  }
+
   await prisma.$transaction(async (tx) => {
     if (input.weekStart !== undefined) {
       await tx.user.update({ where: { id: userId }, data: { weekStart: input.weekStart } });
     }
 
-    if (input.themeKey !== undefined || input.raceCardKey !== undefined || input.titleKey !== undefined) {
+    if (
+      input.themeKey !== undefined || input.raceCardKey !== undefined
+      || input.badgeKey !== undefined || input.bannerKey !== undefined
+    ) {
       await tx.careerProfile.update({
         where: { userId },
         data: {
           ...(input.themeKey !== undefined ? { themeKey: input.themeKey } : {}),
           ...(input.raceCardKey !== undefined ? { raceCardKey: input.raceCardKey } : {}),
-          ...(input.titleKey !== undefined ? { titleKey: input.titleKey } : {}),
+          ...(input.badgeKey !== undefined ? { badgeKey: input.badgeKey } : {}),
+          ...(input.bannerKey !== undefined ? { bannerKey: input.bannerKey } : {}),
         },
+      });
+    }
+
+    // Not `careerProfile.titleKey`: that one belongs to the level ladder and is
+    // rewritten on every XP award, which is exactly how a chosen title used to
+    // vanish the next time a stint was logged.
+    if (input.displayTitle !== undefined) {
+      await tx.configOverride.upsert({
+        where: { userId_key: { userId, key: DISPLAY_TITLE_KEY } },
+        update: { value: input.displayTitle },
+        create: { userId, key: DISPLAY_TITLE_KEY, value: input.displayTitle },
       });
     }
 
@@ -475,9 +521,8 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
     }
   });
 
-  revalidatePath('/settings');
-  revalidatePath('/');
-  revalidatePath('/budget');
+  // The theme is applied by the root layout, so every page has to redraw.
+  revalidatePath('/', 'layout');
   return { ok: true, message: 'Settings saved.' };
 }
 

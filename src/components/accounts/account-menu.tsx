@@ -14,6 +14,7 @@ import * as React from 'react';
 import { useRouter } from 'next/navigation';
 import { LogOut, Settings, Users } from 'lucide-react';
 import { AccountAvatar } from '@/components/accounts/avatar';
+import { accentStyle } from '@/components/accounts/identity';
 import { Button } from '@/components/ui/controls';
 import { Dialog } from '@/components/ui/dialog';
 import { signOutAction } from '@/lib/server/account-actions';
@@ -58,7 +59,10 @@ export function AccountMenu({ user, compact }: { user: AccountChip; compact?: bo
           compact ? 'px-2 py-1.5' : 'w-full px-3 py-2',
         )}
       >
-        <AccountAvatar avatarKey={user.avatarKey} size="sm" />
+        {/* The account's card colour, here and nowhere else in the chrome. */}
+        <span className="inline-flex" style={accentStyle(user.accentKey)}>
+          <AccountAvatar avatarKey={user.avatarKey} size="sm" />
+        </span>
         <span className="min-w-0">
           <span className="block max-w-[9rem] truncate text-[0.8125rem] font-medium leading-tight text-ink">
             {user.name}
@@ -74,7 +78,9 @@ export function AccountMenu({ user, compact }: { user: AccountChip; compact?: bo
       <Dialog open={open} onClose={() => setOpen(false)} title="Account" size="sm">
         <div className="space-y-4">
           <div className="flex items-center gap-3">
-            <AccountAvatar avatarKey={user.avatarKey} />
+            <span className="inline-flex" style={accentStyle(user.accentKey)}>
+              <AccountAvatar avatarKey={user.avatarKey} />
+            </span>
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold text-ink">{user.name}</div>
               <div className="label mt-1">Level {formatNumber(user.level)}</div>

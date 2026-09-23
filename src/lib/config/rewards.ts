@@ -44,21 +44,60 @@ export const STANDARD_REWARDS: readonly RewardDef[] = [
   { key: 'badge_hyperpole', name: 'Hyperpole Badge', type: 'BADGE', rarity: 'RARE', color: '#c0504d' },
 ];
 
+/**
+ * The themes the pass can award.
+ *
+ * Graphite is not among them: it is what every account starts with, and a
+ * reward that grants something you already have is not a reward. Declared
+ * before the milestone pool because the pool and the rotation below share
+ * these exact objects.
+ */
+export const THEME_REWARDS = {
+  midnight: { key: 'theme_midnight', name: 'Midnight Dashboard Theme', type: 'THEME', rarity: 'EPIC' },
+  sarthe: { key: 'theme_sarthe', name: 'Sarthe Dashboard Theme', type: 'THEME', rarity: 'RARE' },
+  daytona: { key: 'theme_daytona', name: 'Daytona Dashboard Theme', type: 'THEME', rarity: 'RARE' },
+  nordschleife: { key: 'theme_nordschleife', name: 'Nordschleife Dashboard Theme', type: 'THEME', rarity: 'EPIC' },
+} as const satisfies Record<string, RewardDef>;
+
 /** Bigger rewards for milestone tiers (every 10th by default). */
 export const MILESTONE_REWARDS: readonly RewardDef[] = [
   { key: 'title_quarter_starter', name: 'Title: Quarter Starter', type: 'TITLE', rarity: 'UNCOMMON' },
-  { key: 'theme_graphite', name: 'Graphite Dashboard Theme', type: 'THEME', rarity: 'RARE' },
+  // A THEME entry here marks a rotating slot — see THEME_ROTATION. The theme
+  // named is only what a track built without a quarter shows.
+  THEME_REWARDS.sarthe,
   { key: 'trophy_q_bronze', name: 'Quarterly Bronze Trophy', type: 'TROPHY_ITEM', rarity: 'RARE' },
   { key: 'card_hyperpole', name: 'Hyperpole Race Card', type: 'RACE_CARD', rarity: 'RARE' },
   { key: 'title_halfway', name: 'Title: Halfway Marker', type: 'TITLE', rarity: 'RARE' },
-  { key: 'theme_midnight', name: 'Midnight Dashboard Theme', type: 'THEME', rarity: 'EPIC' },
+  THEME_REWARDS.midnight,
   { key: 'trophy_q_silver', name: 'Quarterly Silver Trophy', type: 'TROPHY_ITEM', rarity: 'EPIC' },
   { key: 'banner_sarthe', name: 'Long Straight Banner', type: 'BANNER', rarity: 'EPIC' },
   { key: 'hof_quarter', name: 'Hall of Fame Collectible: Quarter Plate', type: 'HALL_OF_FAME_COLLECTIBLE', rarity: 'LEGENDARY' },
   { key: 'trophy_q_gold', name: 'Quarterly Gold Trophy', type: 'TROPHY_ITEM', rarity: 'LEGENDARY' },
 ];
 
-/** Dashboard themes unlockable through the pass. Purely visual. */
+/**
+ * Which themes a quarter's pass offers in its theme slots.
+ *
+ * The milestone track has two theme slots and there are four themes to earn,
+ * so they alternate by quarter: any two consecutive quarters offer all four,
+ * and nothing else on the milestone track had to be given up to make room.
+ * Indexed by `year * 4 + (quarter - 1)`, modulo the length.
+ */
+export const THEME_ROTATION: readonly (readonly [RewardDef, RewardDef])[] = [
+  [THEME_REWARDS.nordschleife, THEME_REWARDS.midnight],
+  [THEME_REWARDS.sarthe, THEME_REWARDS.daytona],
+];
+
+/**
+ * The theme every account has from the start. The rest are earned through
+ * the season pass.
+ */
+export const DEFAULT_THEME_KEY = 'graphite';
+
+/** The race card every account has from the start. */
+export const DEFAULT_RACE_CARD_KEY = 'classic';
+
+/** Dashboard themes. Graphite is free; the others come from the pass. Purely visual. */
 export const THEMES = [
   { key: 'graphite', name: 'Graphite', description: 'The default broadcast look.', accent: '#c8a45c' },
   { key: 'midnight', name: 'Midnight', description: 'Deep blue, for the small hours.', accent: '#4f8fd0' },
@@ -67,7 +106,7 @@ export const THEMES = [
   { key: 'nordschleife', name: 'Nordschleife', description: 'Grey skies, green hell.', accent: '#7f9f4f' },
 ] as const;
 
-/** Race-card designs unlockable through the pass. Purely visual. */
+/** Race-card designs. Classic is free; the others come from the pass. Purely visual. */
 export const RACE_CARD_STYLES = [
   { key: 'classic', name: 'Classic', description: 'Clean panel with a coverage bar.' },
   { key: 'timing', name: 'Timing Screen', description: 'Monospaced, sector-striped.' },

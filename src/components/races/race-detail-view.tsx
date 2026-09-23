@@ -24,16 +24,19 @@ import { Dialog } from '@/components/ui/dialog';
 import { GapList, RaceTimeline } from './race-timeline';
 import { TwentyFourHourClock } from './twenty-four-hour-clock';
 import { LogSessionForm } from './log-session-form';
+import type { StintEntryMode } from '@/lib/domain/race-clock';
 import { StintSummary } from './stint-summary';
 import { deleteRaceAction, deleteSessionAction, logSessionAction } from '@/lib/server/actions';
 import { formatDate, formatNumber } from '@/lib/utils';
 
 export function RaceDetailView({
-  race, longHaulThresholdSec, outcome: initialOutcome,
+  race, longHaulThresholdSec, outcome: initialOutcome, defaultEntryMode = 'RANGE',
 }: {
   race: RaceDetail;
   longHaulThresholdSec: number;
   outcome?: SessionOutcome | null;
+  /** How this account last entered a stint. */
+  defaultEntryMode?: StintEntryMode;
 }) {
   const router = useRouter();
   const [logging, setLogging] = React.useState(false);
@@ -295,8 +298,10 @@ export function RaceDetailView({
           raceId={race.id}
           raceName={race.name}
           runtimeSec={race.runtimeSec}
+          scheduledSec={race.scheduledDurationSec}
           intervals={race.intervals}
           resumeAtSec={race.resumeAtSec}
+          defaultMode={defaultEntryMode}
           defaultSpeed={race.avgPlaybackSpeed > 0 ? roundSpeed(race.avgPlaybackSpeed) : 1}
           action={onLogSession}
           onCancel={() => setLogging(false)}

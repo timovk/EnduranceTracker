@@ -1,8 +1,11 @@
 import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import { SideNav, TopNav } from '@/components/layout/nav';
-import { accentStyle } from '@/components/accounts/identity';
+import { WhatsNew } from '@/components/layout/whats-new';
 import { getSessionUser } from '@/lib/auth/session';
+import { getEffectiveCosmetics } from '@/lib/server/cosmetics';
+import { pendingReleaseNotes } from '@/lib/server/whats-new';
+import { APP_VERSION } from '@/lib/version';
 import './globals.css';
 
 const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] });
@@ -36,24 +39,37 @@ export default async function RootLayout({ children }: LayoutProps<'/'>) {
    */
   const user = await getSessionUser().catch(() => null);
 
+  // Neither of these is worth a broken window: without them the page still
+  // renders, in Graphite and without the notes.
+  const [cosmetics, releaseNotes] = user
+    ? await Promise.all([
+        getEffectiveCosmetics(user.id).catch(() => null),
+        pendingReleaseNotes(user.id).catch(() => null),
+      ])
+    : [null, null];
+
   return (
     <html
       lang="en-GB"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-      // The account's accent, applied to the whole application. Signed out it
-      // is left alone, so the picker keeps the default gold until a career
-      // claims the window.
-      style={user ? accentStyle(user.accentKey) : undefined}
+      // The dashboard theme — earned through the season pass, Graphite until
+      // then. Signed out there is no theme, so the account screens keep the
+      // default gold until a career claims the window. The account's own card
+      // colour is deliberately NOT applied here: it colours the account's card
+      // and avatar, and a free choice at sign-up must not be a way round
+      // earning a theme.
+      data-theme={cosmetics?.themeKey}
       suppressHydrationWarning
     >
       <body className="min-h-full">
         {user ? (
           <div className="flex min-h-screen">
-            <SideNav user={user} />
+            <SideNav user={user} version={APP_VERSION} />
             <div className="flex min-w-0 flex-1 flex-col">
               <TopNav user={user} />
               <main className="min-w-0 flex-1 px-4 py-5 sm:px-6 lg:px-8 lg:py-7">{children}</main>
             </div>
+            {releaseNotes ? <WhatsNew entry={releaseNotes} /> : null}
           </div>
         ) : (
           /*

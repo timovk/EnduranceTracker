@@ -41,7 +41,9 @@ import type { SeasonPass } from '@/generated/prisma/client';
 import type { Tx } from '@/lib/db/client';
 import { createManySkippingDuplicates, prisma } from '@/lib/db/client';
 import type { RewardDef } from '@/lib/config';
-import { MILESTONE_REWARDS, SEASON_PASS_CONFIG, SEASON_PASS_SHAPE, STANDARD_REWARDS } from '@/lib/config';
+import {
+  MILESTONE_REWARDS, SEASON_PASS_CONFIG, SEASON_PASS_SHAPE, STANDARD_REWARDS, THEME_ROTATION,
+} from '@/lib/config';
 import { ARCHIVED_PASS_NOTE } from '@/lib/copy/tone';
 import { quarterBounds, quarterOf } from '@/lib/domain/periods';
 import type { Rarity, RewardType } from '@/lib/domain/types';
@@ -290,13 +292,26 @@ function pick(pool: readonly RewardDef[], index: number, poolName: string): Rewa
  * many ordinary tiers came before them rather than by the tier number, so
  * inserting or removing milestone tiers in configuration does not scramble the
  * ordinary ones.
+ *
+ * Given a `season`, the milestone pool's THEME slots are filled from
+ * `THEME_ROTATION` instead, so each quarter offers a different pair of themes.
+ * Everything else about a tier is the same in every quarter. Without a season
+ * the pool is read as written, which is what the tests and the XP-bonus
+ * lookup want.
  */
-export function rewardForTier(tier: number, config: SeasonPassCurveConfig = SEASON_PASS_CONFIG): RewardDef {
+export function rewardForTier(
+  tier: number,
+  config: SeasonPassCurveConfig = SEASON_PASS_CONFIG,
+  season?: PassSeason,
+): RewardDef {
   const n = Math.max(1, Math.floor(tier));
   const every = Math.max(1, Math.floor(config.milestoneEvery));
 
   if (n % every === 0) {
-    return pick(MILESTONE_REWARDS, n / every - 1, 'MILESTONE_REWARDS');
+    const index = n / every - 1;
+    const reward = pick(MILESTONE_REWARDS, index, 'MILESTONE_REWARDS');
+    if (season === undefined || reward.type !== 'THEME') return reward;
+    return rotatingTheme(index, season);
   }
 
   const ordinaryBefore = n - 1 - Math.floor((n - 1) / every);
@@ -312,6 +327,66 @@ export function isMilestoneTier(tier: number, config: SeasonPassCurveConfig = SE
 /** "Q3 2026". The one place the quarter label is spelled. */
 export function quarterLabel(year: number, quarter: number): string {
   return `Q${quarter} ${year}`;
+}
+
+/** A quarter, as a pass knows it. */
+export interface PassSeason {
+  year: number;
+  quarter: number;
+}
+
+/** Quarters since year zero: the index `THEME_ROTATION` is read with. */
+export function seasonIndex(season: PassSeason): number {
+  return season.year * 4 + (season.quarter - 1);
+}
+
+/** The quarter after `season`. */
+export function nextSeason(season: PassSeason): PassSeason {
+  return season.quarter === 4
+    ? { year: season.year + 1, quarter: 1 }
+    : { year: season.year, quarter: season.quarter + 1 };
+}
+
+/**
+ * The theme a quarter's pass puts in a THEME slot of the milestone pool.
+ *
+ * Slots are counted in pool order, so the first THEME entry takes the first
+ * theme of the quarter's pair and the second takes the second.
+ */
+function rotatingTheme(milestoneIndex: number, season: PassSeason): RewardDef {
+  const length = MILESTONE_REWARDS.length;
+  const position = ((milestoneIndex % length) + length) % length;
+  const slot = MILESTONE_REWARDS.slice(0, position).filter((reward) => reward.type === 'THEME').length;
+
+  const rotation = THEME_ROTATION.length;
+  const pair = THEME_ROTATION[((seasonIndex(season) % rotation) + rotation) % rotation];
+  const theme = pair?.[slot % 2];
+  if (theme === undefined) {
+    throw new Error('THEME_ROTATION is empty; check src/lib/config/rewards.ts.');
+  }
+  return theme;
+}
+
+/**
+ * The first place a reward can be earned, from `from` onwards.
+ *
+ * Used to tell someone where a locked cosmetic comes from. Looks a year ahead,
+ * which covers every rotation there is; anything further away than that is
+ * not in the pool at all and returns null.
+ */
+export function nextPassAppearance(
+  rewardKey: string,
+  from: PassSeason,
+  config: SeasonPassCurveConfig = SEASON_PASS_CONFIG,
+): { season: PassSeason; tier: number } | null {
+  let season = from;
+  for (let quarter = 0; quarter < 4; quarter += 1) {
+    for (let tier = 1; tier <= config.tierCount; tier += 1) {
+      if (rewardForTier(tier, config, season).key === rewardKey) return { season, tier };
+    }
+    season = nextSeason(season);
+  }
+  return null;
 }
 
 /**
@@ -348,8 +423,9 @@ interface TierRowSeed {
   isMilestone: boolean;
 }
 
-function tierRowSeed(seasonPassId: string, tier: number): TierRowSeed {
-  const reward = rewardForTier(tier);
+function tierRowSeed(pass: PassRowOwner, tier: number): TierRowSeed {
+  const reward = rewardForTier(tier, SEASON_PASS_CONFIG, pass);
+  const seasonPassId = pass.id;
   return {
     seasonPassId,
     tier,
@@ -375,7 +451,13 @@ function tierRowSeed(seasonPassId: string, tier: number): TierRowSeed {
  * already-running pass instead of leaving it short. Returns how many rows it
  * had to add, which is of interest to a maintenance script and to nobody else.
  */
-async function ensureTierRows(tx: Tx, seasonPassId: string): Promise<number> {
+/** The parts of a pass its tier rows are built from. */
+interface PassRowOwner extends PassSeason {
+  id: string;
+}
+
+async function ensureTierRows(tx: Tx, pass: PassRowOwner): Promise<number> {
+  const seasonPassId = pass.id;
   // The overwhelmingly common case is a pass that is already complete, and it
   // is reached from the top of every logged stint, so settle it with a count
   // before reading a hundred rows to find out the same thing.
@@ -391,7 +473,7 @@ async function ensureTierRows(tx: Tx, seasonPassId: string): Promise<number> {
   const missing: TierRowSeed[] = [];
   for (let tier = 1; tier <= SEASON_PASS_CONFIG.tierCount; tier += 1) {
     if (present.has(tier)) continue;
-    missing.push(tierRowSeed(seasonPassId, tier));
+    missing.push(tierRowSeed(pass, tier));
   }
   if (missing.length === 0) return 0;
 
@@ -421,7 +503,7 @@ export async function getOrCreateCurrentPass(
     create: { userId, year, quarter, startsAt: start, endsAt: end },
   });
 
-  await ensureTierRows(tx, pass.id);
+  await ensureTierRows(tx, pass);
   return pass;
 }
 
