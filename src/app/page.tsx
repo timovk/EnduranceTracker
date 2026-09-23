@@ -42,7 +42,7 @@ export default async function DashboardPage() {
 
       {/* -- Season pass and challenges ------------------------------------- */}
       <div className="grid items-start gap-4 lg:grid-cols-[1fr_1.4fr]">
-        <SeasonPassPanel pass={data.seasonPass} />
+        <SeasonPassPanel pass={data.seasonPass} closure={data.seasonPassClosure} />
         <ChallengesPanel challenges={data.challenges} />
       </div>
 

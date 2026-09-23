@@ -7,11 +7,15 @@
  */
 
 import type { ChallengeView } from '@/lib/engines/challenge-engine';
+import type { SeasonPassClosure } from '@/lib/engines/season-pass-engine';
 import type { ChallengeScope } from '@/lib/domain/types';
 import { Check, Clock } from 'lucide-react';
-import { EXPIRED_CHALLENGE_NOTE } from '@/lib/copy/tone';
+import { EXPIRED_CHALLENGE_NOTE, seasonalChallengesClosedNote } from '@/lib/copy/tone';
 import { Badge, EmptyState, Panel, PanelBody, PanelHeader, TimingBar } from '@/components/ui/primitives';
-import { cn, formatNumber } from '@/lib/utils';
+import { cn, formatDate, formatNumber } from '@/lib/utils';
+
+/** What the seasonal slot needs to know while the season is closed (0.3.1). */
+export type SeasonalClosure = Pick<SeasonPassClosure, 'label' | 'reopensAt'>;
 
 const SCOPES: { scope: ChallengeScope; label: string; blurb: string }[] = [
   { scope: 'DAILY', label: 'Today', blurb: 'Small nudges. They reset at midnight.' },
@@ -20,21 +24,34 @@ const SCOPES: { scope: ChallengeScope; label: string; blurb: string }[] = [
   { scope: 'SEASONAL', label: 'This quarter', blurb: 'The long view, closing with the season pass.' },
 ];
 
-export function ChallengeBoard({ challenges }: { challenges: ChallengeView[] }) {
+export function ChallengeBoard({
+  challenges, seasonalClosure = null,
+}: {
+  challenges: ChallengeView[];
+  /** Set while the season is closed; the seasonal slot then says when it returns. */
+  seasonalClosure?: SeasonalClosure | null;
+}) {
   if (challenges.length === 0) {
     return (
-      <Panel>
-        <EmptyState
-          title="No challenges just now"
-          body="Challenges are built from the races in your library, so a few races is all it takes for some to appear."
-        />
-      </Panel>
+      <div className="space-y-4">
+        <Panel>
+          <EmptyState
+            title="No challenges just now"
+            body="Challenges are built from the races in your library, so a few races is all it takes for some to appear."
+          />
+        </Panel>
+        {seasonalClosure ? <SeasonalClosedPanel closure={seasonalClosure} /> : null}
+      </div>
     );
   }
 
   return (
     <div className="space-y-4">
       {SCOPES.map(({ scope, label, blurb }) => {
+        if (scope === 'SEASONAL' && seasonalClosure) {
+          return <SeasonalClosedPanel key={scope} closure={seasonalClosure} />;
+        }
+
         const items = challenges.filter((c) => c.scope === scope);
         if (items.length === 0) return null;
 
@@ -71,6 +88,23 @@ export function ChallengeBoard({ challenges }: { challenges: ChallengeView[] }) 
         to be available; if it closes untouched, your career is exactly as it was.
       </p>
     </div>
+  );
+}
+
+/** The seasonal slot while the season is closed: when seasonal challenges return. */
+function SeasonalClosedPanel({ closure }: { closure: SeasonalClosure }) {
+  return (
+    <Panel>
+      <PanelHeader
+        title="Seasonal"
+        action={<span className="text-[0.6875rem] text-ink-faint">returns {formatDate(closure.reopensAt)}</span>}
+      />
+      <PanelBody>
+        <p className="text-xs leading-relaxed text-ink-dim">
+          {seasonalChallengesClosedNote(closure.label, formatDate(closure.reopensAt, 'long'))}
+        </p>
+      </PanelBody>
+    </Panel>
   );
 }
 

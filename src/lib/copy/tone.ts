@@ -79,6 +79,48 @@ export function stintHeading(realMinutes: number): string {
   return 'DOUBLE STINT COMPLETE';
 }
 
+// ---------------------------------------------------------------------------
+// The season closure (0.3.1)
+// ---------------------------------------------------------------------------
+//
+// The season pass is closed for a while and opens on a known date. Said
+// plainly: what carries on comes first, then when the pass opens. Never
+// framed as something taken away. `opensOn` is always a formatted date, e.g.
+// "1 October 2026", and `passLabel` the quarter, e.g. "Q4 2026".
+
+/** Headline for the closed season pass. */
+export function seasonPassClosedHeadline(opensOn: string): string {
+  return `Closed until ${opensOn}`;
+}
+
+/** The season pass page, while the pass is closed. */
+export function seasonPassClosedNote(passLabel: string, opensOn: string): string {
+  return (
+    `The ${passLabel} pass opens on ${opensOn} and starts from tier 0, like every pass. ` +
+    'Until then every stint still counts towards your career: career XP, levels, achievements, milestones, ' +
+    'mastery, collections and daily, weekly and monthly challenges all carry on as usual. ' +
+    'Season XP begins when the pass opens.'
+  );
+}
+
+/** The dashboard's season pass panel, while the pass is closed. */
+export function seasonPassClosedShortNote(passLabel: string): string {
+  return `The ${passLabel} pass opens then. Stints keep earning career XP in the meantime.`;
+}
+
+/** The challenges page, in place of the seasonal challenges. */
+export function seasonalChallengesClosedNote(passLabel: string, opensOn: string): string {
+  return (
+    `Seasonal challenges return on ${opensOn}, with the ${passLabel} season pass. ` +
+    'Daily, weekly and monthly challenges carry on as usual.'
+  );
+}
+
+/** The stint summary, in place of the season XP figure. */
+export function seasonClosedStintNote(opensOn: string): string {
+  return `Career XP only until the season pass opens on ${opensOn}.`;
+}
+
 /** Recommendation framing. Suggestions, never instructions. */
 export const RECOMMENDATION_PREFIXES = {
   continue: 'Continue the story',

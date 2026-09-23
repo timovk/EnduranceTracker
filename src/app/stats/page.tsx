@@ -1,6 +1,8 @@
 import { PageHeader } from '@/components/layout/page-header';
 import { StatisticsView } from '@/components/dashboard/statistics-view';
 import { getFilterOptions, getStatistics, type StatsFilter } from '@/lib/engines/stats-engine';
+import { seasonPassClosure } from '@/lib/engines/season-pass-engine';
+import { formatDate } from '@/lib/utils';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
 import type { RaceStatus, RaceType } from '@/lib/domain/types';
@@ -30,6 +32,11 @@ export default async function StatsPage(props: PageProps<'/stats'>) {
     getFilterOptions(userId),
   ]);
 
+  // While the season is closed (0.3.1) the pass figures are all zero; the
+  // panel says why rather than leaving the zeros to speak for themselves.
+  const closure = seasonPassClosure();
+  const seasonClosure = closure ? { label: closure.label, opensOn: formatDate(closure.reopensAt, 'long') } : null;
+
   return (
     <div className="mx-auto max-w-6xl">
       <PageHeader
@@ -37,7 +44,7 @@ export default async function StatsPage(props: PageProps<'/stats'>) {
         title="Statistics"
         description={stats.note}
       />
-      <StatisticsView stats={stats} options={options} />
+      <StatisticsView stats={stats} options={options} seasonClosure={seasonClosure} />
     </div>
   );
 }

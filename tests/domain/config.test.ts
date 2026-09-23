@@ -16,7 +16,7 @@ import {
   ACHIEVEMENT_BOARD_CONFIG, AWARDS_CONFIG, BUDGET_CONFIG, BUDGET_SHAPE, CHALLENGE_CONFIG, CHALLENGE_SHAPE,
   CHAMPIONSHIP_PRESETS, DEFAULT_CONFIG, LEVEL_CONFIG, LEVEL_TITLES, MAJOR_EVENT_SUGGESTIONS,
   MASTERY_CONFIG, MASTERY_SHAPE, MILESTONE_CONFIG, MILESTONE_REWARDS, MOMENTUM_CONFIG,
-  MOMENTUM_SHAPE, PRESTIGE_CONFIG, RACE_CARD_STYLES, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG,
+  MOMENTUM_SHAPE, PRESTIGE_CONFIG, RACE_CARD_STYLES, RACE_TYPE_PRESETS, SEASON_CLOSURE_CONFIG, SEASON_PASS_CONFIG,
   SEASON_PASS_SHAPE, STANDARD_REWARDS, STATS_CONFIG, STORY_CONFIG, STRATEGIST_CONFIG, STRATEGIST_SHAPE, THEMES,
   THEME_ROTATION, DEFAULT_THEME_KEY, DEFAULT_RACE_CARD_KEY,
   TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG,
@@ -236,6 +236,15 @@ describe('the season pass', () => {
   });
 });
 
+describe('the season closure (0.3.1)', () => {
+  it('reopens on the first day of a quarter, so the pass that opens is a whole one', () => {
+    const { year, month, day } = SEASON_CLOSURE_CONFIG.reopensOn;
+    expect(day).toBe(1);
+    expect([1, 4, 7, 10]).toContain(month);
+    expect(year).toBeGreaterThanOrEqual(2026);
+  });
+});
+
 describe('challenges', () => {
   it('offers several per scope', () => {
     for (const count of Object.values(CHALLENGE_CONFIG.counts)) {
@@ -360,6 +369,7 @@ describe('the configuration barrel', () => {
     for (const key of [
       'xp', 'level', 'budget', 'story', 'momentum', 'seasonPass', 'challenge',
       'strategist', 'prestige', 'longHaul', 'mastery', 'milestone', 'achievementBoard', 'awards', 'stats',
+      'seasonClosure',
     ]) {
       expect(DEFAULT_CONFIG).toHaveProperty(key);
     }
@@ -388,7 +398,8 @@ describe('the configuration barrel', () => {
     const imported = new Map<string, unknown>([
       ['XP_CONFIG', XP_CONFIG], ['LEVEL_CONFIG', LEVEL_CONFIG], ['BUDGET_CONFIG', BUDGET_CONFIG],
       ['STORY_CONFIG', STORY_CONFIG], ['MOMENTUM_CONFIG', MOMENTUM_CONFIG],
-      ['SEASON_PASS_CONFIG', SEASON_PASS_CONFIG], ['CHALLENGE_CONFIG', CHALLENGE_CONFIG],
+      ['SEASON_PASS_CONFIG', SEASON_PASS_CONFIG], ['SEASON_CLOSURE_CONFIG', SEASON_CLOSURE_CONFIG],
+      ['CHALLENGE_CONFIG', CHALLENGE_CONFIG],
       ['STRATEGIST_CONFIG', STRATEGIST_CONFIG], ['PRESTIGE_CONFIG', PRESTIGE_CONFIG],
       ['TWENTY_FOUR_HOUR_CONFIG', TWENTY_FOUR_HOUR_CONFIG], ['MASTERY_CONFIG', MASTERY_CONFIG],
       ['MILESTONE_CONFIG', MILESTONE_CONFIG], ['ACHIEVEMENT_BOARD_CONFIG', ACHIEVEMENT_BOARD_CONFIG], ['AWARDS_CONFIG', AWARDS_CONFIG], ['STATS_CONFIG', STATS_CONFIG],

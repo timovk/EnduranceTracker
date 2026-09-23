@@ -42,6 +42,7 @@ import type { Prisma } from '@/generated/prisma/client';
 import { XP_CONFIG } from '@/lib/config';
 import { prisma, type Tx } from '@/lib/db/client';
 import type { CollectionKind } from '@/lib/domain/types';
+import { isSeasonClosed } from '@/lib/domain/season-closure';
 import type { CollectionOutcome } from '@/lib/engines/contracts';
 import { awardXp } from '@/lib/engines/xp-ledger';
 
@@ -574,7 +575,8 @@ export async function syncCollections(tx: Tx, userId: string, now: Date = new Da
     const award = await awardXp(tx, userId, {
       source: 'SEASON_COMPLETE',
       amount: XP_CONFIG.seasonCompleteBonus,
-      seasonAmount: XP_CONFIG.seasonCompleteSeasonXp,
+      // No season XP while the season pass is closed (0.3.1); career XP as ever.
+      seasonAmount: isSeasonClosed(now) ? 0 : XP_CONFIG.seasonCompleteSeasonXp,
       description: `Season Complete — ${collection.name}`,
       sourceRef: season.id,
       // The structural guard. One season, one bonus, for the life of the

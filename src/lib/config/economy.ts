@@ -255,6 +255,24 @@ export const SEASON_PASS_CONFIG = {
   milestoneEvery: 10,
 } as const;
 
+/**
+ * The season pass and seasonal challenges are closed until this date (0.3.1).
+ *
+ * Until then no pass is created, no season XP is paid from any source and no
+ * SEASONAL challenge is generated; career XP is untouched. From the first
+ * instant of this day, in LOCAL time, everything behaves as it did in 0.3.0.
+ *
+ * Stored as calendar parts rather than a `Date` because a `Date` constant
+ * would have to pick a timezone when the module loads, and quarters in this
+ * application are local-time quarters (`quarterBounds`). `month` is 1-based, as
+ * a person would write it; `seasonReopensAt` in `@/lib/domain/season-closure`
+ * is the one place it becomes an instant. It should be the first day of a
+ * quarter, so the pass that opens is a whole quarter long.
+ */
+export const SEASON_CLOSURE_CONFIG = {
+  reopensOn: { year: 2026, month: 10, day: 1 },
+} as const;
+
 // ---------------------------------------------------------------------------
 // Challenges
 // ---------------------------------------------------------------------------

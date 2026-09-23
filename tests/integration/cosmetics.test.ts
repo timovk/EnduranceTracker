@@ -22,7 +22,11 @@ import { LEVEL_TITLES } from '@/lib/config';
 import { APP_VERSION } from '@/lib/version';
 
 const PREFIX = 'CosmeticsTest';
-const NOW = new Date(2026, 8, 23, 12);
+// After the 0.3.1 closure: a pass can only be created once the season has
+// reopened, and these tests need one to stamp their unlocks on.
+const NOW = new Date(2026, 9, 23, 12);
+/** Inside the 0.3.1 closure, when there is no pass at all. */
+const CLOSED = new Date(2026, 8, 23, 12);
 
 let userId: string;
 
@@ -73,6 +77,36 @@ describe('a new account', () => {
       if (option.unlocked) continue;
       expect(option.source, option.value).toMatch(/season pass, tier \d+/);
     }
+  });
+});
+
+describe('while the season is closed (0.3.1)', () => {
+  it('points every locked option at the quarter that reopens, never at this one', async () => {
+    const state = await getCosmeticState(userId, prisma, CLOSED);
+    const locked = [
+      ...state.theme.options, ...state.raceCard.options, ...state.badge.options,
+      ...state.banner.options, ...state.title.options,
+    ].filter((option) => !option.unlocked && !option.source.startsWith('Career level'));
+
+    expect(locked.length).toBeGreaterThan(0);
+    for (const option of locked) {
+      expect(option.source, option.value).not.toMatch(/Q3 2026/);
+      expect(option.source, option.value).not.toMatch(/This quarter/i);
+      expect(option.source, option.value).toMatch(/The Q[1-4] 20\d\d season pass, tier \d+|Not in the season pass/);
+    }
+
+    // The two themes the reopening pass offers are named with their tiers.
+    const sarthe = state.theme.options.find((option) => option.value === 'sarthe');
+    const daytona = state.theme.options.find((option) => option.value === 'daytona');
+    expect(sarthe?.source).toBe('The Q4 2026 season pass, tier 20');
+    expect(daytona?.source).toBe('The Q4 2026 season pass, tier 60');
+  });
+
+  it('reads this quarter again once the season has reopened', async () => {
+    await unlock('badge_greenflag', 'BADGE');
+    const state = await getCosmeticState(userId, prisma, NOW);
+    const sarthe = state.theme.options.find((option) => option.value === 'sarthe');
+    expect(sarthe?.source).toBe("This quarter's season pass, tier 20");
   });
 });
 

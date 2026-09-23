@@ -19,6 +19,7 @@ import { addInterval, coverageSeconds, fromRows } from '@/lib/domain/intervals';
 import { clampSpeed, realSecondsFor, timelineSecondsFor } from '@/lib/domain/playback';
 import { storyCompleteBonus, xpForSession } from '@/lib/domain/progression';
 import { stintHeading } from '@/lib/copy/tone';
+import { isSeasonClosed } from '@/lib/domain/season-closure';
 import type { SessionInput } from '@/lib/validation/schemas';
 import type { SessionOutcome, SessionRemoval } from './contracts';
 import {
@@ -32,7 +33,9 @@ import { computeCareerMetrics } from './metrics';
 import { recomputeRaceAggregates } from './race-engine';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
-import { addSeasonXp, getOrCreateCurrentPass, rebuildSeasonXpFromLedger } from './season-pass-engine';
+import {
+  addSeasonXp, getOrCreateCurrentPass, rebuildSeasonXpFromLedger, seasonClosureNotice,
+} from './season-pass-engine';
 import { evaluateChallenges } from './challenge-engine';
 import { syncAchievements, syncMilestones } from './achievement-engine';
 import { ensureMasteryTrees, syncMastery, recomputeRaceMasteries, getMasteryForChampionship } from './mastery-engine';
@@ -170,11 +173,17 @@ export async function logViewingSession(
     let careerXpAwarded = 0;
     let seasonXpAwarded = 0;
 
+    // While the season is closed (0.3.1) a stint earns career XP only. Every
+    // ledger row it writes carries a season amount of zero, so there is no
+    // season XP anywhere for a later rebuild to find.
+    const seasonClosed = isSeasonClosed(now);
+    const viewingSeasonXp = seasonClosed ? 0 : sessionXp.seasonXp;
+
     if (sessionXp.careerXp > 0) {
       const viewing = await awardXp(db, userId, {
         source: addedSeconds > 0 ? 'VIEWING' : 'REWATCH',
         amount: sessionXp.careerXp,
-        seasonAmount: sessionXp.seasonXp,
+        seasonAmount: viewingSeasonXp,
         description: addedSeconds > 0 ? 'Viewing time' : 'Re-watched section',
         sourceRef: race.id,
         sessionId: session.id,
@@ -182,7 +191,7 @@ export async function logViewingSession(
         // belongs to, and each logged stint is its own row.
       });
       careerXpAwarded += viewing.granted;
-      seasonXpAwarded += sessionXp.seasonXp;
+      seasonXpAwarded += viewingSeasonXp;
       xpBreakdown.push({ label: addedSeconds > 0 ? 'Viewing time' : 'Re-watch', amount: viewing.granted });
     }
 
@@ -190,10 +199,11 @@ export async function logViewingSession(
     let storyBonusAwarded = 0;
     if (aggregates.becameStoryComplete) {
       const bonus = storyCompleteBonus(race.runtimeSec, race.isMajorEvent);
+      const bonusSeasonXp = seasonClosed ? 0 : bonus.seasonXp;
       const award = await awardXp(db, userId, {
         source: 'STORY_COMPLETE',
         amount: bonus.careerXp,
-        seasonAmount: bonus.seasonXp,
+        seasonAmount: bonusSeasonXp,
         description: `Story Complete — ${race.name}`,
         sourceRef: race.id,
         sessionId: session.id,
@@ -203,7 +213,7 @@ export async function logViewingSession(
       });
       storyBonusAwarded = award.granted;
       careerXpAwarded += award.granted;
-      seasonXpAwarded += award.duplicate ? 0 : bonus.seasonXp;
+      seasonXpAwarded += award.duplicate ? 0 : bonusSeasonXp;
       if (award.granted > 0) {
         xpBreakdown.push({ label: `Story Complete (${bonus.label})`, amount: award.granted });
       }
@@ -269,12 +279,19 @@ export async function logViewingSession(
     //
     // Momentum's bonus applies to the quarterly currency only. It can never
     // make permanent career progression easier.
-    await getOrCreateCurrentPass(db, userId, now);
-    const boostedSeasonXp = Math.round(seasonXpAwarded * (1 + momentum.seasonXpBonus));
-    const seasonPassTiers = await addSeasonXp(db, userId, boostedSeasonXp, now, {
-      description: `Stint — ${race.name}`,
-      sourceRef: race.id,
-    });
+    //
+    // While the season is closed there is no pass: none is created, nothing is
+    // added, and the summary reports no season XP and no tiers.
+    let boostedSeasonXp = 0;
+    let seasonPassTiers: SessionOutcome['seasonPassTiers'] = [];
+    if (!seasonClosed) {
+      await getOrCreateCurrentPass(db, userId, now);
+      boostedSeasonXp = Math.round(seasonXpAwarded * (1 + momentum.seasonXpBonus));
+      seasonPassTiers = await addSeasonXp(db, userId, boostedSeasonXp, now, {
+        description: `Stint — ${race.name}`,
+        sourceRef: race.id,
+      });
+    }
 
     // -- 11. Trophies and the Hall of Fame ---------------------------------
     const profileAfter = await db.careerProfile.findUniqueOrThrow({ where: { userId } });
@@ -335,6 +352,7 @@ export async function logViewingSession(
       careerXpAwarded,
       seasonXpAwarded: boostedSeasonXp,
       xpBreakdown,
+      seasonClosure: seasonClosureNotice(now),
 
       levelBefore,
       levelAfter: profileAfter.level,

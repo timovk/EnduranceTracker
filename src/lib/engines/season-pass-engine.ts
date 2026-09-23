@@ -46,8 +46,9 @@ import {
 } from '@/lib/config';
 import { ARCHIVED_PASS_NOTE } from '@/lib/copy/tone';
 import { quarterBounds, quarterOf } from '@/lib/domain/periods';
+import { isSeasonClosed, reopeningSeason, seasonReopensAt } from '@/lib/domain/season-closure';
 import type { Rarity, RewardType } from '@/lib/domain/types';
-import type { SeasonPassTierUnlock } from './contracts';
+import type { SeasonClosureNotice, SeasonPassTierUnlock } from './contracts';
 import { awardXp } from './xp-ledger';
 
 const MS_PER_DAY = 86_400_000;
@@ -409,6 +410,99 @@ export function selectionKeyFor(reward: { key: string; type: RewardType }): stri
 }
 
 // ---------------------------------------------------------------------------
+// The closure (0.3.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by `getOrCreateCurrentPass` while the season is closed.
+ *
+ * A refusal rather than a quiet `null`, because a caller that reaches for a
+ * pass during the closure has a bug, and a bug is better found than absorbed.
+ */
+export class SeasonClosedError extends Error {
+  readonly reopensAt: Date;
+
+  constructor(now: Date) {
+    const reopensAt = seasonReopensAt();
+    super(`The season pass is closed until ${reopensAt.toDateString()} (asked at ${now.toISOString()}).`);
+    this.name = 'SeasonClosedError';
+    this.reopensAt = reopensAt;
+  }
+}
+
+/** One reward the reopening pass will offer, for the closed-state preview. */
+export interface SeasonPassRewardPreview {
+  tier: number;
+  rewardKey: string;
+  rewardName: string;
+  rewardType: RewardType;
+  rarity: Rarity;
+}
+
+/**
+ * What the season-pass screens show while the season is closed.
+ *
+ * Everything in it is derived from configuration through the same functions
+ * that will build the pass when it opens, so the preview cannot disagree with
+ * the track that follows it.
+ */
+export interface SeasonPassClosure {
+  /** Local midnight at which the pass opens. */
+  reopensAt: Date;
+  /** The quarter that opens, e.g. `{ year: 2026, quarter: 4 }`. */
+  season: PassSeason;
+  /** "Q4 2026". */
+  label: string;
+  tierCount: number;
+  /** Every milestone tier of the reopening pass, in tier order. */
+  milestones: SeasonPassRewardPreview[];
+  /** The themes the reopening pass offers, in tier order. */
+  themes: SeasonPassRewardPreview[];
+}
+
+/**
+ * The closed state at `now`, or null when the season is open.
+ *
+ * Pure: it reads no rows and creates none, so a page can call it on every
+ * render.
+ */
+export function seasonPassClosure(
+  now: Date = new Date(),
+  config: SeasonPassCurveConfig = SEASON_PASS_CONFIG,
+): SeasonPassClosure | null {
+  if (!isSeasonClosed(now)) return null;
+
+  const season = reopeningSeason();
+  const track: SeasonPassRewardPreview[] = [];
+  for (let tier = 1; tier <= config.tierCount; tier += 1) {
+    const reward = rewardForTier(tier, config, season);
+    track.push({ tier, rewardKey: reward.key, rewardName: reward.name, rewardType: reward.type, rarity: reward.rarity });
+  }
+
+  return {
+    reopensAt: seasonReopensAt(),
+    season,
+    label: quarterLabel(season.year, season.quarter),
+    tierCount: config.tierCount,
+    milestones: track.filter((entry) => isMilestoneTier(entry.tier, config)),
+    themes: track.filter((entry) => entry.rewardType === 'THEME'),
+  };
+}
+
+/**
+ * The closure as a stint summary records it, or null when the season is open
+ * at `at`.
+ *
+ * `at` is when the stint was logged, not when its summary is read, because the
+ * question the summary answers is whether that stint could earn season XP.
+ */
+export function seasonClosureNotice(at: Date): SeasonClosureNotice | null {
+  if (!isSeasonClosed(at)) return null;
+  const season = reopeningSeason();
+  return { label: quarterLabel(season.year, season.quarter), reopensAt: seasonReopensAt().toISOString() };
+}
+
+// ---------------------------------------------------------------------------
 // Creating a pass
 // ---------------------------------------------------------------------------
 
@@ -493,6 +587,11 @@ export async function getOrCreateCurrentPass(
   userId: string,
   now: Date = new Date(),
 ): Promise<SeasonPass> {
+  // The closure is enforced here, where passes are made, rather than trusted
+  // to every caller: while the season is closed no pass can come into
+  // existence at all, whoever asks.
+  if (isSeasonClosed(now)) throw new SeasonClosedError(now);
+
   const year = now.getFullYear();
   const quarter = quarterOf(now);
   const { start, end } = quarterBounds(year, quarter);
@@ -602,6 +701,10 @@ export async function addSeasonXp(
   now: Date = new Date(),
   meta?: SeasonXpMeta,
 ): Promise<SeasonPassTierUnlock[]> {
+  // While the season is closed there is no pass to add to and no season XP
+  // to add: every source already writes zero, and this is the backstop.
+  if (isSeasonClosed(now)) return [];
+
   const granted = Math.max(0, Math.round(amount));
   const pass = await getOrCreateCurrentPass(tx, userId, now);
 

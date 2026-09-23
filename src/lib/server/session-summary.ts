@@ -15,6 +15,8 @@ import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getMasteryForChampionship } from '@/lib/engines/mastery-engine';
 import { MILESTONES, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
+import { isSeasonClosed } from '@/lib/domain/season-closure';
+import { seasonClosureNotice } from '@/lib/engines/season-pass-engine';
 
 export async function buildOutcomeForSession(
   userId: string,
@@ -25,7 +27,7 @@ export async function buildOutcomeForSession(
     select: {
       id: true, raceId: true, realSeconds: true, timelineSeconds: true,
       newCoverageSeconds: true, playbackSpeed: true, coverageBeforeSec: true,
-      coverageAfterSec: true, watchedAt: true,
+      coverageAfterSec: true, watchedAt: true, createdAt: true,
       race: {
         select: {
           id: true, name: true, runtimeSec: true, storyCompletedAt: true,
@@ -61,7 +63,10 @@ export async function buildOutcomeForSession(
       }),
       prisma.challengeProgress.findMany({
         where: { challenge: { userId }, completedAt: { gte: windowStart } },
-        select: { challenge: { select: { id: true, scope: true, title: true, xpReward: true, seasonXpReward: true } } },
+        select: {
+          completedAt: true,
+          challenge: { select: { id: true, scope: true, title: true, xpReward: true, seasonXpReward: true } },
+        },
       }),
       prisma.milestoneProgress.findMany({
         where: { userId, reachedAt: { gte: windowStart } },
@@ -99,6 +104,10 @@ export async function buildOutcomeForSession(
     careerXpAwarded,
     seasonXpAwarded,
     xpBreakdown: session.xpTransactions.map((t) => ({ label: t.description, amount: t.amount })),
+    // Decided by when the stint was logged (the row's `createdAt`, stamped in
+    // the same transaction), not when the summary is read and not `watchedAt`,
+    // which can be backdated: the engine decided by the time of logging too.
+    seasonClosure: seasonClosureNotice(session.createdAt),
 
     levelBefore: profile.level,
     levelAfter: profile.level,
@@ -142,7 +151,9 @@ export async function buildOutcomeForSession(
       scope: c.challenge.scope,
       title: c.challenge.title,
       xpAwarded: c.challenge.xpReward,
-      seasonXpAwarded: c.challenge.seasonXpReward,
+      // A challenge completed while the season was closed (0.3.1) paid no
+      // season XP, whatever its row says it offered.
+      seasonXpAwarded: isSeasonClosed(c.completedAt ?? session.watchedAt) ? 0 : c.challenge.seasonXpReward,
     })),
     seasonPassTiers: tiers.map((t) => ({
       tier: t.tier,

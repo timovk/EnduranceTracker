@@ -21,6 +21,7 @@ import {
 import type { Rarity, RewardType } from '@/lib/domain/types';
 import { levelFromXp, titleForLevel } from '@/lib/domain/progression';
 import { quarterOf } from '@/lib/domain/periods';
+import { isSeasonClosed, reopeningSeason } from '@/lib/domain/season-closure';
 import {
   AUTOMATIC_TITLE, DISPLAY_TITLE_KEY, NO_SELECTION, PASS_TITLES, effectiveSelection, levelTitleChoice, passTitleChoice, passTitleName, resolveDisplayTitle,
 } from '@/lib/domain/cosmetics';
@@ -166,7 +167,12 @@ export async function getCosmeticState(
   db: Tx = prisma,
   now: Date = new Date(),
 ): Promise<CosmeticState> {
-  const season: PassSeason = { year: now.getFullYear(), quarter: quarterOf(now) };
+  // While the season is closed (0.3.1) there is no pass this quarter, so the
+  // search for where a cosmetic can be earned starts from the quarter that
+  // reopens, and this quarter's rows — there should be none — are not read.
+  const closed = isSeasonClosed(now);
+  const season: PassSeason = closed ? reopeningSeason() : { year: now.getFullYear(), quarter: quarterOf(now) };
+  const noRows: { tier: number; rewardKey: string; unlockedAt: Date | null }[] = [];
 
   const [profile, unlocks, titleChoice, currentRows] = await Promise.all([
     db.careerProfile.findUnique({
@@ -175,11 +181,13 @@ export async function getCosmeticState(
     }),
     unlocksOf(userId, db),
     displayTitleChoice(userId, db),
-    db.seasonPassProgress.findMany({
-      where: { seasonPass: { userId, year: season.year, quarter: season.quarter }, rewardType: { in: COSMETIC_TYPES } },
-      select: { tier: true, rewardKey: true, unlockedAt: true },
-      orderBy: { tier: 'asc' },
-    }),
+    closed
+      ? noRows
+      : db.seasonPassProgress.findMany({
+          where: { seasonPass: { userId, year: season.year, quarter: season.quarter }, rewardType: { in: COSMETIC_TYPES } },
+          select: { tier: true, rewardKey: true, unlockedAt: true },
+          orderBy: { tier: 'asc' },
+        }),
   ]);
 
   const level = levelFromXp(Number(profile?.careerXp ?? 0)).level;

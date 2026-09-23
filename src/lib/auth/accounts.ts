@@ -16,6 +16,7 @@ import { hashPassword, passwordProblem, verifyPassword } from '@/lib/auth/passwo
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { DISPLAY_TITLE_KEY, resolveDisplayTitle } from '@/lib/domain/cosmetics';
 import { markReleaseNotesSeen } from '@/lib/server/whats-new';
+import { markSeasonResetApplied } from '@/lib/server/upgrades/season-reset';
 
 export const MAX_ACCOUNT_NAME_LENGTH = 32;
 
@@ -189,6 +190,9 @@ export async function createAccount(input: NewAccountInput): Promise<string> {
   // first sight of the app would be a list of changes to a version they never
   // had.
   await markReleaseNotesSeen(id);
+  // Nor does it have anything from before 0.3.1 to reset. Marked now so the
+  // one-time season reset never runs on it, whenever the server next starts.
+  await markSeasonResetApplied(id);
   return id;
 }
 

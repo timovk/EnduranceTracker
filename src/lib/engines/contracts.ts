@@ -240,6 +240,19 @@ export interface SessionRemoval {
 // Session result — what the stint summary screen renders
 // ---------------------------------------------------------------------------
 
+/**
+ * The season closure (0.3.1) as a stint summary carries it: the quarter whose
+ * pass opens next, and the instant it opens. The instant is an ISO string
+ * because the summary reaches the page through a JSON route, where a `Date`
+ * would arrive as a string anyway and a type saying otherwise would lie.
+ */
+export interface SeasonClosureNotice {
+  /** "Q4 2026". */
+  label: string;
+  /** Local midnight at which the pass opens, as `Date.toISOString()`. */
+  reopensAt: string;
+}
+
 export interface SessionOutcome {
   sessionId: string;
   raceId: string;
@@ -256,6 +269,12 @@ export interface SessionOutcome {
   careerXpAwarded: number;
   seasonXpAwarded: number;
   xpBreakdown: { label: string; amount: number }[];
+  /**
+   * Set when the stint was logged while the season pass was closed, so it
+   * earned no season XP; the summary says when the pass opens instead of
+   * showing a season XP figure. Null for a stint logged while it was open.
+   */
+  seasonClosure: SeasonClosureNotice | null;
 
   levelBefore: number;
   levelAfter: number;

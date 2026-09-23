@@ -13,26 +13,12 @@ import * as React from 'react';
 import Link from 'next/link';
 import { Clock, Lock } from 'lucide-react';
 import type { SeasonPassSummary, SeasonPassTierView, SeasonPassView } from '@/lib/engines/season-pass-engine';
-import type { RewardType } from '@/lib/domain/types';
 import {
   Panel, PanelBody, PanelHeader, RarityBadge, rarityColor, Stat, TimingBar,
 } from '@/components/ui/primitives';
 import { Segmented } from '@/components/ui/controls';
 import { cn, formatDate, formatNumber } from '@/lib/utils';
-
-const REWARD_LABEL: Record<RewardType, string> = {
-  BADGE: 'Badge',
-  TITLE: 'Title',
-  THEME: 'Theme',
-  RACE_CARD: 'Race card',
-  TROPHY_ITEM: 'Trophy',
-  PATCH: 'Patch',
-  EMBLEM: 'Emblem',
-  BANNER: 'Banner',
-  POSTER: 'Poster',
-  XP_BONUS: 'XP bonus',
-  HALL_OF_FAME_COLLECTIBLE: 'Hall of Fame',
-};
+import { REWARD_TYPE_LABEL } from './reward-labels';
 
 export function SeasonPassTrack({
   pass, history,
@@ -208,7 +194,7 @@ function TierCard({ tier, compact }: { tier: SeasonPassTierView; compact?: boole
             {tier.rewardName}
           </div>
           {!compact ? (
-            <div className="mt-0.5 text-[0.625rem] text-ink-faint">{REWARD_LABEL[tier.rewardType]}</div>
+            <div className="mt-0.5 text-[0.625rem] text-ink-faint">{REWARD_TYPE_LABEL[tier.rewardType]}</div>
           ) : null}
         </div>
         {tier.isMilestone || !compact ? <RarityBadge rarity={tier.rarity} /> : null}

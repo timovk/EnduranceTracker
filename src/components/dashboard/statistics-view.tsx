@@ -26,10 +26,20 @@ import { formatDuration } from '@/lib/domain/time';
 import { Panel, PanelBody, PanelHeader, Stat, TimingBar, EmptyState } from '@/components/ui/primitives';
 import { Button, Segmented, Select } from '@/components/ui/controls';
 import { cn, formatDate, formatHours, formatNumber } from '@/lib/utils';
+import { seasonPassClosedHeadline, seasonPassClosedShortNote } from '@/lib/copy/tone';
+
+/**
+ * The season pass while it is closed (0.3.1), already formatted on the server:
+ * the quarter that opens and the day it opens.
+ */
+export interface StatsSeasonClosure {
+  label: string;
+  opensOn: string;
+}
 
 export function StatisticsView({
-  stats, options,
-}: { stats: Stats; options: StatsFilterOptions }) {
+  stats, options, seasonClosure = null,
+}: { stats: Stats; options: StatsFilterOptions; seasonClosure?: StatsSeasonClosure | null }) {
   const [tab, setTab] = React.useState<'overview' | 'cadence' | 'breakdown' | 'career'>('overview');
 
   return (
@@ -50,7 +60,7 @@ export function StatisticsView({
       {tab === 'overview' ? <Overview stats={stats} /> : null}
       {tab === 'cadence' ? <Cadence stats={stats} /> : null}
       {tab === 'breakdown' ? <Breakdown stats={stats} /> : null}
-      {tab === 'career' ? <Career stats={stats} /> : null}
+      {tab === 'career' ? <Career stats={stats} seasonClosure={seasonClosure} /> : null}
 
       <p className="px-1 pb-2 text-[0.6875rem] leading-relaxed text-ink-faint">
         {stats.completion.note}
@@ -510,7 +520,9 @@ function Breakdown({ stats }: { stats: Stats }) {
 // Career
 // ---------------------------------------------------------------------------
 
-function Career({ stats }: { stats: Stats }) {
+function Career({
+  stats, seasonClosure,
+}: { stats: Stats; seasonClosure: StatsSeasonClosure | null }) {
   const xp = stats.xpHistory.slice(-24).map((point) => ({
     label: point.label.replace(/ \d{4}$/, ''),
     full: point.label,
@@ -575,6 +587,12 @@ function Career({ stats }: { stats: Stats }) {
         <Panel>
           <PanelHeader title="Season passes" />
           <PanelBody className="space-y-3">
+            {seasonClosure ? (
+              <p className="border-b border-hairline pb-3 text-xs leading-relaxed text-ink-dim">
+                <span className="text-ink">{seasonPassClosedHeadline(seasonClosure.opensOn)}.</span>{' '}
+                {seasonPassClosedShortNote(seasonClosure.label)}
+              </p>
+            ) : null}
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
               <Stat label="Quarters" value={formatNumber(stats.seasonPasses.passes)} size="sm" tone="muted" />
               <Stat label="Completed" value={formatNumber(stats.seasonPasses.completedPasses)} size="sm" />

@@ -189,6 +189,81 @@ describe('progression can only ever go forwards', () => {
   });
 });
 
+describe('taking back a reward is confined to the 0.3.1 season reset', () => {
+  /**
+   * 0.3.1 removed the season pass rewards already given, once, at the user's
+   * request. That is the only exception to "nothing takes back what it has
+   * given", and it lives in exactly one module. Any other file that deletes a
+   * trophy, a Hall of Fame entry, a season pass, its tiers or a challenge is
+   * the exception spreading.
+   */
+  const RESET_MODULE = 'src/lib/server/upgrades/season-reset.ts';
+
+  /**
+   * Allowed alongside it: the developer seed script's `--remove-demo`, which
+   * deletes a career made only of demonstration data. It is not part of the
+   * application and never runs in it. Only the deletions it already makes are
+   * allowed there, not the whole file, so a new one added to it is still
+   * caught.
+   */
+  const SEED_SCRIPT = 'scripts/seed.ts';
+  const SEED_DELETIONS = [
+    'trophy.deleteMany', 'hallOfFameEntry.deleteMany', 'challenge.deleteMany', 'seasonPass.deleteMany',
+  ];
+
+  const REWARD_DELETE =
+    /\b(?:trophy|hallOfFameEntry|seasonPass|seasonPassProgress|challenge|challengeProgress)\s*\.\s*delete(?:Many)?\b/;
+  const REWARD_DELETE_SQL =
+    /DELETE\s+FROM\s+["'`]?(?:trophies|hall_of_fame_entries|season_passes|season_pass_progress|challenges|challenge_progress)\b/i;
+
+  const EVERYWHERE = [
+    ...walk(join(ROOT, 'src'), /\.(?:ts|tsx|js|mjs)$/),
+    ...DESKTOP_FILES,
+    ...walk(join(ROOT, 'scripts'), /\.(?:ts|js|mjs)$/),
+  ];
+
+  it('deletes rewards nowhere but the reset module', () => {
+    const offenders = EVERYWHERE.filter((file) => {
+      if (rel(file) === RESET_MODULE || rel(file) === SEED_SCRIPT) return false;
+      const code = codeOf(file);
+      return REWARD_DELETE.test(code) || REWARD_DELETE_SQL.test(readFileSync(file, 'utf8'));
+    });
+    expect(offenders.map(rel)).toEqual([]);
+  });
+
+  it('lets the seed script make only the demo-removal deletions it already makes', () => {
+    const file = join(ROOT, SEED_SCRIPT);
+    const found = [...codeOf(file).matchAll(new RegExp(REWARD_DELETE.source, 'g'))]
+      .map((match) => match[0].replace(/\s+/g, ''));
+    expect(found.sort()).toEqual([...SEED_DELETIONS].sort());
+    expect(REWARD_DELETE_SQL.test(readFileSync(file, 'utf8'))).toBe(false);
+  });
+
+  it('re-locks a reward nowhere, in any file', () => {
+    // Taking a reward back by writing its unlock date away is the same thing
+    // as deleting it. The engines are held to this above; this holds every
+    // other file to it too. (The reset module deletes, it never re-locks.)
+    const RELOCK = /data:\s*\{[^}]*\b(?:unlockedAt|awardedAt|completedAt):\s*null\b/;
+    const offenders = EVERYWHERE.filter((file) => RELOCK.test(codeOf(file)));
+    expect(offenders.map(rel)).toEqual([]);
+  });
+
+  it('keeps the reset module outside the engines', () => {
+    expect(RESET_MODULE.startsWith('src/lib/engines/')).toBe(false);
+    for (const file of ENGINE_FILES) {
+      expect(codeOf(file), rel(file)).not.toMatch(/upgrades\/season-reset/);
+    }
+  });
+
+  it('finds the deletions it allows where it expects them', () => {
+    // If this ever fails, the rule above is passing for the wrong reason.
+    const code = codeOf(join(ROOT, RESET_MODULE));
+    expect(code).toMatch(/trophy\.deleteMany/);
+    expect(code).toMatch(/hallOfFameEntry\.deleteMany/);
+    expect(code).toMatch(/seasonPass\.deleteMany/);
+  });
+});
+
 describe('the application never scolds', () => {
   const FORBIDDEN = [
     'you failed', 'you lost', 'you missed', 'penalty', 'penalised', 'penalized',

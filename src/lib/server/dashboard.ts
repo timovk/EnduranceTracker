@@ -13,7 +13,9 @@ import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getRecommendations } from '@/lib/engines/strategist-engine';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { ensureChallenges, expireStaleChallenges, getActiveChallenges } from '@/lib/engines/challenge-engine';
-import { archiveExpiredPasses, getSeasonPassView } from '@/lib/engines/season-pass-engine';
+import {
+  archiveExpiredPasses, getSeasonPassView, seasonPassClosure, type SeasonPassClosure,
+} from '@/lib/engines/season-pass-engine';
 import { getCareerView } from './career';
 import { getCurrentStint } from './races';
 import { welcomeBack } from '@/lib/copy/tone';
@@ -28,6 +30,12 @@ export interface DashboardData {
   recommendations: Recommendation[];
   budget: BudgetSnapshot | null;
   seasonPass: SeasonPassSummaryData | null;
+  /**
+   * Set while the season pass is closed (0.3.1): when it reopens and what the
+   * reopening pass offers. Null once it is open. `seasonPass` is null
+   * throughout the closure, because no pass exists.
+   */
+  seasonPassClosure: SeasonPassClosure | null;
   challenges: ChallengeRow[];
   unlocks: UnlockRowData[];
   snapshot: CareerSnapshotData;
@@ -104,6 +112,8 @@ export async function getDashboard(userId: string, now: Date = new Date()): Prom
           nextRewardRarity: pass.nextTiers[0]?.rarity ?? null,
         }
       : null,
+
+    seasonPassClosure: seasonPassClosure(now),
 
     challenges: challenges.map((challenge) => ({
       id: challenge.id,

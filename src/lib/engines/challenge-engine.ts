@@ -39,6 +39,7 @@ import { createManySkippingDuplicates, prisma } from '@/lib/db/client';
 import { CHALLENGE_CONFIG, CHALLENGE_NOMINALS, CHALLENGE_SHAPE } from '@/lib/config';
 import { EXPIRED_CHALLENGE_NOTE } from '@/lib/copy/tone';
 import { periodForScope, type Period } from '@/lib/domain/periods';
+import { isSeasonClosed } from '@/lib/domain/season-closure';
 import { averagePlaybackSpeed, clampSpeed } from '@/lib/domain/playback';
 import { formatDuration } from '@/lib/domain/time';
 import type { ChallengeScope, ChallengeState } from '@/lib/domain/types';
@@ -112,6 +113,23 @@ export type ChallengeParams = {
 };
 
 const SCOPES: readonly ChallengeScope[] = ['DAILY', 'WEEKLY', 'MONTHLY', 'SEASONAL'];
+
+/**
+ * The scopes that are open at `now`.
+ *
+ * SEASONAL challenges belong to the season pass, and close with it while the
+ * season is closed (0.3.1). Daily, weekly and monthly challenges carry on as
+ * normal and keep paying career XP; only their season XP is withheld, when
+ * they are completed, by `seasonXpFor`.
+ */
+function openScopes(now: Date): readonly ChallengeScope[] {
+  return isSeasonClosed(now) ? SCOPES.filter((scope) => scope !== 'SEASONAL') : SCOPES;
+}
+
+/** The season XP a challenge pays if it is completed at `now`: none while the season is closed. */
+function seasonXpFor(challenge: { seasonXpReward: number }, now: Date): number {
+  return isSeasonClosed(now) ? 0 : challenge.seasonXpReward;
+}
 
 /** Display order for a board that shows every scope at once. */
 const SCOPE_ORDER: Readonly<Record<ChallengeScope, number>> = {
@@ -1773,7 +1791,7 @@ export async function ensureChallenges(
   const user = await db.user.findUniqueOrThrow({ where: { id: userId }, select: { weekStart: true } });
   const library = await loadLibrarySnapshot(userId, now, db);
 
-  const periods = SCOPES.map((scope) => ({ scope, period: periodForScope(scope, now, user.weekStart) }));
+  const periods = openScopes(now).map((scope) => ({ scope, period: periodForScope(scope, now, user.weekStart) }));
 
   const generated = periods.flatMap(({ scope, period }) =>
     buildChallengesForScope(scope, library, period, `${userId}:${scope}:${period.key}`),
@@ -1860,7 +1878,7 @@ export async function evaluateChallenges(
   now: Date = new Date(),
 ): Promise<ChallengeCompletion[]> {
   const open = await tx.challenge.findMany({
-    where: { userId, periodStart: { lte: now }, periodEnd: { gt: now } },
+    where: { userId, scope: { in: [...openScopes(now)] }, periodStart: { lte: now }, periodEnd: { gt: now } },
     include: { progress: true },
   });
 
@@ -1905,10 +1923,11 @@ export async function evaluateChallenges(
     // One-shot, so the award carries a stable dedupe key. If the ledger has
     // seen it before, `awardXp` grants nothing and says so — which is success,
     // not an error.
+    const seasonXp = seasonXpFor(challenge, now);
     const award = await awardXp(tx, userId, {
       source: 'CHALLENGE',
       amount: challenge.xpReward,
-      seasonAmount: challenge.seasonXpReward,
+      seasonAmount: seasonXp,
       description: `Challenge — ${challenge.title}`,
       sourceRef: challenge.id,
       dedupeKey: `challenge:${challenge.id}`,
@@ -1921,7 +1940,7 @@ export async function evaluateChallenges(
       xpAwarded: award.granted,
       // Season XP is passed straight through to the caller, which adds it to
       // the quarter's pass alongside the session's own. It is never deducted.
-      seasonXpAwarded: award.duplicate ? 0 : challenge.seasonXpReward,
+      seasonXpAwarded: award.duplicate ? 0 : seasonXp,
     });
   }
 
@@ -1993,7 +2012,7 @@ export async function getActiveChallenges(
   db: Tx = prisma,
 ): Promise<ChallengeView[]> {
   const rows = await db.challenge.findMany({
-    where: { userId, periodStart: { lte: now }, periodEnd: { gt: now } },
+    where: { userId, scope: { in: [...openScopes(now)] }, periodStart: { lte: now }, periodEnd: { gt: now } },
     include: { progress: true },
   });
   if (rows.length === 0) return [];
@@ -2032,7 +2051,9 @@ export async function getActiveChallenges(
         progress: row.target > 0 ? Math.min(1, Math.max(0, value / row.target)) : 1,
         state,
         xpReward: row.xpReward,
-        seasonXpReward: row.seasonXpReward,
+        // What completing it now would pay, so nothing advertises season XP
+        // while the season is closed.
+        seasonXpReward: seasonXpFor(row, now),
         periodStart: row.periodStart,
         periodEnd: row.periodEnd,
         msRemaining,

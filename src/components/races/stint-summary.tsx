@@ -16,9 +16,10 @@ import Link from 'next/link';
 import { ArrowRight, Award, Check, Layers, ListChecks, Ticket, Trophy, Zap } from 'lucide-react';
 import type { SessionOutcome } from '@/lib/engines/contracts';
 import { formatDuration } from '@/lib/domain/time';
+import { seasonClosedStintNote } from '@/lib/copy/tone';
 import { Panel, RarityBadge, SectorRule, TimingBar } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
-import { cn, formatHours, formatNumber } from '@/lib/utils';
+import { cn, formatDate, formatHours, formatNumber } from '@/lib/utils';
 
 export function StintSummary({
   outcome, onDismiss, nextHref = '/planner',
@@ -84,10 +85,14 @@ export function StintSummary({
                 +{formatNumber(outcome.careerXpAwarded)}
               </div>
             </div>
-            <div>
-              <div className="label mb-1">Season XP</div>
-              <div className="timing text-2xl text-ink-muted">+{formatNumber(outcome.seasonXpAwarded)}</div>
-            </div>
+            {/* While the season pass is closed there is no season XP to show,
+                and a "+0" would read as something withheld. */}
+            {outcome.seasonClosure ? null : (
+              <div>
+                <div className="label mb-1">Season XP</div>
+                <div className="timing text-2xl text-ink-muted">+{formatNumber(outcome.seasonXpAwarded)}</div>
+              </div>
+            )}
             {outcome.levelsGained > 0 ? (
               <div>
                 <div className="label mb-1">Career level</div>
@@ -103,6 +108,12 @@ export function StintSummary({
               </div>
             ) : null}
           </div>
+
+          {outcome.seasonClosure ? (
+            <p className="mt-2 text-xs text-ink-faint">
+              {seasonClosedStintNote(formatDate(outcome.seasonClosure.reopensAt, 'long'))}
+            </p>
+          ) : null}
 
           {outcome.xpBreakdown.length > 1 ? (
             <ul className="mt-3 space-y-1 border-t border-hairline pt-3">
@@ -249,7 +260,7 @@ function Figure({ label, value, big }: { label: string; value: string; big?: boo
   return (
     <div className="min-w-0">
       <div className="label mb-1">{label}</div>
-      <div className={cn('timing truncate text-ink', big ? 'text-xl sm:text-2xl' : 'text-base sm:text-lg')}>
+      <div className={cn('timing truncate text-ink', big ? 'text-xl sm:text-2xl' : 'text-[1rem] sm:text-lg')}>
         {value}
       </div>
     </div>

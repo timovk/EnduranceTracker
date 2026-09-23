@@ -16,7 +16,9 @@ import {
 } from '@/lib/domain/periods';
 import {
   ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, EXPIRED_CHALLENGE_NOTE,
-  FORBIDDEN_TONE_WORDS, momentumNote, RECOMMENDATION_FOOTNOTE, stintHeading, welcomeBack,
+  FORBIDDEN_TONE_WORDS, momentumNote, RECOMMENDATION_FOOTNOTE, seasonClosedStintNote,
+  seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
+  seasonPassClosedShortNote, stintHeading, welcomeBack,
 } from '@/lib/copy/tone';
 
 describe('viewing weeks', () => {
@@ -182,6 +184,13 @@ function everyUserFacingString(): string[] {
   for (const count of [0, 1, 2, 12, 250]) strings.push(backlogFraming(count));
   for (const minutes of [5, 25, 57, 130, 400]) strings.push(stintHeading(minutes));
   for (const projected of [100, 285, 336, 351, 500]) strings.push(budgetProjectionNote(projected, 336));
+  strings.push(
+    seasonPassClosedHeadline('1 October 2026'),
+    seasonPassClosedNote('Q4 2026', '1 October 2026'),
+    seasonPassClosedShortNote('Q4 2026'),
+    seasonalChallengesClosedNote('Q4 2026', '1 October 2026'),
+    seasonClosedStintNote('1 October 2026'),
+  );
   return strings;
 }
 
@@ -210,6 +219,26 @@ describe('tone', () => {
     expect(over).toContain('351 hours');
     expect(over).toContain('entirely fine');
     expect(over).not.toContain('too much');
+  });
+
+  it('announces the season closure by what carries on and when it opens', () => {
+    // The closure is a date, not a loss: every line names when the pass opens,
+    // and what is being said about a stint is that career XP still counts.
+    const note = seasonPassClosedNote('Q4 2026', '1 October 2026');
+    expect(note).toContain('1 October 2026');
+    expect(note).toContain('Q4 2026');
+    expect(note.toLowerCase()).toContain('still counts towards your career');
+    expect(seasonalChallengesClosedNote('Q4 2026', '1 October 2026')).toContain('return on 1 October 2026');
+    expect(seasonClosedStintNote('1 October 2026')).toContain('Career XP');
+
+    const closure = [
+      seasonPassClosedHeadline('1 October 2026'), note, seasonPassClosedShortNote('Q4 2026'),
+      seasonalChallengesClosedNote('Q4 2026', '1 October 2026'), seasonClosedStintNote('1 October 2026'),
+    ].join(' ').toLowerCase();
+    // Whole words: "closed" contains "lose", and "closed" is the point.
+    for (const word of ['lost', 'lose', 'missed', 'removed', 'taken away', 'unfortunately', 'sorry']) {
+      expect(closure, word).not.toMatch(new RegExp(`\\b${word}\\b`));
+    }
   });
 
   it('never tells the user they cannot watch something', () => {

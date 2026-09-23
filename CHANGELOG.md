@@ -2,6 +2,23 @@
 
 <!-- Generated from src/lib/changelog.ts by `npm run changelog`. Edit that file, not this one. -->
 
+## 0.3.1 — Season pass closed until 1 October
+
+*23 September 2026*
+
+The season pass and seasonal challenges are closed until 1 October 2026, when the Q4 2026 pass opens. What they gave so far — their rewards, and the XP those rewards paid — has been removed, and your level is worked out again without it. Your races, stints, achievements and the rest of your career stay as they were.
+
+> Before it changes anything, the desktop app saves a copy of your career as it was, in %APPDATA%\Endurance Racing Career\backups. Its name starts with pre-update-0.3.1.
+
+### Changed
+
+- The season pass and seasonal challenges are closed until 1 October 2026. The Q4 2026 pass opens at midnight that day and starts from tier 0 with your first stint, with the Sarthe theme at tier 20 and Daytona at tier 60. Seasonal challenges return with it.
+- Until then, stints earn career XP only. Levels, achievements, milestones, mastery, collections and daily, weekly and monthly challenges work exactly as before. Nothing earns season XP.
+- Removed from careers that had them: every season pass before Q4 2026 and everything it unlocked — themes, race card designs, badges, banners, titles, patches, emblems, posters, trophy items and the Hall of Fame collectible — along with seasonal challenges, the trophies and Hall of Fame entries that came from the season pass, and the XP all of these paid. This happens once, the first time this version starts. Nothing from the Q4 2026 pass onwards is touched.
+- Career XP, level, prestige and title are recalculated from what remains, the same way as when a stint is deleted, so your level may be lower than it was.
+- Your look is back to the defaults: the Graphite theme, the Classic race card, no badge, no banner and the automatic title. Looks from the Q4 2026 pass can be chosen in Settings as you unlock them.
+- Everything else stays as it was: races and stints, achievements, milestones, mastery, collections, and daily, weekly and monthly challenges, with the XP each of them earned.
+
 ## 0.3.0 — Your look, earned
 
 *23 September 2026*

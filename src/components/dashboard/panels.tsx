@@ -10,12 +10,15 @@
 import Link from 'next/link';
 import { Award, Check, Clock, Layers, ListChecks, Ticket, Trophy } from 'lucide-react';
 import type { ChallengeScope, Rarity } from '@/lib/domain/types';
-import { EXPIRED_CHALLENGE_NOTE } from '@/lib/copy/tone';
+import type { SeasonPassClosure } from '@/lib/engines/season-pass-engine';
+import {
+  EXPIRED_CHALLENGE_NOTE, seasonPassClosedHeadline, seasonPassClosedShortNote,
+} from '@/lib/copy/tone';
 import {
   Badge, EmptyState, Panel, PanelBody, PanelHeader, RarityBadge, Stat, TimingBar,
 } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
-import { cn, formatHours, formatNumber } from '@/lib/utils';
+import { cn, formatDate, formatHours, formatNumber } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Challenges
@@ -127,12 +130,20 @@ export interface SeasonPassSummaryData {
   nextRewardRarity: Rarity | null;
 }
 
-export function SeasonPassPanel({ pass }: { pass: SeasonPassSummaryData | null }) {
+export function SeasonPassPanel({
+  pass, closure,
+}: {
+  pass: SeasonPassSummaryData | null;
+  /** Set while the season pass is closed (0.3.1); it takes the panel's place. */
+  closure: SeasonPassClosure | null;
+}) {
+  if (closure) return <SeasonPassClosedPanel closure={closure} />;
+
   if (!pass) {
     return (
       <Panel>
         <PanelHeader title="Season pass" icon={<Ticket size={12} />} />
-        <EmptyState title="No pass open" body="A new quarterly pass opens automatically." />
+        <EmptyState title="No pass open" body="This quarter's pass starts with your first stint." />
       </Panel>
     );
   }
@@ -183,6 +194,51 @@ export function SeasonPassPanel({ pass }: { pass: SeasonPassSummaryData | null }
               <div className="truncate text-xs text-ink-muted">{pass.nextRewardName}</div>
             </div>
             {pass.nextRewardRarity ? <RarityBadge rarity={pass.nextRewardRarity} /> : null}
+          </div>
+        ) : null}
+      </PanelBody>
+    </Panel>
+  );
+}
+
+/**
+ * The compact closed state: when the pass opens, and the themes it brings.
+ * Everything named here comes from the engine's preview of the reopening pass.
+ */
+function SeasonPassClosedPanel({ closure }: { closure: SeasonPassClosure }) {
+  return (
+    <Panel>
+      <PanelHeader
+        title="Season pass"
+        icon={<Ticket size={12} />}
+        action={
+          <Link href="/season-pass" className="text-[0.6875rem] text-ink-dim transition-colors hover:text-ink-muted">
+            Preview
+          </Link>
+        }
+      />
+      <PanelBody className="space-y-3.5">
+        <div>
+          <div className="text-sm font-medium text-ink">
+            {seasonPassClosedHeadline(formatDate(closure.reopensAt, 'long'))}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-ink-dim">{seasonPassClosedShortNote(closure.label)}</p>
+        </div>
+
+        {closure.themes.length > 0 ? (
+          <div className="border-t border-hairline pt-3">
+            <div className="label mb-1.5">Themes on the {closure.label} pass</div>
+            <ul className="space-y-1.5">
+              {closure.themes.map((theme) => (
+                <li key={theme.tier} className="flex items-center justify-between gap-3">
+                  <span className="min-w-0 truncate text-xs text-ink-muted">{theme.rewardName}</span>
+                  <span className="flex shrink-0 items-center gap-2">
+                    <span className="timing text-[0.6875rem] text-ink-faint">Tier {theme.tier}</span>
+                    <RarityBadge rarity={theme.rarity} />
+                  </span>
+                </li>
+              ))}
+            </ul>
           </div>
         ) : null}
       </PanelBody>
