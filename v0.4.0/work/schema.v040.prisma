@@ -1,0 +1,1095 @@
+// ---------------------------------------------------------------------------
+// Endurance Racing Career Mode — data model
+//
+// Design notes that matter for progression integrity:
+//
+//  * WatchedInterval rows hold the CANONICAL, MERGED timeline coverage for a
+//    race. They are rewritten as a set whenever coverage changes. They are the
+//    single source of truth for "how much of this race's story have I seen".
+//  * RaceViewingSession rows hold the RAW, append-only history of what the user
+//    actually did. They are never merged or rewritten, so real-world viewing
+//    time and session statistics stay honest even when intervals overlap.
+//  * Denormalised counters on Race (coverageSec, realViewingSec, ...) are a
+//    cache. `recomputeRaceAggregates` rebuilds them from the two tables above
+//    inside the same transaction that mutates them, and a maintenance script
+//    can rebuild every race from scratch.
+//  * Every XP award writes an XPTransaction. `dedupeKey` is unique, which is
+//    what structurally prevents double-awarding a bonus.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ===========================================================================
+// Enums
+// ===========================================================================
+
+enum RaceType {
+  SPRINT_ENDURANCE
+  H4
+  H6
+  H8
+  H10
+  H12
+  H24
+  CUSTOM
+}
+
+enum RaceStatus {
+  UNWATCHED
+  QUEUED
+  WATCHING
+  PAUSED
+  COMPLETED
+  ABANDONED
+  ARCHIVED
+}
+
+enum RacePriority {
+  LOW
+  NORMAL
+  HIGH
+  MUST_WATCH
+}
+
+enum Rarity {
+  COMMON
+  UNCOMMON
+  RARE
+  EPIC
+  LEGENDARY
+  MYTHIC
+}
+
+enum ChallengeScope {
+  DAILY
+  WEEKLY
+  MONTHLY
+  SEASONAL
+}
+
+enum ChallengeState {
+  ACTIVE
+  COMPLETED
+  EXPIRED
+}
+
+/// Where an XP award came from. Used for auditing and for the XP breakdown UI.
+enum XPSource {
+  VIEWING
+  REWATCH
+  STORY_COMPLETE
+  RACE_COMPLETE
+  ACHIEVEMENT
+  CHALLENGE
+  MASTERY_NODE
+  SEASON_COMPLETE
+  MAJOR_EVENT
+  MILESTONE
+  SEASON_PASS_TIER
+  PRESTIGE
+  HALL_OF_FAME
+  MANUAL_ADJUSTMENT
+  /// Race Expedition checkpoint (0.4.0). Career XP only; seasonAmount is always 0.
+  EXPEDITION
+}
+
+/// How exactly a landmark's `achievedAt` is known (0.4.0).
+///   INTERPOLATED  a running total crossed its threshold inside a stint; the
+///                 instant is interpolated along that stint's wall-clock window.
+///   STINT         a count reached its threshold with a stint; the instant is
+///                 that stint's `watchedAt`.
+///   RECOGNISED    history cannot say when; the date shown is when the app
+///                 recorded it (`reachedAt` / `unlockedAt`).
+enum MilestonePrecision {
+  INTERPOLATED
+  STINT
+  RECOGNISED
+}
+
+enum MasteryKind {
+  CHAMPIONSHIP
+  RACE_EVENT
+  GLOBAL
+}
+
+enum CollectionKind {
+  SEASON
+  MAJOR_EVENT
+  CIRCUIT
+  CUSTOM
+}
+
+enum TrophyCategory {
+  SEASON
+  MAJOR_EVENT
+  MASTERY
+  PRESTIGE
+  ACHIEVEMENT
+  SEASON_PASS
+  MILESTONE
+}
+
+enum RewardType {
+  BADGE
+  TITLE
+  THEME
+  RACE_CARD
+  TROPHY_ITEM
+  PATCH
+  EMBLEM
+  BANNER
+  POSTER
+  XP_BONUS
+  HALL_OF_FAME_COLLECTIBLE
+}
+
+enum HallOfFameCategory {
+  FIRST
+  MILESTONE
+  SEASON
+  MAJOR_EVENT
+  CAREER
+  MASTERY
+  SEASON_PASS
+  PRESTIGE
+}
+
+// ===========================================================================
+// Identity & career
+// ===========================================================================
+
+model User {
+  id        String   @id @default(uuid())
+  /// Display name, and the label on the account card. Unique so the picker is
+  /// unambiguous; uniqueness is also checked case-insensitively in the app
+  /// layer, which SQLite cannot express as a constraint.
+  name      String   @unique @default("Driver")
+  timezone  String   @default("UTC")
+  /// ISO weekday the viewing week starts on (1 = Monday).
+  weekStart Int      @default(1)
+
+  /// Cosmetic identity for the account card. Resolved against config, never
+  /// free text, so a card can never render an unknown asset.
+  avatarKey String @default("helmet")
+  accentKey String @default("amber")
+
+  /// Optional local password. Both are null, or both are set — never one.
+  /// See src/lib/auth/password.ts for the format. This keeps a housemate out
+  /// of a career; it is not protection against someone holding the disk.
+  passwordHash String?
+  passwordSalt String?
+
+  /// Ordering hint for the account picker: the last account played comes
+  /// first, because that is almost always the one being opened again.
+  lastActiveAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions          UserSession[]
+  careerProfile     CareerProfile?
+  championships     Championship[]
+  races             Race[]
+  viewingSessions   RaceViewingSession[]
+  xpTransactions    XPTransaction[]
+  challenges        Challenge[]
+  achievementProg   AchievementProgress[]
+  masteryTrees      MasteryTree[]
+  masteryProgress   MasteryProgress[]
+  collections       Collection[]
+  trophies          Trophy[]
+  hallOfFameEntries HallOfFameEntry[]
+  budgetYears       BudgetYear[]
+  momentumHistory   MomentumHistory[]
+  seasonPasses      SeasonPass[]
+  milestones        MilestoneProgress[]
+  raceMasteries     RaceMastery[]
+  configOverrides   ConfigOverride[]
+  expeditionSummaries ExpeditionSummary[]
+  chronicleYears      ChronicleYear[]
+  eventStepCredits    EventStepCredit[]
+
+  @@map("users")
+}
+
+/// A signed-in session on this machine.
+///
+/// The cookie holds only this row's opaque id; everything else is server-side,
+/// so signing out is a delete and "sign out everywhere" is a deleteMany. There
+/// is no remote attacker in this threat model — the point is that an account's
+/// career is not reachable by clicking around while someone else is signed in.
+model UserSession {
+  id         String   @id
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+/// The permanent career. Never reset, not even by prestige.
+model CareerProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Lifetime career XP. BigInt because the level curve is unbounded.
+  careerXp BigInt @default(0)
+  level    Int    @default(1)
+  /// Prestige rank. Purely additive — it never resets anything.
+  prestige Int    @default(0)
+  /// Key of the currently displayed title (resolved against config).
+  titleKey      String?
+  /// Cosmetic selections unlocked through the season pass.
+  themeKey      String @default("graphite")
+  raceCardKey   String @default("classic")
+  bannerKey     String?
+  badgeKey      String?
+
+  // -- Streaks: recorded, celebrated, never punished ------------------------
+  currentStreakDays   Int       @default(0)
+  longestStreakDays   Int       @default(0)
+  lifetimeActiveDays  Int       @default(0)
+  lifetimeActiveWeeks Int       @default(0)
+  lastActiveDate      DateTime?
+
+  // -- Momentum (soft streak alternative) -----------------------------------
+  momentumPoints    Float    @default(0)
+  momentumTierKey   String   @default("cold_tyres")
+  momentumUpdatedAt DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("career_profiles")
+}
+
+// ===========================================================================
+// Race library
+// ===========================================================================
+
+model Championship {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name      String
+  slug      String
+  shortName String?
+  /// Restrained accent colour used by race cards and mastery panels.
+  accentColor String @default("#c8a45c")
+  /// False for the shipped presets (WEC, IMSA, ...), true for user-created ones.
+  isCustom    Boolean @default(true)
+  sortOrder   Int     @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  seasons      ChampionshipSeason[]
+  races        Race[]
+  masteryTrees MasteryTree[]
+
+  @@unique([userId, slug])
+  @@map("championships")
+}
+
+/// One year of a championship. Doubles as a collectible set.
+model ChampionshipSeason {
+  id             String       @id @default(uuid())
+  championshipId String
+  championship   Championship @relation(fields: [championshipId], references: [id], onDelete: Cascade)
+
+  year  Int
+  label String?
+  /// How many races the user considers the official season. Null = "whatever I
+  /// have added". The user owns this definition; nothing is imported.
+  plannedRaceCount Int?
+
+  isComplete  Boolean   @default(false)
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  races       Race[]
+  collections Collection[]
+
+  @@unique([championshipId, year])
+  @@map("championship_seasons")
+}
+
+model Race {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name           String
+  championshipId String?
+  championship   Championship?       @relation(fields: [championshipId], references: [id], onDelete: SetNull)
+  seasonId       String?
+  season         ChampionshipSeason? @relation(fields: [seasonId], references: [id], onDelete: SetNull)
+
+  circuit     String?
+  /// Normalised circuit key so "Circuit de la Sarthe" and "circuit de la sarthe"
+  /// count as one circuit in statistics.
+  circuitSlug String?
+  country     String?
+  raceDate    DateTime?
+
+  /// Advertised length, e.g. 6h for a "6 Hours of ...".
+  scheduledDurationSec Int
+  /// What the race actually ran to, if it differed (red flags, shortened races).
+  actualDurationSec    Int?
+  /// The runtime the progress tracker works against.
+  /// Always kept equal to `actualDurationSec ?? scheduledDurationSec`.
+  runtimeSec           Int
+
+  raceType   RaceType     @default(H6)
+  priority   RacePriority @default(NORMAL)
+  /// Personal excitement, 1-5.
+  excitement Int          @default(3)
+  status     RaceStatus   @default(UNWATCHED)
+
+  isMajorEvent Boolean @default(false)
+  /// Groups recurring editions of the same event for Race Mastery,
+  /// e.g. "le-mans-24". Entirely user-defined.
+  iconicKey    String?
+
+  notes     String?
+  replayUrl String?
+  posterUrl String?
+
+  // -- Cached aggregates (rebuilt by recomputeRaceAggregates) ---------------
+  /// Unique seconds of race timeline covered. NOT the furthest point reached.
+  coverageSec       Int       @default(0)
+  /// Real-world seconds spent watching, including rewatched sections.
+  realViewingSec    Int       @default(0)
+  /// Timeline seconds played, including rewatched sections.
+  timelineWatchedSec Int      @default(0)
+  sessionCount      Int       @default(0)
+  furthestTimestampSec Int    @default(0)
+  avgPlaybackSpeed  Float     @default(1)
+  startedAt         DateTime?
+  completedAt       DateTime?
+  lastWatchedAt     DateTime?
+  /// Set the moment timeline coverage crosses the Story Complete threshold.
+  storyCompletedAt  DateTime?
+  /// Sum of credited real seconds over this race's stints (0.4.0). A cache,
+  /// rebuilt by recomputeRaceAggregates; null only until the 0.4.0 upgrade
+  /// has filled it. See creditedSeconds() in domain/career-timeline.
+  creditedViewingSec Int?
+
+  /// Expedition Mode (0.4.0): null = automatic by runtime, true = switched on,
+  /// false = switched off. The user's choice, so it is persisted.
+  expeditionMode Boolean?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions        RaceViewingSession[]
+  intervals       WatchedInterval[]
+  collectionItems CollectionItem[]
+  hallOfFame      HallOfFameEntry[]
+  raceMasteryId   String?
+  raceMastery     RaceMastery?         @relation(fields: [raceMasteryId], references: [id], onDelete: SetNull)
+  expeditionSummaries ExpeditionSummary[]
+
+  @@index([userId, status])
+  @@index([userId, championshipId])
+  @@index([userId, seasonId])
+  @@index([userId, iconicKey])
+  @@index([userId, raceDate])
+  @@index([userId, raceMasteryId])
+  @@map("races")
+}
+
+/// Append-only record of one stint in front of the screen.
+model RaceViewingSession {
+  id     String @id @default(uuid())
+  raceId String
+  race   Race   @relation(fields: [raceId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Race-timeline window covered by this stint, in seconds.
+  startTimestampSec Int
+  endTimestampSec   Int
+  playbackSpeed     Float @default(1)
+
+  /// endTimestampSec - startTimestampSec
+  timelineSeconds Int
+  /// timelineSeconds / playbackSpeed — the wall-clock cost of the stint.
+  realSeconds     Int
+  /// How much of `timelineSeconds` was timeline the user had never seen before.
+  newCoverageSeconds Int
+
+  /// Denormalised snapshot for the stint summary screen.
+  coverageBeforeSec Int @default(0)
+  coverageAfterSec  Int @default(0)
+  careerXpAwarded   Int @default(0)
+  seasonXpAwarded   Int @default(0)
+
+  watchedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  /// Entirely optional. The application never asks the user to write down
+  /// what happened in the race.
+  note String?
+
+  intervals      WatchedInterval[]
+  xpTransactions XPTransaction[]
+
+  @@index([userId, watchedAt])
+  @@index([raceId, watchedAt])
+  @@map("race_viewing_sessions")
+}
+
+/// Canonical merged coverage. Rewritten as a set; never overlapping.
+model WatchedInterval {
+  id     String @id @default(uuid())
+  raceId String
+  race   Race   @relation(fields: [raceId], references: [id], onDelete: Cascade)
+
+  startSec Int
+  endSec   Int
+
+  /// The session that first contributed to this interval, when known.
+  /// Purely informational — merging can absorb several sessions into one row.
+  sessionId String?
+  session   RaceViewingSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([raceId, startSec])
+  /// 0.4.0. Serves SQLite's ON DELETE SET NULL search when a stint is deleted.
+  @@index([sessionId])
+  @@map("watched_intervals")
+}
+
+/// Lifetime history of a recurring event (e.g. every Le Mans ever watched).
+model RaceMastery {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Matches Race.iconicKey.
+  key  String
+  name String
+
+  editionsTracked      Int       @default(0)
+  editionsStoryComplete Int      @default(0)
+  totalRealSec         Int       @default(0)
+  totalTimelineSec     Int       @default(0)
+  firstCompletedYear   Int?
+  latestCompletedYear  Int?
+  longestConsecutiveEditions Int @default(0)
+
+  // -- Event Legacy (0.4.0). `key` is the event's permanent identity and is
+  // never rewritten; everything the user can change lives below.
+  /// The user's name for the event. Null = `name` (derived from the key).
+  displayName   String?
+  /// True when the user created the event on the Events page.
+  createdByUser Boolean?
+  /// Hidden from the Events list. Only an event with no races can be archived.
+  archivedAt    DateTime?
+  /// Set when this event was merged into another; its races now belong there.
+  mergedIntoId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  races Race[]
+
+  @@unique([userId, key])
+  @@map("race_masteries")
+}
+
+// ===========================================================================
+// Progression
+// ===========================================================================
+
+/// Immutable audit trail. Career XP is always the sum of these.
+model XPTransaction {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  source      XPSource
+  amount      Int
+  seasonAmount Int     @default(0)
+  description String
+  /// Free-form pointer to the originating entity (race id, achievement key...).
+  sourceRef   String?
+
+  sessionId String?
+  session   RaceViewingSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  seasonPassId String?
+  seasonPass   SeasonPass? @relation(fields: [seasonPassId], references: [id], onDelete: SetNull)
+
+  /// Career XP total immediately after this transaction (for the XP graph).
+  careerXpAfter BigInt @default(0)
+  levelAfter    Int    @default(1)
+
+  /// Structural guard against double-awarding. One-shot bonuses set this.
+  ///
+  /// Unique PER ACCOUNT, not globally: the keys for achievements, milestones
+  /// and the global mastery trees carry no user id, so a single global
+  /// constraint meant the second account to earn one was told it had earned
+  /// it and paid nothing.
+  dedupeKey String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+  @@index([userId, source])
+  /// 0.4.0. Leftmost `sessionId` on purpose: SQLite's ON DELETE SET NULL
+  /// searches this table by sessionId for every deleted stint, and only an
+  /// index that starts with the FK column serves that search. It also serves
+  /// the per-stint revocations and the Expedition Summary XP sums.
+  @@index([sessionId])
+  @@map("xp_transactions")
+}
+
+/// Definition rows, upserted from config so the economy stays re-balanceable.
+model Achievement {
+  id          String  @id @default(uuid())
+  key         String  @unique
+  name        String
+  description String
+  category    String
+  rarity      Rarity  @default(COMMON)
+  /// Metric the progress bar tracks (see config/achievements.ts).
+  metric      String
+  threshold   Float
+  xpReward    Int     @default(0)
+  iconKey     String  @default("trophy")
+  /// Hidden achievements only reveal themselves on unlock.
+  isSecret    Boolean @default(false)
+  sortOrder   Int     @default(100)
+
+  progress AchievementProgress[]
+
+  @@map("achievements")
+}
+
+model AchievementProgress {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  achievementKey String
+  achievement    Achievement @relation(fields: [achievementKey], references: [key], onDelete: Cascade)
+
+  /// Current value of the tracked metric.
+  value      Float     @default(0)
+  target     Float
+  unlockedAt DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, achievementKey])
+  @@index([userId, unlockedAt])
+  @@map("achievement_progress")
+}
+
+/// Numerical lifetime progression, distinct from discrete achievements.
+model MilestoneProgress {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  metric    String
+  threshold Float
+  reachedAt DateTime?
+  valueAtReach Float?
+  xpAwarded Int @default(0)
+
+  // -- Career Milestones (0.4.0). Written once, when achievedPrecision is
+  // null, and never again: a milestone keeps its date whatever happens to the
+  // history later. No foreign keys on purpose — a landmark outlives the stint,
+  // race or event it points at.
+  achievedAt        DateTime?
+  achievedPrecision MilestonePrecision?
+  sessionId         String?
+  raceId            String?
+  eventId           String?
+  /// Race or event name at the moment it was reached, for when it is gone.
+  subjectName       String?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, metric, threshold])
+  @@index([userId, metric])
+  @@map("milestone_progress")
+}
+
+// ===========================================================================
+// Challenges
+// ===========================================================================
+
+model Challenge {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  scope       ChallengeScope
+  templateKey String
+  title       String
+  description String
+  /// Metric evaluated over [periodStart, periodEnd).
+  metric      String
+  target      Float
+  /// Template-specific parameters (race ids, championship ids, minimum length).
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  params      Json
+
+  xpReward       Int @default(0)
+  seasonXpReward Int @default(0)
+
+  periodStart DateTime
+  periodEnd   DateTime
+  generatedAt DateTime @default(now())
+
+  progress ChallengeProgress?
+
+  @@unique([userId, scope, templateKey, periodStart])
+  @@index([userId, scope, periodEnd])
+  @@map("challenges")
+}
+
+model ChallengeProgress {
+  id          String    @id @default(uuid())
+  challengeId String    @unique
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  value       Float          @default(0)
+  state       ChallengeState @default(ACTIVE)
+  completedAt DateTime?
+  /// Expiry is recorded, never punished.
+  expiredAt   DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@map("challenge_progress")
+}
+
+// ===========================================================================
+// Season pass
+// ===========================================================================
+
+model SeasonPass {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  year    Int
+  quarter Int
+
+  startsAt DateTime
+  endsAt   DateTime
+
+  seasonXp    Int      @default(0)
+  tier        Int      @default(0)
+  isArchived  Boolean  @default(false)
+  archivedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tiers          SeasonPassProgress[]
+  xpTransactions XPTransaction[]
+
+  @@unique([userId, year, quarter])
+  @@map("season_passes")
+}
+
+/// One row per tier of a pass: both the reward definition and its unlock state.
+model SeasonPassProgress {
+  id           String     @id @default(uuid())
+  seasonPassId String
+  seasonPass   SeasonPass @relation(fields: [seasonPassId], references: [id], onDelete: Cascade)
+
+  tier          Int
+  /// Cumulative season XP needed to reach this tier.
+  xpRequired    Int
+  rewardKey     String
+  rewardType    RewardType
+  rewardName    String
+  rewardRarity  Rarity     @default(COMMON)
+  /// Milestone tiers (every 10th) get the larger presentation.
+  isMilestone   Boolean    @default(false)
+
+  unlockedAt DateTime?
+
+  @@unique([seasonPassId, tier])
+  @@index([seasonPassId, unlockedAt])
+  @@map("season_pass_progress")
+}
+
+// ===========================================================================
+// Mastery
+// ===========================================================================
+
+model MasteryTree {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind MasteryKind
+
+  championshipId String?
+  championship   Championship? @relation(fields: [championshipId], references: [id], onDelete: Cascade)
+  /// For RACE_EVENT trees, matches Race.iconicKey.
+  iconicKey      String?
+
+  key         String
+  name         String
+  description String?
+  accentColor String  @default("#c8a45c")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  nodes MasteryNode[]
+
+  @@unique([userId, key])
+  @@map("mastery_trees")
+}
+
+model MasteryNode {
+  id     String      @id @default(uuid())
+  treeId String
+  tree   MasteryTree @relation(fields: [treeId], references: [id], onDelete: Cascade)
+
+  key         String
+  name        String
+  description String
+  metric      String
+  threshold   Float
+  xpReward    Int    @default(0)
+  /// Visual row in the tree.
+  tier        Int    @default(1)
+  sortOrder   Int    @default(100)
+  rarity      Rarity @default(COMMON)
+
+  progress MasteryProgress[]
+
+  @@unique([treeId, key])
+  @@map("mastery_nodes")
+}
+
+model MasteryProgress {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  nodeId String
+  node   MasteryNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  value      Float     @default(0)
+  target     Float
+  unlockedAt DateTime?
+
+  /// Event Legacy steps (0.4.0): when the step was reached in viewing history.
+  /// Same write-once rule as MilestoneProgress.
+  achievedAt        DateTime?
+  achievedPrecision MilestonePrecision?
+  achievedSessionId String?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, nodeId])
+  @@map("mastery_progress")
+}
+
+// ===========================================================================
+// Collections, trophies, hall of fame
+// ===========================================================================
+
+model Collection {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind CollectionKind
+  key  String
+  name String
+  description String?
+  accentColor String @default("#c8a45c")
+
+  seasonId String?
+  season   ChampionshipSeason? @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items CollectionItem[]
+
+  @@unique([userId, key])
+  @@map("collections")
+}
+
+model CollectionItem {
+  id           String     @id @default(uuid())
+  collectionId String
+  collection   Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  key  String
+  name String
+
+  raceId String?
+  race   Race?   @relation(fields: [raceId], references: [id], onDelete: Cascade)
+
+  filledAt      DateTime?
+  /// Story Complete cards get the special border.
+  storyComplete Boolean   @default(false)
+  sortOrder     Int       @default(100)
+
+  @@unique([collectionId, key])
+  @@map("collection_items")
+}
+
+model Trophy {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  key         String
+  name        String
+  description String
+  category    TrophyCategory
+  rarity      Rarity         @default(RARE)
+  iconKey     String         @default("trophy")
+  accentColor String         @default("#c8a45c")
+
+  /// Frozen statistics shown when the trophy is opened.
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  metadata Json
+
+  awardedAt DateTime @default(now())
+
+  @@unique([userId, key])
+  @@index([userId, awardedAt])
+  @@map("trophies")
+}
+
+model HallOfFameEntry {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  key      String
+  title    String
+  subtitle String?
+  category HallOfFameCategory
+  rarity   Rarity             @default(RARE)
+
+  raceId String?
+  race   Race?   @relation(fields: [raceId], references: [id], onDelete: SetNull)
+
+  championshipName String?
+  seasonLabel      String?
+
+  /// Career statistics frozen at the moment it happened.
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  snapshot Json
+
+  occurredAt DateTime @default(now())
+
+  @@unique([userId, key])
+  @@index([userId, occurredAt])
+  @@map("hall_of_fame_entries")
+}
+
+// ===========================================================================
+// Viewing budget
+// ===========================================================================
+
+model BudgetYear {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  year               Int
+  /// 336 hours by default, stored so past years keep their own figure.
+  annualBudgetHours  Float @default(336)
+  /// Nominal weekly ceiling (8h). The engine may still recommend more for a
+  /// Le Mans week — this is a planning anchor, never a restriction.
+  weeklyTargetHours  Float @default(8)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  weeks BudgetWeek[]
+
+  @@unique([userId, year])
+  @@map("budget_years")
+}
+
+model BudgetWeek {
+  id           String     @id @default(uuid())
+  budgetYearId String
+  budgetYear   BudgetYear @relation(fields: [budgetYearId], references: [id], onDelete: Cascade)
+
+  isoYear Int
+  isoWeek Int
+  /// Inclusive start / exclusive end of the viewing week.
+  weekStart DateTime
+  weekEnd   DateTime
+
+  /// What the adaptive engine suggested for this week.
+  recommendedHours Float @default(0)
+  /// Why it suggested that (human readable factors).
+  /// No database default: SQLite cannot express one for JSON, and every
+  /// write site supplies this explicitly in any case.
+  rationale        Json
+  /// Deliberate rest week — recommendation drops to zero and redistributes.
+  isRestWeek       Boolean @default(false)
+
+  computedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([budgetYearId, isoYear, isoWeek])
+  @@index([budgetYearId, weekStart])
+  @@map("budget_weeks")
+}
+
+model MomentumHistory {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Local calendar day this snapshot describes.
+  date        DateTime
+  points      Float
+  tierKey     String
+  realSeconds Int      @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, date])
+  @@index([userId, date])
+  @@map("momentum_history")
+}
+
+// ===========================================================================
+// Runtime-tunable configuration
+// ===========================================================================
+
+/// Overrides for any value in src/lib/config. Lets the economy be rebalanced
+/// without a redeploy, and keeps the defaults in one typed place.
+model ConfigOverride {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  key   String
+  value Json
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, key])
+  @@map("config_overrides")
+}
+
+// ===========================================================================
+// Career history (0.4.0)
+// ===========================================================================
+
+/// The permanent record of a completed Race Expedition. Written once, the
+/// first time a stint, the upgrade, recompute or switching Expedition Mode on
+/// finds the race Story Complete while it is an Expedition, and never
+/// rewritten. Survives the race being deleted (raceId SetNull).
+model ExpeditionSummary {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  raceId   String?
+  race     Race?   @relation(fields: [raceId], references: [id], onDelete: SetNull)
+  raceName String
+
+  /// Wall-clock start of the first stint, and `watchedAt` of the completing stint.
+  startedAt   DateTime
+  completedAt DateTime
+  /// True when written after the fact (the 0.4.0 upgrade, recompute,
+  /// Expedition Mode switched on later) rather than by a stint.
+  retrospective Boolean @default(false)
+  schemaVersion Int
+  /// ExpeditionSummarySnapshotV1 — see src/lib/domain/expedition.ts.
+  snapshot      Json
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, raceId])
+  @@index([userId, completedAt])
+  /// Serves SQLite's ON DELETE SET NULL search when a race is deleted.
+  @@index([raceId])
+  @@map("expedition_summaries")
+}
+
+/// A completed calendar year of the Career Chronicle, frozen. The current
+/// year is never stored: it is derived on every read.
+model ChronicleYear {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  year          Int
+  schemaVersion Int
+  /// ChronicleChapterV1 — see src/lib/domain/chronicle.ts.
+  snapshot      Json
+  frozenAt      DateTime
+  /// Set only when the user explicitly rebuilt the chapter.
+  rebuiltAt     DateTime?
+  /// When the year's Endurance Wrapped was clicked through to its last card.
+  wrappedSeenAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, year])
+  @@map("chronicle_years")
+}
+
+/// "This race has already helped pay this kind of event step" (0.4.0).
+/// Stops the same editions paying the same Event Legacy step twice when races
+/// are moved between events, events are merged, or a race is deleted and added
+/// again. raceId has no foreign key on purpose: the credit must outlive the race.
+model EventStepCredit {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// A RACE_EVENT mastery node key, e.g. "edition_5".
+  nodeKey  String
+  raceId   String
+  /// The event whose step it helped pay (audit only).
+  eventKey String
+  /// Set when the race is deleted: the edition's fingerprint (year, rounded
+  /// hours, circuit slug, name signature) as JSON — see domain/edition.ts.
+  fingerprint String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, nodeKey, raceId])
+  @@map("event_step_credits")
+}
