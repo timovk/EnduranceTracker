@@ -43,6 +43,7 @@ const RACE_SELECT = {
 /** The race select plus its full session history, for the race detail page. */
 const RACE_DETAIL_SELECT = {
   ...RACE_SELECT,
+  creditedViewingSec: true,
   sessions: {
     select: {
       id: true, startTimestampSec: true, endTimestampSec: true, playbackSpeed: true,
@@ -149,6 +150,12 @@ export interface RaceDetail {
   coverageSec: number;
   coveragePercent: number;
   realViewingSec: number;
+  /**
+   * Real viewing credited the way XP credits it (0.4.0): the race's "Real
+   * viewing" figure, so it agrees with every other hour figure. Null only
+   * until the 0.4.0 upgrade has filled it.
+   */
+  creditedViewingSec: number | null;
   timelineWatchedSec: number;
   sessionCount: number;
   avgPlaybackSpeed: number;
@@ -220,6 +227,7 @@ export async function getRaceDetail(userId: string, raceId: string): Promise<Rac
     coverageSec: coverage,
     coveragePercent: estimate.completionPercent,
     realViewingSec: race.realViewingSec,
+    creditedViewingSec: race.creditedViewingSec,
     timelineWatchedSec: race.timelineWatchedSec,
     sessionCount: race.sessionCount,
     avgPlaybackSpeed: speed,

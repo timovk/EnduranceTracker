@@ -179,7 +179,12 @@ export function RaceDetailView({
               ) : null}
 
               <div className="grid grid-cols-2 gap-x-5 gap-y-3 border-t border-hairline pt-4 sm:grid-cols-4">
-                <Stat label="Real viewing" value={formatDuration(race.realViewingSec)} size="sm" tone="muted" />
+                <Stat
+                  label="Real viewing"
+                  value={formatDuration(race.creditedViewingSec ?? race.realViewingSec)}
+                  size="sm"
+                  tone="muted"
+                />
                 <Stat label="Timeline played" value={formatDuration(race.timelineWatchedSec)} size="sm" tone="muted" />
                 <Stat label="Sessions" value={formatNumber(race.sessionCount)} size="sm" tone="muted" />
                 <Stat
@@ -282,9 +287,18 @@ export function RaceDetailView({
       <div className="flex justify-end">
         <form
           action={async () => {
-            if (!confirm(`Remove ${race.name} from the library? Its viewing history goes with it.`)) return;
-            await deleteRaceAction(race.id);
-            router.push('/races');
+            if (!confirm(
+              `Remove ${race.name} from the library? Its viewing history goes with it, and so does the XP it ` +
+                'earned — viewing and Story Complete. Achievements and milestones you reached stay.',
+            )) return;
+            const result = await deleteRaceAction(race.id);
+            if (!result.ok || !result.data) {
+              setNotice(result.message ?? 'That race is no longer in the library.');
+              return;
+            }
+            // The library says what went with it, once.
+            const params = new URLSearchParams({ removed: result.data.raceName, xp: String(result.data.xpRemoved) });
+            router.push(`/races?${params.toString()}`);
           }}
         >
           <Button type="submit" variant="ghost" size="sm" className="text-ink-faint">

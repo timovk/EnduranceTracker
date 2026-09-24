@@ -144,6 +144,23 @@ export function stillToComeEmptyNote(count: number, firstOn: string): string {
         'The strategist suggests each one from its race day.';
 }
 
+// ---------------------------------------------------------------------------
+// Removing a race (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// Deleting a race takes back the XP it earned, and the library says so in one
+// plain line: what went, and that everything reached along the way stays.
+
+/** The library's one-line notice after a race was removed. */
+export function raceRemovedNotice(raceName: string, xpRemoved: number): string {
+  const xp = Math.max(0, Math.round(xpRemoved));
+  if (xp === 0) return `${raceName} was removed from the library.`;
+  return (
+    `${raceName} was removed from the library, with the ${xp.toLocaleString('en-GB')} XP it earned. ` +
+    'Achievements and milestones you reached stay.'
+  );
+}
+
 /** Recommendation framing. Suggestions, never instructions. */
 export const RECOMMENDATION_PREFIXES = {
   continue: 'Continue the story',

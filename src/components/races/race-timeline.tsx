@@ -10,7 +10,7 @@
  */
 
 import * as React from 'react';
-import { formatTimestamp, formatDuration } from '@/lib/domain/time';
+import { formatCoveragePercent, formatTimestamp, formatDuration } from '@/lib/domain/time';
 import type { Interval } from '@/lib/domain/types';
 import { cn } from '@/lib/utils';
 
@@ -161,6 +161,6 @@ function gapsBetween(intervals: Interval[], runtimeSec: number): Interval[] {
 
 function describeCoverage(intervals: Interval[], runtimeSec: number): string {
   const covered = intervals.reduce((sum, iv) => sum + (iv.end - iv.start), 0);
-  const percent = Math.round((covered / runtimeSec) * 1000) / 10;
-  return `${percent}% watched`;
+  // Floored, so a race with a gap never reads "100% watched".
+  return `${formatCoveragePercent(covered, runtimeSec)} watched`;
 }

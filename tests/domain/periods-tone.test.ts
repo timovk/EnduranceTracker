@@ -16,7 +16,7 @@ import {
 } from '@/lib/domain/periods';
 import {
   ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, EXPIRED_CHALLENGE_NOTE,
-  FORBIDDEN_TONE_WORDS, momentumNote, RECOMMENDATION_FOOTNOTE, seasonClosedStintNote,
+  FORBIDDEN_TONE_WORDS, momentumNote, raceRemovedNotice, RECOMMENDATION_FOOTNOTE, seasonClosedStintNote,
   seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
   seasonPassClosedShortNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
 } from '@/lib/copy/tone';
@@ -194,6 +194,7 @@ function everyUserFacingString(): string[] {
   for (const count of [1, 2, 7]) {
     strings.push(stillToComeNote(count), stillToComeEmptyNote(count, '7 November 2026'));
   }
+  for (const xp of [0, 1, 360, 12_345]) strings.push(raceRemovedNotice('24 Hours of Le Mans', xp));
   return strings;
 }
 
@@ -257,6 +258,15 @@ describe('tone', () => {
     expect(stillToComeEmptyNote(1, '7 November 2026')).toContain('is run on 7 November 2026');
     expect(stillToComeEmptyNote(3, '7 November 2026')).toContain('The 3 races');
     expect(stillToComeEmptyNote(3, '7 November 2026')).toContain('the first is on 7 November 2026');
+  });
+
+  it('says what went with a removed race, and what stays', () => {
+    expect(raceRemovedNotice('6 Hours of Spa', 12_345)).toBe(
+      '6 Hours of Spa was removed from the library, with the 12,345 XP it earned. '
+        + 'Achievements and milestones you reached stay.',
+    );
+    // Nothing to take back, nothing to mention.
+    expect(raceRemovedNotice('6 Hours of Spa', 0)).toBe('6 Hours of Spa was removed from the library.');
   });
 
   it('makes even a short stint feel worthwhile', () => {

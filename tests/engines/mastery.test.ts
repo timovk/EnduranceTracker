@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  computeChampionshipMetrics, computeEventMetrics,
+  computeChampionshipMetrics, computeEventMetrics, masteryUnlockAward,
   type MasteryRaceInput, type MasterySeasonInput,
 } from '@/lib/engines/mastery-engine';
 import { MASTERY_CONFIG } from '@/lib/config';
@@ -233,6 +233,7 @@ describe('computeEventMetrics — recurring events build a lifetime history', ()
       edition({ id: 'b', year: 2026 }),
     ]);
     expect(metrics.consecutiveEditions).toBe(1);
+    expect(metrics.editionsStoryComplete).toBe(1);
   });
 
   it('handles an edition with no year recorded', () => {
@@ -255,7 +256,51 @@ describe('computeEventMetrics — recurring events build a lifetime history', ()
   it('returns zeroes for no editions', () => {
     const metrics = computeEventMetrics([]);
     expect(metrics.editionsStoryComplete).toBe(0);
+    expect(metrics.editionsExperienced).toBe(0);
     expect(metrics.consecutiveEditions).toBe(0);
+  });
+
+  it('counts experienced editions, once per year, whether or not the story is complete', () => {
+    const metrics = computeEventMetrics([
+      edition({ id: 'a', year: 2024, storyComplete: false, experienced: true }),
+      edition({ id: 'b', year: 2025 }),
+      edition({ id: 'c', year: 2025, storyComplete: false, experienced: true }),
+      edition({ id: 'd', year: 2026, storyComplete: false, experienced: false }),
+    ]);
+    expect(metrics.editionsExperienced).toBe(2);
+    expect(metrics.editionsStoryComplete).toBe(1);
+  });
+
+  it('takes a complete story as experienced when a fixture does not say', () => {
+    const metrics = computeEventMetrics([edition({ id: 'a', year: 2026 })]);
+    expect(metrics.editionsExperienced).toBe(1);
+  });
+
+  it('keeps two events’ editions of the same year apart in a wider scope', () => {
+    const metrics = computeChampionshipMetrics([
+      masteryRace({ id: 'a', iconicKey: 'le-mans-24', year: 2026 }),
+      masteryRace({ id: 'b', iconicKey: 'daytona-24', year: 2026 }),
+    ], []);
+    expect(metrics.editionsStoryComplete).toBe(2);
+    expect(metrics.editionsExperienced).toBe(2);
+  });
+});
+
+describe('paying for an unlocked node', () => {
+  const unlock = { treeKey: 'event:le-mans-24', treeName: '24 Hours of Le Mans', nodeKey: 'edition_1', nodeName: 'First Edition' };
+
+  it('pays a node its reward, once, under a stable key', () => {
+    expect(masteryUnlockAward({ ...unlock, xpReward: 1_000 })).toEqual({
+      source: 'MASTERY_NODE',
+      amount: 1_000,
+      description: 'Mastery — 24 Hours of Le Mans: First Edition',
+      sourceRef: 'event:le-mans-24:edition_1',
+      dedupeKey: 'mastery:event:le-mans-24:edition_1',
+    });
+  });
+
+  it('writes no ledger row for a node worth nothing', () => {
+    expect(masteryUnlockAward({ ...unlock, xpReward: 0 })).toBeNull();
   });
 });
 

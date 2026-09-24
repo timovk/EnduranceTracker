@@ -15,7 +15,7 @@ import * as React from 'react';
 import Link from 'next/link';
 import { ArrowRight, Award, Check, Layers, ListChecks, Ticket, Trophy, Zap } from 'lucide-react';
 import type { SessionOutcome } from '@/lib/engines/contracts';
-import { formatDuration } from '@/lib/domain/time';
+import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
 import { seasonClosedStintNote } from '@/lib/copy/tone';
 import { Panel, RarityBadge, SectorRule, TimingBar } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
@@ -60,7 +60,7 @@ export function StintSummary({
             <Figure label="Race progress" value={`+${formatDuration(outcome.timelineSeconds)}`} big={spectacular} />
             <Figure
               label="Completion"
-              value={`${outcome.coverageBeforePercent.toFixed(0)}% → ${outcome.coverageAfterPercent.toFixed(0)}%`}
+              value={`${formatCoveragePercent(outcome.coverageBeforeSec, outcome.runtimeSec)} → ${formatCoveragePercent(outcome.coverageAfterSec, outcome.runtimeSec)}`}
               big={spectacular}
             />
             <Figure label="Playback" value={`${outcome.playbackSpeed}×`} big={spectacular} />

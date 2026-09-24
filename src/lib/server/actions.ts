@@ -24,7 +24,12 @@ import {
   championshipInputSchema, raceInputSchema, raceUpdateSchema, restWeekSchema,
   seasonInputSchema, sessionDeleteSchema, sessionInputSchema, settingsSchema,
 } from '@/lib/validation/schemas';
-import { circuitSlug } from '@/lib/engines/race-engine';
+import { circuitSlug, rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
+import { clearCareerTimelineCache } from '@/lib/engines/career-timeline-engine';
+import type { RaceEditResync } from '@/lib/engines/progression-resync';
+import { raceRemovedNotice } from '@/lib/copy/tone';
+import { formatTimestamp } from '@/lib/domain/time';
+import { formatNumber } from '@/lib/utils';
 import { championshipSlug, ensureCareer, ensureChampionshipPresets } from './bootstrap';
 import { DISPLAY_TITLE_KEY, getCosmeticState, isChoosable, type CosmeticKind } from './cosmetics';
 import { rememberStintEntryMode } from './preferences';
@@ -124,11 +129,19 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
     });
   });
 
+  clearCareerTimelineCache(userId);
   revalidatePath('/races');
   revalidatePath('/');
   revalidatePath('/collections');
   return { ok: true, data: { id: race.id }, message: `${input.name} is in the library.` };
 }
+
+/**
+ * The interactive transaction for an edit that re-syncs progression: the
+ * default five seconds is far too short for mastery, metrics and achievements
+ * on a long career. The same generous limits as logging a stint.
+ */
+const EDIT_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
 
 export async function updateRaceAction(form: FormData): Promise<ActionResult<{ id: string }>> {
   const userId = await requireUserId();
@@ -141,16 +154,19 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
   }
 
   const input = parsed.data;
+  const now = new Date();
+  const { resyncAfterRaceEdit } = await import('@/lib/engines/progression-resync');
   const updated = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
 
     // The race id came from the form. Ownership is established inside the same
     // transaction as the write, so there is no window in which it could change
     // between the two.
-    const owned = await db.race.findFirst({ where: { id: input.id, userId }, select: { id: true } });
-    if (owned === null) return false;
+    const owned = await db.race.findFirst({ where: { id: input.id, userId }, select: { id: true, runtimeSec: true } });
+    if (owned === null) return null;
 
     const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, userId, input);
+    const runtimeSec = input.actualDuration ?? input.scheduledDuration;
 
     await db.race.update({
       where: { id: input.id },
@@ -165,7 +181,7 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
         raceType: input.raceType,
         scheduledDurationSec: input.scheduledDuration,
         actualDurationSec: input.actualDuration,
-        runtimeSec: input.actualDuration ?? input.scheduledDuration,
+        runtimeSec,
         priority: input.priority,
         excitement: input.excitement,
         isMajorEvent: input.isMajorEvent,
@@ -176,19 +192,46 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
       },
     });
 
-    // Changing the runtime changes what "complete" means, so the aggregates
-    // have to be rebuilt rather than left pointing at the old length.
-    const { recomputeRaceAggregates } = await import('@/lib/engines/race-engine');
-    await recomputeRaceAggregates(db, input.id);
-    return true;
-  });
+    // Changing the runtime changes what "complete" means: the coverage is
+    // rebuilt against the new length, so timeline past a shortened end stops
+    // counting, and the aggregates follow it.
+    const runtimeChanged = runtimeSec !== owned.runtimeSec;
+    if (runtimeChanged) await rebuildRaceIntervals(db, input.id);
+    await recomputeRaceAggregates(db, input.id, now);
 
-  if (!updated) return { ok: false, message: 'That race is no longer in the library.' };
+    // Then progression: balances follow the edit at once, landmarks only when
+    // the runtime did not change (`resyncAfterRaceEdit`).
+    const resync = await resyncAfterRaceEdit(db, userId, input.id, now, { runtimeChanged });
+    return { runtimeSec, runtimeChanged, resync };
+  }, EDIT_TRANSACTION);
 
-  revalidatePath('/races');
-  revalidatePath(`/races/${input.id}`);
-  revalidatePath('/');
-  return { ok: true, data: { id: input.id }, message: 'Saved.' };
+  if (updated === null) return { ok: false, message: 'That race is no longer in the library.' };
+
+  clearCareerTimelineCache(userId);
+  revalidatePathsAfterSession(input.id);
+  return { ok: true, data: { id: input.id }, message: raceSavedMessage(updated) };
+}
+
+/** What saving a race changed, in a sentence or two. Plain "Saved." when it changed no XP. */
+function raceSavedMessage(saved: { runtimeSec: number; runtimeChanged: boolean; resync: RaceEditResync }): string {
+  const { resync } = saved;
+  const sentences = ['Saved.'];
+  if (resync.storyBonus.revoked > 0) {
+    sentences.push(
+      saved.runtimeChanged
+        ? `The Story Complete bonus came off because the race now runs to ${formatTimestamp(saved.runtimeSec)}.`
+        : 'The Story Complete bonus came off because the race is no longer a complete story.',
+    );
+  }
+  if (resync.storyBonus.awarded > 0) {
+    sentences.push(
+      `At ${formatTimestamp(saved.runtimeSec)} the race is a complete story, ` +
+        `so its Story Complete bonus of ${formatNumber(resync.storyBonus.awarded)} XP was added.`,
+    );
+  }
+  const unlocked = resync.xpAwarded - resync.storyBonus.awarded;
+  if (unlocked > 0) sentences.push(`The change also earned ${formatNumber(unlocked)} XP.`);
+  return sentences.join(' ');
 }
 
 /**
@@ -258,24 +301,37 @@ export async function setRaceStatusAction(raceId: string, status: string): Promi
   });
   if (count === 0) return { ok: false, message: 'That race is no longer in the library.' };
 
+  clearCareerTimelineCache(userId);
   revalidatePath(`/races/${raceId}`);
   revalidatePath('/races');
   return { ok: true };
 }
 
-export async function deleteRaceAction(raceId: string): Promise<ActionResult> {
+/**
+ * Remove a race, and the XP it earned with it (owner decision D4). The race is
+ * looked up inside the signed-in account by the engine, so another career's
+ * race id reads as already gone.
+ */
+export async function deleteRaceAction(
+  raceId: string,
+): Promise<ActionResult<{ raceName: string; xpRemoved: number }>> {
   const userId = await requireUserId();
-  const race = await prisma.race.findFirst({ where: { id: raceId, userId }, select: { name: true } });
-  if (!race) return { ok: false, message: 'That race is no longer in the library.' };
+  const { deleteRace } = await import('@/lib/engines/session-engine');
+  const removal = await deleteRace(userId, raceId, new Date());
+  if (removal === null) return { ok: false, message: 'That race is no longer in the library.' };
 
-  // Scoped here too, so the delete is safe on its own rather than because the
-  // check above happens to come first.
-  await prisma.race.deleteMany({ where: { id: raceId, userId } });
-
-  revalidatePath('/races');
-  revalidatePath('/');
-  revalidatePath('/collections');
-  return { ok: true, message: `${race.name} was removed from the library.` };
+  clearCareerTimelineCache(userId);
+  for (const path of [
+    '/races', '/', '/collections', '/chronicle', '/events', '/career', '/stats', '/career/milestones',
+    '/mastery', '/hall-of-fame',
+  ]) {
+    revalidatePath(path);
+  }
+  return {
+    ok: true,
+    message: raceRemovedNotice(removal.raceName, removal.careerXpRemoved),
+    data: { raceName: removal.raceName, xpRemoved: removal.careerXpRemoved },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -299,8 +355,17 @@ export async function logSessionAction(form: FormData): Promise<ActionResult<{ s
     return { ok: false, message: 'That stint could not be read.', errors: fieldErrors(parsed.error.issues) };
   }
 
-  const { logViewingSession } = await import('@/lib/engines/session-engine');
-  const outcome = await logViewingSession(userId, parsed.data);
+  const { InvalidStintError, logViewingSession } = await import('@/lib/engines/session-engine');
+  let outcome: Awaited<ReturnType<typeof logViewingSession>>;
+  try {
+    outcome = await logViewingSession(userId, parsed.data);
+  } catch (error) {
+    if (error instanceof InvalidStintError) {
+      return { ok: false, message: 'That stint is dated in the future, so it was not logged.' };
+    }
+    throw error;
+  }
+  clearCareerTimelineCache(userId);
 
   // The way this stint was typed becomes the default for the next one. Only
   // after the stint is safely logged: a preference is not worth failing a
@@ -326,18 +391,25 @@ export async function deleteSessionAction(sessionId: string): Promise<ActionResu
   if (!session) return { ok: false, message: 'That session is no longer recorded.' };
 
   const { deleteViewingSession } = await import('@/lib/engines/session-engine');
-  await deleteViewingSession(userId, sessionId);
+  const removal = await deleteViewingSession(userId, sessionId);
+  clearCareerTimelineCache(userId);
 
   revalidatePathsAfterSession(session.raceId);
   return {
     ok: true,
-    // Deliberately reassuring: correcting a mistake should never feel costly.
-    message: 'Session removed. Your coverage has been recalculated; XP already earned stays where it is.',
+    // Said plainly: XP follows the data, so what the stint earned went with it.
+    message: removal.careerXpRemoved > 0
+      ? `Stint removed. ${formatNumber(removal.careerXpRemoved)} XP came off with it; coverage has been recalculated.`
+      : 'Stint removed. Coverage has been recalculated.',
   };
 }
 
 function revalidatePathsAfterSession(raceId: string): void {
-  for (const path of ['/', '/races', `/races/${raceId}`, '/planner', '/budget', '/career', '/challenges', '/season-pass', '/mastery', '/collections', '/achievements', '/stats', '/trophies', '/hall-of-fame']) {
+  for (const path of [
+    '/', '/races', `/races/${raceId}`, '/planner', '/budget', '/career', '/challenges', '/season-pass', '/mastery',
+    '/collections', '/achievements', '/stats', '/trophies', '/hall-of-fame',
+    '/chronicle', '/events', '/career/milestones', `/races/${raceId}/expedition`,
+  ]) {
     revalidatePath(path);
   }
 }
@@ -372,6 +444,7 @@ export async function createChampionshipAction(form: FormData): Promise<ActionRe
     select: { id: true },
   });
 
+  clearCareerTimelineCache(userId);
   revalidatePath('/races');
   revalidatePath('/mastery');
   return { ok: true, data: championship, message: `${parsed.data.name} added.` };
@@ -408,6 +481,7 @@ export async function upsertSeasonAction(form: FormData): Promise<ActionResult> 
     },
   });
 
+  clearCareerTimelineCache(userId);
   revalidatePath('/collections');
   revalidatePath('/races');
   return { ok: true, message: 'Season saved.' };
@@ -417,6 +491,7 @@ export async function seedPresetChampionshipsAction(): Promise<ActionResult<{ cr
   const userId = await requireUserId();
   await ensureCareer(userId);
   const created = await ensureChampionshipPresets(userId);
+  clearCareerTimelineCache(userId);
   revalidatePath('/races');
   revalidatePath('/settings');
   return { ok: true, data: { created }, message: `${created} championship${created === 1 ? '' : 's'} added.` };

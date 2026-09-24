@@ -12,10 +12,12 @@
  * re-run — while a second account can still earn it for the first time.
  */
 
+import { Prisma } from '@/generated/prisma/client';
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
 import { levelFromXp, prestigeForLevel, titleForLevel } from '@/lib/domain/progression';
 import type { XPSource } from '@/lib/domain/types';
+import { rebuildSeasonXpFromLedger } from './season-pass-engine';
 
 export interface XpAward {
   source: XPSource;
@@ -148,9 +150,90 @@ export interface XpRevocation {
   transactions: number;
   careerXp: number;
   seasonXp: number;
+  /**
+   * The earliest removed row in ledger order (`createdAt`, then `id`), or null
+   * when nothing was removed. Every running total from this point on described
+   * a career that included the row, so `settleLedger` re-stamps from here.
+   */
+  earliest: LedgerPosition | null;
 }
 
-const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0 };
+/** A place in the ledger's order: `createdAt`, then `id` to break ties. */
+export interface LedgerPosition {
+  createdAt: Date;
+  id: string;
+}
+
+const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0, earliest: null };
+
+/** Ids per `IN (…)` list, well inside SQLite's limit on bound parameters. */
+const ID_CHUNK = 500;
+
+/**
+ * Rows re-stamped per UPDATE statement. One statement per row made a full
+ * re-stamp of 180,000 rows take 29.6 s; batches of 400 take 6.9 s.
+ */
+const LEDGER_RESTAMP_BATCH = 400;
+
+/** True when `a` comes before `b` in ledger order. */
+function isEarlier(a: LedgerPosition, b: LedgerPosition): boolean {
+  const byTime = a.createdAt.getTime() - b.createdAt.getTime();
+  return byTime !== 0 ? byTime < 0 : a.id < b.id;
+}
+
+function earlierOf(a: LedgerPosition | null, b: LedgerPosition | null): LedgerPosition | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return isEarlier(b, a) ? b : a;
+}
+
+/** Several removals as one. */
+export function combineRevocations(revocations: readonly XpRevocation[]): XpRevocation {
+  return revocations.reduce<XpRevocation>(
+    (total, revocation) => ({
+      transactions: total.transactions + revocation.transactions,
+      careerXp: total.careerXp + revocation.careerXp,
+      seasonXp: total.seasonXp + revocation.seasonXp,
+      earliest: earlierOf(total.earliest, revocation.earliest),
+    }),
+    NOTHING_REVOKED,
+  );
+}
+
+/**
+ * Delete these rows and say what they were worth.
+ *
+ * The one place a revocation deletes, so every path reports its removals the
+ * same way — including the earliest row, which is where the settle starts.
+ *
+ * The rows were read inside the account a moment ago, in the same
+ * transaction, and are deleted by primary key alone: with a `userId` term
+ * SQLite plans the delete on the `(userId, createdAt)` index and walks the
+ * whole account's ledger for every statement.
+ */
+async function removeRows(
+  tx: Tx,
+  rows: readonly { id: string; amount: number; seasonAmount: number; createdAt: Date }[],
+): Promise<XpRevocation> {
+  if (rows.length === 0) return NOTHING_REVOKED;
+
+  for (let index = 0; index < rows.length; index += ID_CHUNK) {
+    const ids = rows.slice(index, index + ID_CHUNK).map((row) => row.id);
+    await tx.xPTransaction.deleteMany({ where: { id: { in: ids } } });
+  }
+
+  let earliest: LedgerPosition | null = null;
+  for (const row of rows) earliest = earlierOf(earliest, { createdAt: row.createdAt, id: row.id });
+
+  return {
+    transactions: rows.length,
+    careerXp: rows.reduce((sum, row) => sum + row.amount, 0),
+    seasonXp: rows.reduce((sum, row) => sum + row.seasonAmount, 0),
+    earliest,
+  };
+}
+
+const REVOKED_ROW_SELECT = { id: true, amount: true, seasonAmount: true, createdAt: true } as const;
 
 /**
  * The sources a logged stint is allowed to take back with it.
@@ -172,22 +255,55 @@ const SESSION_BOUND_SOURCES: XPSource[] = ['VIEWING', 'REWATCH'];
  *
  * Note what this does NOT do: it writes no negative transaction and decrements
  * no counter. The rows simply cease to exist, and the totals are rebuilt from
- * what remains. There is still no negative XP in this application.
+ * what remains (`settleLedger`). There is still no negative XP in this
+ * application.
  */
 export async function revokeSessionXp(tx: Tx, userId: string, sessionId: string): Promise<XpRevocation> {
+  return revokeSessionsXp(tx, userId, [sessionId]);
+}
+
+/**
+ * Remove the XP several stints earned — every stint of a race that is being
+ * deleted, say. Same rule and same precondition as `revokeSessionXp`: it runs
+ * before the stints go.
+ *
+ * The lookup is by `sessionId` alone, in chunks, so SQLite serves it from the
+ * `sessionId` index: with a `userId` term it would choose the
+ * `(userId, source)` index and read every viewing award the account holds.
+ * The account is then checked on each row found, so a stint id from another
+ * account takes nothing back.
+ */
+export async function revokeSessionsXp(
+  tx: Tx,
+  userId: string,
+  sessionIds: readonly string[],
+): Promise<XpRevocation> {
+  const rows: { id: string; amount: number; seasonAmount: number; createdAt: Date }[] = [];
+  for (let index = 0; index < sessionIds.length; index += ID_CHUNK) {
+    const chunk = sessionIds.slice(index, index + ID_CHUNK);
+    const found = await tx.xPTransaction.findMany({
+      where: { sessionId: { in: [...chunk] }, source: { in: SESSION_BOUND_SOURCES } },
+      select: { ...REVOKED_ROW_SELECT, userId: true },
+    });
+    for (const row of found) if (row.userId === userId) rows.push(row);
+  }
+  return removeRows(tx, rows);
+}
+
+/**
+ * Remove every viewing award a race holds.
+ *
+ * The viewing award always names its race in `sourceRef`, so this finds the
+ * rows `revokeSessionsXp` cannot: the ones whose stint was deleted under a
+ * version that left the XP behind, which `onDelete: SetNull` cut loose from
+ * any session. Deleting a race takes those back too (owner decision D4).
+ */
+export async function revokeRaceViewingXp(tx: Tx, userId: string, raceId: string): Promise<XpRevocation> {
   const rows = await tx.xPTransaction.findMany({
-    where: { userId, sessionId, source: { in: SESSION_BOUND_SOURCES } },
-    select: { id: true, amount: true, seasonAmount: true },
+    where: { userId, sourceRef: raceId, source: { in: SESSION_BOUND_SOURCES } },
+    select: REVOKED_ROW_SELECT,
   });
-  if (rows.length === 0) return NOTHING_REVOKED;
-
-  await tx.xPTransaction.deleteMany({ where: { id: { in: rows.map((row) => row.id) } } });
-
-  return {
-    transactions: rows.length,
-    careerXp: rows.reduce((sum, row) => sum + row.amount, 0),
-    seasonXp: rows.reduce((sum, row) => sum + row.seasonAmount, 0),
-  };
+  return removeRows(tx, rows);
 }
 
 /**
@@ -201,15 +317,24 @@ export async function revokeSessionXp(tx: Tx, userId: string, sessionId: string)
  * exactly when the thing is true" an invariant rather than a hope.
  */
 export async function revokeXpByDedupeKey(tx: Tx, userId: string, dedupeKey: string): Promise<XpRevocation> {
-  const row = await tx.xPTransaction.findFirst({
-    where: { userId, dedupeKey },
-    select: { id: true, amount: true, seasonAmount: true },
-  });
-  if (!row) return NOTHING_REVOKED;
+  return revokeXpByDedupeKeys(tx, userId, [dedupeKey]);
+}
 
-  await tx.xPTransaction.delete({ where: { id: row.id } });
-
-  return { transactions: 1, careerXp: row.amount, seasonXp: row.seasonAmount };
+/** `revokeXpByDedupeKey` for several keys at once, through the unique index. */
+export async function revokeXpByDedupeKeys(
+  tx: Tx,
+  userId: string,
+  dedupeKeys: readonly string[],
+): Promise<XpRevocation> {
+  const rows: { id: string; amount: number; seasonAmount: number; createdAt: Date }[] = [];
+  for (let index = 0; index < dedupeKeys.length; index += ID_CHUNK) {
+    const chunk = dedupeKeys.slice(index, index + ID_CHUNK);
+    rows.push(...await tx.xPTransaction.findMany({
+      where: { userId, dedupeKey: { in: [...chunk] } },
+      select: REVOKED_ROW_SELECT,
+    }));
+  }
+  return removeRows(tx, rows);
 }
 
 /**
@@ -226,17 +351,9 @@ export async function revokeXpByDedupeKey(tx: Tx, userId: string, dedupeKey: str
 export async function purgeOrphanedSessionXp(tx: Tx, userId: string): Promise<XpRevocation> {
   const rows = await tx.xPTransaction.findMany({
     where: { userId, sessionId: null, source: { in: SESSION_BOUND_SOURCES } },
-    select: { id: true, amount: true, seasonAmount: true },
+    select: REVOKED_ROW_SELECT,
   });
-  if (rows.length === 0) return NOTHING_REVOKED;
-
-  await tx.xPTransaction.deleteMany({ where: { id: { in: rows.map((row) => row.id) } } });
-
-  return {
-    transactions: rows.length,
-    careerXp: rows.reduce((sum, row) => sum + row.amount, 0),
-    seasonXp: rows.reduce((sum, row) => sum + row.seasonAmount, 0),
-  };
+  return removeRows(tx, rows);
 }
 
 /** How a rebuild moved the career. */
@@ -261,29 +378,62 @@ export interface LedgerRebuild {
  * are what the career XP graph is drawn from; remove a row from the middle of
  * the history and every snapshot after it is describing a career that no
  * longer happened. Replaying in order is the only way the graph stays true.
+ *
+ * `from` limits the replay to the rows at or after that position: everything
+ * before it is summed in one aggregate and left alone, because nothing before
+ * the earliest removed row changed. Without it every row is replayed. Either
+ * way the corrected rows are written a batch at a time, one statement per
+ * `LEDGER_RESTAMP_BATCH` rows, which is what keeps deleting a stint from the
+ * first year of a long career inside its transaction.
  */
-export async function rebuildCareerTotals(tx: Tx, userId: string): Promise<LedgerRebuild> {
+export async function rebuildCareerTotals(
+  tx: Tx,
+  userId: string,
+  options: { from?: LedgerPosition } = {},
+): Promise<LedgerRebuild> {
   const profile = await tx.careerProfile.findUniqueOrThrow({ where: { userId } });
+  const from = options.from;
+
+  let running = 0;
+  if (from !== undefined) {
+    const before = await tx.xPTransaction.aggregate({
+      where: {
+        userId,
+        OR: [{ createdAt: { lt: from.createdAt } }, { createdAt: from.createdAt, id: { lt: from.id } }],
+      },
+      _sum: { amount: true },
+    });
+    running = before._sum.amount ?? 0;
+  }
 
   // `id` breaks ties: two awards inside one transaction share a timestamp, and
   // an unstable order would re-stamp them differently on every rebuild.
   const rows = await tx.xPTransaction.findMany({
-    where: { userId },
+    where: from === undefined
+      ? { userId }
+      : {
+          userId,
+          OR: [{ createdAt: { gt: from.createdAt } }, { createdAt: from.createdAt, id: { gte: from.id } }],
+        },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     select: { id: true, amount: true, careerXpAfter: true, levelAfter: true },
   });
 
-  let running = 0;
-  let rowsRestamped = 0;
+  const changed: { id: string; careerXpAfter: number; levelAfter: number }[] = [];
+  // The level is solved again only when the running total leaves the current
+  // level's band: solving it is a walk up the curve, and a long ledger crosses
+  // a band a hundred times, not a hundred thousand.
+  let band = levelFromXp(running);
   for (const row of rows) {
     running += row.amount;
-    const level = levelFromXp(running).level;
+    if (running < band.levelStartXp || running >= band.nextLevelXp) band = levelFromXp(running);
+    const level = band.level;
     if (Number(row.careerXpAfter) === running && row.levelAfter === level) continue;
-    await tx.xPTransaction.update({
-      where: { id: row.id },
-      data: { careerXpAfter: BigInt(running), levelAfter: level },
-    });
-    rowsRestamped += 1;
+    changed.push({ id: row.id, careerXpAfter: running, levelAfter: level });
+  }
+
+  for (let index = 0; index < changed.length; index += LEDGER_RESTAMP_BATCH) {
+    await restampBatch(tx, changed.slice(index, index + LEDGER_RESTAMP_BATCH));
   }
 
   const state = levelFromXp(running);
@@ -302,8 +452,60 @@ export async function rebuildCareerTotals(tx: Tx, userId: string): Promise<Ledge
     careerXpAfter: running,
     levelBefore: profile.level,
     levelAfter: state.level,
-    rowsRestamped,
+    rowsRestamped: changed.length,
   };
+}
+
+/**
+ * Write one batch of corrected running totals in a single statement:
+ * `UPDATE … SET careerXpAfter = CASE id WHEN … THEN … END, levelAfter = CASE …`.
+ *
+ * The rows are found by primary key alone. The ids were read inside the
+ * account a moment ago, and a `userId` term would let SQLite choose the
+ * `(userId, …)` index and scan the whole account's ledger for every batch —
+ * measured, a full re-stamp of 180,000 rows went from 5 s to 35 s.
+ */
+async function restampBatch(
+  tx: Tx,
+  batch: readonly { id: string; careerXpAfter: number; levelAfter: number }[],
+): Promise<void> {
+  if (batch.length === 0) return;
+  const careerXpCases = Prisma.join(batch.map((row) => Prisma.sql`WHEN ${row.id} THEN ${row.careerXpAfter}`), ' ');
+  const levelCases = Prisma.join(batch.map((row) => Prisma.sql`WHEN ${row.id} THEN ${row.levelAfter}`), ' ');
+  const ids = Prisma.join(batch.map((row) => row.id));
+  await tx.$executeRaw`
+    UPDATE "xp_transactions"
+    SET "careerXpAfter" = CASE "id" ${careerXpCases} END,
+        "levelAfter" = CASE "id" ${levelCases} END
+    WHERE "id" IN (${ids})`;
+}
+
+/**
+ * Settle the ledger after rows were removed (R13).
+ *
+ * Every transaction that deletes an `XPTransaction` row ends here, after its
+ * last award, so the rows awarded after a removal are re-stamped as well and
+ * "career XP equals the sum of the ledger" holds by construction rather than
+ * because each caller remembered to rebuild. The replay starts at the earliest
+ * row any of the revocations removed.
+ *
+ * Season XP is rebuilt only when a removed row carried some. Rebuilding it
+ * otherwise would sum the ledger's unboosted `seasonAmount` and quietly take
+ * the momentum bonus off a pass (see `season-reset.ts`).
+ *
+ * Returns null, having done nothing, when nothing was removed.
+ */
+export async function settleLedger(
+  tx: Tx,
+  userId: string,
+  revocations: readonly XpRevocation[],
+): Promise<LedgerRebuild | null> {
+  const removed = combineRevocations(revocations);
+  if (removed.transactions === 0 || removed.earliest === null) return null;
+
+  const rebuild = await rebuildCareerTotals(tx, userId, { from: removed.earliest });
+  if (removed.seasonXp > 0) await rebuildSeasonXpFromLedger(tx, userId);
+  return rebuild;
 }
 
 /** `rebuildCareerTotals` in its own transaction, for scripts and one-off repairs. */

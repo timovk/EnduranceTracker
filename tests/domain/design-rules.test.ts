@@ -279,8 +279,19 @@ describe('the application never scolds', () => {
       .map((match) => match[1] ?? match[2] ?? match[3] ?? '');
   }
 
+  /**
+   * The source a user can read text from: the application itself, and the
+   * server modules whose action messages and page data carry sentences.
+   */
+  const USER_FACING = [...ALL_SOURCE, ...SERVER_FILES];
+
+  it('finds the server modules it scans', () => {
+    // If this ever reads zero, the scans below pass for the wrong reason.
+    expect(SERVER_FILES.map(rel)).toContain('src/lib/server/actions.ts');
+  });
+
   it('says none of the forbidden things anywhere a user can see', () => {
-    for (const file of ALL_SOURCE) {
+    for (const file of USER_FACING) {
       for (const text of stringsIn(file)) {
         const lower = text.toLowerCase();
         for (const phrase of FORBIDDEN) {
@@ -291,7 +302,7 @@ describe('the application never scolds', () => {
   });
 
   it('never tells the user they cannot watch something', () => {
-    for (const file of ALL_SOURCE) {
+    for (const file of USER_FACING) {
       for (const text of stringsIn(file)) {
         const lower = text.toLowerCase();
         expect(lower, rel(file)).not.toContain('you cannot watch');

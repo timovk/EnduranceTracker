@@ -9,17 +9,38 @@
  * Requires `.env.test` to point at a database that can be wiped.
  */
 
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * The server actions below run as this account. The session is the one thing
+ * replaced: a browser cannot influence it, and it is not what is under test.
+ */
+const signedIn = vi.hoisted(() => ({ userId: '00000000-0000-4000-8000-0000000000ff' }));
+
+vi.mock('server-only', () => ({}));
+vi.mock('@/lib/auth/session', () => ({
+  SESSION_COOKIE: 'endurance_session',
+  requireUserId: async () => signedIn.userId,
+  getSessionUserId: async () => signedIn.userId,
+  getSessionUser: async () => null,
+}));
+// No router here to tell about revalidated routes.
+vi.mock('next/cache', () => ({ revalidatePath: () => {} }));
+
 import { prisma, disconnectDb } from '@/lib/db/client';
-import { logViewingSession, deleteViewingSession, repairXpLedger } from '@/lib/engines/session-engine';
+import {
+  InvalidStintError, logViewingSession, deleteViewingSession, repairXpLedger,
+} from '@/lib/engines/session-engine';
 import { recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { awardXp, recalculateCareerXp } from '@/lib/engines/xp-ledger';
 import { coverageSeconds, fromRows } from '@/lib/domain/intervals';
 import { XP_CONFIG } from '@/lib/config';
+import { deleteSessionAction, logSessionAction, updateRaceAction } from '@/lib/server/actions';
+import { formatNumber } from '@/lib/utils';
 import type { Tx } from '@/lib/db/client';
 
 const H = 3600;
-const USER = '00000000-0000-4000-8000-0000000000ff';
+const USER = signedIn.userId;
 
 /** Wipe everything this user owns. Cascades take the rest. */
 async function resetUser(): Promise<void> {
@@ -590,6 +611,23 @@ describe('cached aggregates are only ever a cache', () => {
     expect(after.avgPlaybackSpeed).toBeCloseTo(before.avgPlaybackSpeed, 3);
   });
 
+  it('counts no coverage past the runtime, and can keep the status the user chose', async () => {
+    const raceId = await makeRace({ runtimeHours: 6 });
+    // Intervals as 0.3.x could leave them after the race was shortened to
+    // six hours: seven hours stored, with an hour-long gap inside the six.
+    await prisma.watchedInterval.createMany({
+      data: [{ raceId, startSec: 0, endSec: H }, { raceId, startSec: 2 * H, endSec: 7 * H }],
+    });
+    await prisma.race.update({ where: { id: raceId }, data: { status: 'ARCHIVED' } });
+
+    const kept = await prisma.$transaction((tx) =>
+      recomputeRaceAggregates(tx as Tx, raceId, new Date(), { preserveStatus: true }));
+    expect(kept.coverageSec).toBe(5 * H);
+    expect(kept.furthestTimestampSec).toBe(6 * H);
+    expect(kept.storyCompletedAt).toBeNull();
+    expect((await prisma.race.findUniqueOrThrow({ where: { id: raceId } })).status).toBe('ARCHIVED');
+  });
+
   it('weights the average playback speed by timeline, not by session count', async () => {
     const raceId = await makeRace({ runtimeHours: 6 });
     await logViewingSession(USER, {
@@ -708,5 +746,134 @@ describe('repairing a career written before deletion took its XP back', () => {
     expect(repair.staleStoryBonuses).toBe(0);
     expect(Number(after.careerXp)).toBe(Number(before.careerXp));
     expect(after.level).toBe(before.level);
+  });
+});
+
+describe('shortening a race', () => {
+  it('shortening a race does not complete it from coverage past the new end', async () => {
+    const raceId = await makeRace({ runtimeHours: 7, name: 'Seven Hours' });
+    await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 2 * H, endTimestamp: 7 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+
+    // The race turns out to have run six hours. Five of the seven hours were
+    // watched, but one of them is now past the end.
+    const edit = new FormData();
+    for (const [key, value] of Object.entries({
+      id: raceId, name: 'Seven Hours', raceType: 'H6', scheduledDuration: '06:00:00',
+      priority: 'NORMAL', excitement: '3', status: 'WATCHING',
+    })) edit.append(key, value);
+    const saved = await updateRaceAction(edit);
+    expect(saved.ok, saved.message).toBe(true);
+
+    const rows = await prisma.watchedInterval.findMany({ where: { raceId }, select: { startSec: true, endSec: true } });
+    expect(rows).toEqual([{ startSec: 2 * H, endSec: 6 * H }]);
+    expect((await prisma.race.findUniqueOrThrow({ where: { id: raceId } })).coverageSec).toBe(4 * H);
+
+    // Watching the first hour leaves the second still to watch: not complete.
+    const outcome = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    expect(outcome.storyCompleted).toBe(false);
+    expect(outcome.coverageAfterSec).toBe(5 * H);
+    expect(await prisma.xPTransaction.count({ where: { userId: USER, dedupeKey: `story-complete:${raceId}` } })).toBe(0);
+  });
+
+  it('takes the Story Complete bonus back at once, and says why', async () => {
+    const raceId = await makeRace({ runtimeHours: 6, name: 'Six Hours' });
+    await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 6 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    const achievementsBefore = await prisma.achievementProgress.count({ where: { userId: USER, unlockedAt: { not: null } } });
+
+    const edit = new FormData();
+    for (const [key, value] of Object.entries({
+      id: raceId, name: 'Six Hours', raceType: 'H6', scheduledDuration: '06:30:00',
+      priority: 'NORMAL', excitement: '3', status: 'COMPLETED',
+    })) edit.append(key, value);
+    const saved = await updateRaceAction(edit);
+
+    expect(saved.message).toBe('Saved. The Story Complete bonus came off because the race now runs to 06:30:00.');
+    expect(await prisma.xPTransaction.count({ where: { userId: USER, dedupeKey: `story-complete:${raceId}` } })).toBe(0);
+    // Landmarks stay earned.
+    expect(await prisma.achievementProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }))
+      .toBe(achievementsBefore);
+    const [profile, ledger] = await Promise.all([
+      prisma.careerProfile.findUniqueOrThrow({ where: { userId: USER } }),
+      prisma.xPTransaction.aggregate({ where: { userId: USER }, _sum: { amount: true } }),
+    ]);
+    expect(Number(profile.careerXp)).toBe(ledger._sum.amount ?? 0);
+  });
+});
+
+describe('the messages a stint action gives', () => {
+  it('deleting a stint says how much XP came off', async () => {
+    const raceId = await makeRace();
+    const logged = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 2 * H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    const viewing = await prisma.xPTransaction.findFirstOrThrow({
+      where: { userId: USER, sessionId: logged.sessionId, source: 'VIEWING' },
+    });
+
+    const result = await deleteSessionAction(logged.sessionId);
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toBe(
+      `Stint removed. ${formatNumber(viewing.amount)} XP came off with it; coverage has been recalculated.`,
+    );
+  });
+
+  it('says only that coverage was recalculated when the stint held no XP', async () => {
+    const raceId = await makeRace();
+    // A stint of no length earns nothing.
+    const logged = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: H, endTimestamp: H,
+      playbackSpeed: 1, watchedAt: null, note: undefined,
+    });
+    expect(await prisma.xPTransaction.count({ where: { sessionId: logged.sessionId } })).toBe(0);
+
+    const result = await deleteSessionAction(logged.sessionId);
+    expect(result.message).toBe('Stint removed. Coverage has been recalculated.');
+  });
+});
+
+describe('a stint dated in the future', () => {
+  const now = new Date(2026, 8, 24, 20, 0);
+
+  it('is refused, and nothing is written', async () => {
+    const raceId = await makeRace();
+    await expect(logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: H,
+      playbackSpeed: 1, watchedAt: new Date(now.getTime() + 86_400_000), note: undefined,
+    }, now)).rejects.toBeInstanceOf(InvalidStintError);
+
+    expect(await prisma.raceViewingSession.count({ where: { raceId } })).toBe(0);
+    expect(await prisma.xPTransaction.count({ where: { userId: USER } })).toBe(0);
+  });
+
+  it('is accepted a couple of minutes ahead, for a clock that runs fast', async () => {
+    const raceId = await makeRace();
+    const outcome = await logViewingSession(USER, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: H,
+      playbackSpeed: 1, watchedAt: new Date(now.getTime() + 2 * 60_000), note: undefined,
+    }, now);
+    expect(outcome.sessionId).toBeTruthy();
+  });
+
+  it('is refused by the action in a plain sentence', async () => {
+    const raceId = await makeRace();
+    const form = new FormData();
+    for (const [key, value] of Object.entries({
+      raceId, mode: 'RANGE', startTimestamp: '00:00:00', endTimestamp: '01:00:00', playbackSpeed: '1',
+      watchedAt: new Date(Date.now() + 86_400_000).toISOString(),
+    })) form.append(key, value);
+
+    const result = await logSessionAction(form);
+    expect(result).toEqual({ ok: false, message: 'That stint is dated in the future, so it was not logged.' });
   });
 });

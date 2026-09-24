@@ -253,6 +253,24 @@ export interface SessionRemoval {
   remainingSessions: number;
 }
 
+/**
+ * The result of removing a whole race from the library (0.4.0, owner decision
+ * D4): the XP its viewing earned goes with it, exactly as if its stints had
+ * been deleted one by one. Achievements, milestones and every other landmark
+ * it helped reach stay.
+ */
+export interface RaceRemoval {
+  raceName: string;
+  sessionsRemoved: number;
+  /** Career XP taken back: viewing, re-watch and the Story Complete bonus. Never negative. */
+  careerXpRemoved: number;
+  seasonXpRemoved: number;
+  /** True when the race held its Story Complete bonus, which went with it. */
+  storyBonusRemoved: boolean;
+  levelBefore: number;
+  levelAfter: number;
+}
+
 // ---------------------------------------------------------------------------
 // Session result — what the stint summary screen renders
 // ---------------------------------------------------------------------------
@@ -282,6 +300,13 @@ export interface SessionOutcome {
 
   coverageBeforePercent: number;
   coverageAfterPercent: number;
+  /**
+   * The same coverage in seconds, with the race's runtime, so a percentage can
+   * be shown with `formatCoveragePercent`, which never rounds a gap up to 100%.
+   */
+  coverageBeforeSec: number;
+  coverageAfterSec: number;
+  runtimeSec: number;
 
   careerXpAwarded: number;
   seasonXpAwarded: number;
