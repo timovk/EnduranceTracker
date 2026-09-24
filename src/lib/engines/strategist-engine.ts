@@ -8,6 +8,10 @@
  *   BEST_FIT  a race that fits the viewing window the user actually has
  *   WILDCARD  something deliberately unlike the other two
  *
+ * A race whose race date is still to come is never one of them (0.3.2): it
+ * cannot be watched yet. It stays in the library and is suggested from its
+ * race day on. See `isStillToCome` in `@/lib/domain/race-day`.
+ *
  * ===========================================================================
  * THE STRATEGIST DOES NOT OPTIMISE XP.
  *
@@ -44,9 +48,10 @@ import { prisma } from '@/lib/db/client';
 import { fromRows, gapsIn } from '@/lib/domain/intervals';
 import { dayPeriod } from '@/lib/domain/periods';
 import { averagePlaybackSpeed, clampSpeed, realSecondsFor, suggestStints } from '@/lib/domain/playback';
+import { isStillToCome, raceDayStart } from '@/lib/domain/race-day';
 import { formatDuration } from '@/lib/domain/time';
 import type { Interval, RacePriority, RaceStatus } from '@/lib/domain/types';
-import type { Recommendation, RecommendationKind } from '@/lib/engines/contracts';
+import type { Recommendation, RecommendationKind, StillToCome, StrategistView } from '@/lib/engines/contracts';
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -82,6 +87,13 @@ export interface RaceCandidate {
   excitement: number;
   isMajorEvent: boolean;
   storyComplete: boolean;
+  /**
+   * The day the race is run, as stored: the typed calendar day at midnight
+   * UTC. Null when the user gave none.
+   */
+  raceDate: Date | null;
+  /** Stints logged on this race. One is enough to make a dated race watchable. */
+  sessionCount: number;
   lastWatchedAt: Date | null;
   /** Unwatched holes in the timeline, merged and ordered. */
   gaps: readonly Interval[];
@@ -219,14 +231,23 @@ function estimateCandidate(candidate: RaceCandidate, context: StrategistContext)
 }
 
 /**
- * A race is a candidate unless the user has deliberately put it away or has
- * already seen the whole story. Nothing else is filtered out — a library is a
- * set of future experiences, and the strategist does not curate it.
+ * Whether a race is one the user might still want to watch: not deliberately
+ * put away, and not already seen in full.
  */
-function isEligible(candidate: RaceCandidate): boolean {
+function isUnfinished(candidate: RaceCandidate): boolean {
   if (candidate.runtimeSec <= 0) return false;
   if (candidate.storyComplete) return false;
   return candidate.status !== 'ARCHIVED' && candidate.status !== 'ABANDONED';
+}
+
+/**
+ * A race is a candidate unless the user has deliberately put it away, has
+ * already seen the whole story, or it has not been run yet. Nothing else is
+ * filtered out — a library is a set of future experiences, and the strategist
+ * does not curate it.
+ */
+function isEligible(candidate: RaceCandidate, now: Date): boolean {
+  return isUnfinished(candidate) && !isStillToCome(candidate, now);
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +694,7 @@ export function buildRecommendations(
 ): Recommendation[] {
   const eligible = new Map<string, RaceCandidate>();
   for (const candidate of candidates) {
-    if (isEligible(candidate) && !eligible.has(candidate.id)) eligible.set(candidate.id, candidate);
+    if (isEligible(candidate, context.now) && !eligible.has(candidate.id)) eligible.set(candidate.id, candidate);
   }
 
   const picked: Recommendation[] = [];
@@ -718,6 +739,30 @@ export function buildRecommendations(
   take('WILDCARD', wildcard?.entry, wildCtx);
 
   return picked.slice(0, STRATEGIST_CONFIG.recommendationCount);
+}
+
+/**
+ * The unfinished races left out only because they have not been run yet: how
+ * many, and the first day one of them is on.
+ *
+ * Pure, like `buildRecommendations`, and counted with the same rules, so the
+ * number the panel quotes is exactly the races the suggestions skipped. Only
+ * the count and a date leave this function, never the races: they are not
+ * shown until they can be watched.
+ */
+export function summariseStillToCome(candidates: readonly RaceCandidate[], now: Date): StillToCome {
+  const seen = new Set<string>();
+  let count = 0;
+  let next: Date | null = null;
+  for (const candidate of candidates) {
+    if (seen.has(candidate.id)) continue;
+    seen.add(candidate.id);
+    if (!isUnfinished(candidate) || !isStillToCome(candidate, now)) continue;
+    count += 1;
+    const day = raceDayStart(candidate.raceDate);
+    if (day !== null && (next === null || day.getTime() < next.getTime())) next = day;
+  }
+  return { count, nextRaceDay: next };
 }
 
 // ---------------------------------------------------------------------------
@@ -777,14 +822,28 @@ function seasonLabelFor(
 /**
  * Suggest what to watch next.
  *
- * Read-only, so it uses `prisma` directly rather than a transaction client.
- * Everything it reads is turned into plain `RaceCandidate` values and handed to
- * `buildRecommendations`, so the database layer and the rules stay separable.
+ * The suggestions alone; `getStrategist` also says how many races were left
+ * out because they have not been run yet.
  */
 export async function getRecommendations(
   userId: string,
   opts: { windowMinutes?: number; now?: Date } = {},
 ): Promise<Recommendation[]> {
+  return (await getStrategist(userId, opts)).recommendations;
+}
+
+/**
+ * Suggest what to watch next, and say what was left out for not having been
+ * run yet.
+ *
+ * Read-only, so it uses `prisma` directly rather than a transaction client.
+ * Everything it reads is turned into plain `RaceCandidate` values and handed to
+ * `buildRecommendations`, so the database layer and the rules stay separable.
+ */
+export async function getStrategist(
+  userId: string,
+  opts: { windowMinutes?: number; now?: Date } = {},
+): Promise<StrategistView> {
   const now = opts.now ?? new Date();
   const windowMinutes = opts.windowMinutes ?? STRATEGIST_CONFIG.defaultWindowMinutes;
 
@@ -795,7 +854,7 @@ export async function getRecommendations(
       where: { userId },
       select: {
         id: true, name: true, status: true, priority: true, excitement: true,
-        runtimeSec: true, coverageSec: true, isMajorEvent: true, circuit: true,
+        runtimeSec: true, coverageSec: true, isMajorEvent: true, circuit: true, raceDate: true,
         avgPlaybackSpeed: true, sessionCount: true, lastWatchedAt: true,
         storyCompletedAt: true, championshipId: true, seasonId: true,
         championship: { select: { name: true, shortName: true, accentColor: true } },
@@ -924,6 +983,8 @@ export async function getRecommendations(
       excitement: race.excitement,
       isMajorEvent: race.isMajorEvent,
       storyComplete: race.storyCompletedAt !== null,
+      raceDate: race.raceDate,
+      sessionCount: race.sessionCount,
       lastWatchedAt: race.lastWatchedAt,
       gaps: gapsIn(intervals, runtimeSec),
       avgPlaybackSpeed: race.sessionCount > 0 ? race.avgPlaybackSpeed : null,
@@ -932,5 +993,8 @@ export async function getRecommendations(
     };
   });
 
-  return buildRecommendations(candidates, context);
+  return {
+    recommendations: buildRecommendations(candidates, context),
+    stillToCome: summariseStillToCome(candidates, now),
+  };
 }

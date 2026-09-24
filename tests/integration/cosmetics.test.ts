@@ -178,15 +178,28 @@ describe('the displayed title', () => {
 
 describe("what's new", () => {
   it('is not shown to an account created on this version', async () => {
-    expect(await pendingReleaseNotes(userId)).toBeNull();
+    expect(await pendingReleaseNotes(userId)).toEqual([]);
   });
 
   it('is shown once to an account that came from an earlier version', async () => {
     await prisma.configOverride.delete({ where: { userId_key: { userId, key: LAST_SEEN_VERSION_KEY } } });
-    expect((await pendingReleaseNotes(userId))?.version).toBe(APP_VERSION);
+    expect((await pendingReleaseNotes(userId)).map((entry) => entry.version)).toEqual([APP_VERSION]);
 
     await markReleaseNotesSeen(userId);
-    expect(await pendingReleaseNotes(userId)).toBeNull();
+    expect(await pendingReleaseNotes(userId)).toEqual([]);
+  });
+
+  it('also explains a version that was skipped, newest first', async () => {
+    // Straight from 0.3.0 to this version: 0.3.1 ran on the way, so its notes
+    // are owed too.
+    await markReleaseNotesSeen(userId, '0.3.0');
+    const versions = (await pendingReleaseNotes(userId)).map((entry) => entry.version);
+    expect(versions[0]).toBe(APP_VERSION);
+    expect(versions).toContain('0.3.1');
+    expect(versions).not.toContain('0.3.0');
+
+    await markReleaseNotesSeen(userId);
+    expect(await pendingReleaseNotes(userId)).toEqual([]);
   });
 });
 

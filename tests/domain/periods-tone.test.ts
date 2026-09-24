@@ -18,7 +18,7 @@ import {
   ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, EXPIRED_CHALLENGE_NOTE,
   FORBIDDEN_TONE_WORDS, momentumNote, RECOMMENDATION_FOOTNOTE, seasonClosedStintNote,
   seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
-  seasonPassClosedShortNote, stintHeading, welcomeBack,
+  seasonPassClosedShortNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
 } from '@/lib/copy/tone';
 
 describe('viewing weeks', () => {
@@ -191,6 +191,9 @@ function everyUserFacingString(): string[] {
     seasonalChallengesClosedNote('Q4 2026', '1 October 2026'),
     seasonClosedStintNote('1 October 2026'),
   );
+  for (const count of [1, 2, 7]) {
+    strings.push(stillToComeNote(count), stillToComeEmptyNote(count, '7 November 2026'));
+  }
   return strings;
 }
 
@@ -246,6 +249,14 @@ describe('tone', () => {
       expect(text.toLowerCase()).not.toContain('you cannot');
       expect(text.toLowerCase()).not.toContain("can't watch");
     }
+  });
+
+  it('says a race still to come waits for its race day, one race or several', () => {
+    expect(stillToComeNote(1)).toBe('One race dated after today joins the suggestions on its race day.');
+    expect(stillToComeNote(3)).toBe('3 races dated after today join the suggestions on their race days.');
+    expect(stillToComeEmptyNote(1, '7 November 2026')).toContain('is run on 7 November 2026');
+    expect(stillToComeEmptyNote(3, '7 November 2026')).toContain('The 3 races');
+    expect(stillToComeEmptyNote(3, '7 November 2026')).toContain('the first is on 7 November 2026');
   });
 
   it('makes even a short stint feel worthwhile', () => {

@@ -7,6 +7,9 @@
  * again after it is closed — however it is closed. Escape, the X, the backdrop
  * and the button all count, because a panel that comes back after you have
  * dismissed it is nagging, and nothing in this application nags.
+ *
+ * It shows every version since the account last looked, newest first, so a
+ * version that was skipped over is still explained.
  */
 
 import * as React from 'react';
@@ -17,7 +20,7 @@ import { ReleaseNotes } from '@/components/layout/release-notes';
 import { dismissReleaseNotesAction } from '@/lib/server/account-actions';
 import type { ChangelogEntry } from '@/lib/changelog';
 
-export function WhatsNew({ entry }: { entry: ChangelogEntry }) {
+export function WhatsNew({ entries }: { entries: readonly ChangelogEntry[] }) {
   const [open, setOpen] = React.useState(true);
 
   function close() {
@@ -30,7 +33,7 @@ export function WhatsNew({ entry }: { entry: ChangelogEntry }) {
     <Dialog
       open={open}
       onClose={close}
-      title={`What's new in ${entry.version}`}
+      title={`What's new in ${entries[0]?.version ?? ''}`}
       size="lg"
       footer={
         <div className="flex items-center justify-between gap-3">
@@ -41,7 +44,11 @@ export function WhatsNew({ entry }: { entry: ChangelogEntry }) {
         </div>
       }
     >
-      <ReleaseNotes entry={entry} />
+      <div className="divide-y divide-hairline">
+        {entries.map((entry) => (
+          <ReleaseNotes key={entry.version} entry={entry} className="py-4 first:pt-0 last:pb-0" />
+        ))}
+      </div>
     </Dialog>
   );
 }

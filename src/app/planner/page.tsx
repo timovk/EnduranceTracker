@@ -4,7 +4,7 @@ import { StrategistPanel } from '@/components/dashboard/strategist-panel';
 import { WindowPicker } from '@/components/dashboard/window-picker';
 import { Panel, PanelBody, PanelHeader, Stat } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
-import { getRecommendations } from '@/lib/engines/strategist-engine';
+import { getStrategist } from '@/lib/engines/strategist-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
@@ -22,8 +22,8 @@ export default async function PlannerPage(props: PageProps<'/planner'>) {
   const raw = Array.isArray(params.window) ? params.window[0] : params.window;
   const windowMinutes = clampWindow(raw ? Number.parseInt(raw, 10) : undefined);
 
-  const [recommendations, budget] = await Promise.all([
-    getRecommendations(userId, { windowMinutes }),
+  const [{ recommendations, stillToCome }, budget] = await Promise.all([
+    getStrategist(userId, { windowMinutes }),
     getBudgetSnapshot(userId).catch(() => null),
   ]);
 
@@ -48,7 +48,7 @@ export default async function PlannerPage(props: PageProps<'/planner'>) {
         </PanelBody>
       </Panel>
 
-      <StrategistPanel recommendations={recommendations} windowMinutes={windowMinutes} />
+      <StrategistPanel recommendations={recommendations} stillToCome={stillToCome} windowMinutes={windowMinutes} />
 
       {recommendations.length > 0 ? (
         <Panel>

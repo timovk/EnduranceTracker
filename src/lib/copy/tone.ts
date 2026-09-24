@@ -121,6 +121,29 @@ export function seasonClosedStintNote(opensOn: string): string {
   return `Career XP only until the season pass opens on ${opensOn}.`;
 }
 
+// ---------------------------------------------------------------------------
+// Races still to come (0.3.2)
+// ---------------------------------------------------------------------------
+//
+// A race dated after today is not suggested until its race day. Said as a
+// fact about the calendar, never as something withheld. `firstOn` is always a
+// formatted date, e.g. "7 November 2026".
+
+/** The strategist's footnote, when races were left out of its suggestions. */
+export function stillToComeNote(count: number): string {
+  return count === 1
+    ? 'One race dated after today joins the suggestions on its race day.'
+    : `${count} races dated after today join the suggestions on their race days.`;
+}
+
+/** The strategist's empty state, when every unfinished race is still to come. */
+export function stillToComeEmptyNote(count: number, firstOn: string): string {
+  return count === 1
+    ? `The one race in your library still to watch is run on ${firstOn}. The strategist suggests it from that day.`
+    : `The ${count} races in your library still to watch have not been run yet; the first is on ${firstOn}. ` +
+        'The strategist suggests each one from its race day.';
+}
+
 /** Recommendation framing. Suggestions, never instructions. */
 export const RECOMMENDATION_PREFIXES = {
   continue: 'Continue the story',

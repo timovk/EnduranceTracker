@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  buildRecommendations, getRecommendations, scoreCandidate,
+  buildRecommendations, getRecommendations, getStrategist, scoreCandidate, summariseStillToCome,
   type RaceCandidate, type StrategistContext, type StrategistObjective,
 } from '@/lib/engines/strategist-engine';
 import { STRATEGIST_CONFIG } from '@/lib/config';
@@ -36,6 +36,8 @@ function candidate(overrides: Partial<RaceCandidate> = {}): RaceCandidate {
     excitement: 3,
     isMajorEvent: false,
     storyComplete: false,
+    raceDate: null,
+    sessionCount: coverageSec > 0 ? 1 : 0,
     lastWatchedAt: null,
     gaps: coverageSec > 0
       ? [{ start: coverageSec, end: runtimeSec }]
@@ -286,6 +288,92 @@ describe('buildRecommendations', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Races still to come (0.3.2)
+// ---------------------------------------------------------------------------
+
+describe('races still to come', () => {
+  /** A race date exactly as the date field stores it: the typed day at midnight UTC. */
+  const typed = (isoDay: string): Date => new Date(isoDay);
+
+  // The default context is the evening of 22 September 2026, local time.
+  const library = [
+    candidate({ id: 'past', name: 'Already run', raceDate: typed('2026-09-06'), championshipId: 'champ-2' }),
+    candidate({ id: 'undated', name: 'No date', championshipId: 'champ-3' }),
+    candidate({ id: 'future', name: 'Not run yet', raceDate: typed('2026-11-07'), excitement: 5, isMajorEvent: true, priority: 'MUST_WATCH' }),
+    candidate({ id: 'later', name: 'Even later', raceDate: typed('2027-06-12'), excitement: 5, championshipId: 'champ-4' }),
+  ];
+
+  it('never suggests a race dated after today, in any slot', () => {
+    const result = buildRecommendations(library, context());
+    const ids = result.map((r) => r.raceId);
+    expect(ids).not.toContain('future');
+    expect(ids).not.toContain('later');
+    expect(ids).toEqual(expect.arrayContaining(['past', 'undated']));
+  });
+
+  it('suggests nothing when every unfinished race is still to come', () => {
+    expect(buildRecommendations([library[2]!, library[3]!], context())).toEqual([]);
+  });
+
+  it('leaves a race out until the end of the day before, and suggests it from its race day', () => {
+    const race = candidate({ id: 'race-day', raceDate: typed('2026-11-07') });
+    const lastMinuteBefore = context({ now: new Date(2026, 10, 6, 23, 59, 59) });
+    const firstMinuteOf = context({ now: new Date(2026, 10, 7, 0, 0, 0) });
+    const dayAfter = context({ now: new Date(2026, 10, 8, 12) });
+
+    expect(buildRecommendations([race], lastMinuteBefore)).toEqual([]);
+    expect(buildRecommendations([race], firstMinuteOf).map((r) => r.raceId)).toEqual(['race-day']);
+    expect(buildRecommendations([race], dayAfter).map((r) => r.raceId)).toEqual(['race-day']);
+  });
+
+  it('keeps suggesting a dated race once a stint has been logged on it', () => {
+    // An overnight race from the other side of the world begins the evening
+    // before the day it is dated; a story under way is never put out of reach.
+    const started = candidate({
+      id: 'started', raceDate: typed('2026-09-23'), coverageSec: 2 * H, sessionCount: 1,
+      lastWatchedAt: new Date(2026, 8, 22, 18),
+    });
+    const result = buildRecommendations([started], context());
+    expect(result.map((r) => `${r.kind}:${r.raceId}`)).toEqual(['CONTINUE:started']);
+  });
+
+  it('still suggests races with no race date', () => {
+    const result = buildRecommendations([candidate({ id: 'undated', raceDate: null })], context());
+    expect(result.map((r) => r.raceId)).toEqual(['undated']);
+  });
+
+  it('counts the races it left out, and names the first day, not the races', () => {
+    const summary = summariseStillToCome(library, context().now);
+    expect(summary.count).toBe(2);
+    expect(summary.nextRaceDay).toEqual(new Date(2026, 10, 7));
+    expect(Object.keys(summary).sort()).toEqual(['count', 'nextRaceDay']);
+  });
+
+  it('names the earliest day whatever order the races come in', () => {
+    const later = library[3]!;
+    const first = library[2]!;
+    for (const order of [[later, first], [first, later], [later, library[0]!, first]]) {
+      expect(summariseStillToCome(order, context().now).nextRaceDay).toEqual(new Date(2026, 10, 7));
+    }
+  });
+
+  it('counts only races the suggestions skipped for their date', () => {
+    const finished = candidate({ id: 'finished', raceDate: typed('2026-12-01'), storyComplete: true });
+    const archived = candidate({ id: 'archived', raceDate: typed('2026-10-01'), status: 'ARCHIVED' });
+    const setAside = candidate({ id: 'set-aside', raceDate: typed('2026-10-02'), status: 'ABANDONED' });
+    const started = candidate({ id: 'started', raceDate: typed('2026-10-03'), coverageSec: H, sessionCount: 1 });
+    const duplicate = library[2]!;
+    const summary = summariseStillToCome([finished, archived, setAside, started, ...[...library].reverse(), duplicate], context().now);
+    expect(summary).toEqual({ count: 2, nextRaceDay: new Date(2026, 10, 7) });
+  });
+
+  it('reports nothing left out when nothing is still to come', () => {
+    expect(summariseStillToCome([library[0]!, library[1]!], context().now)).toEqual({ count: 0, nextRaceDay: null });
+    expect(summariseStillToCome([], context().now)).toEqual({ count: 0, nextRaceDay: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Voice
 // ---------------------------------------------------------------------------
 
@@ -324,5 +412,6 @@ describe('recommendations never sound mandatory', () => {
 describe('getRecommendations', () => {
   it('is exported for the pages to call', () => {
     expect(typeof getRecommendations).toBe('function');
+    expect(typeof getStrategist).toBe('function');
   });
 });

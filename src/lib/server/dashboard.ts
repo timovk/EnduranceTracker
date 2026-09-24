@@ -10,7 +10,7 @@
 import { prisma } from '@/lib/db/client';
 import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
-import { getRecommendations } from '@/lib/engines/strategist-engine';
+import { getStrategist } from '@/lib/engines/strategist-engine';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { ensureChallenges, expireStaleChallenges, getActiveChallenges } from '@/lib/engines/challenge-engine';
 import {
@@ -19,7 +19,7 @@ import {
 import { getCareerView } from './career';
 import { getCurrentStint } from './races';
 import { welcomeBack } from '@/lib/copy/tone';
-import type { BudgetSnapshot, Recommendation } from '@/lib/engines/contracts';
+import type { BudgetSnapshot, Recommendation, StillToCome, StrategistView } from '@/lib/engines/contracts';
 import type { ChallengeRow, SeasonPassSummaryData, UnlockRowData, CareerSnapshotData } from '@/components/dashboard/panels';
 import type { CareerHeaderData } from '@/components/dashboard/career-header';
 import type { CurrentStintData } from '@/components/dashboard/current-stint';
@@ -28,6 +28,8 @@ export interface DashboardData {
   header: CareerHeaderData;
   stint: CurrentStintData | null;
   recommendations: Recommendation[];
+  /** Races left out of `recommendations` because they have not been run yet. */
+  stillToCome: StillToCome;
   budget: BudgetSnapshot | null;
   seasonPass: SeasonPassSummaryData | null;
   /**
@@ -51,13 +53,16 @@ export async function getDashboard(userId: string, now: Date = new Date()): Prom
     archiveExpiredPasses(userId, now).catch(() => undefined),
   ]);
 
-  const [career, momentum, streak, stint, recommendations, budget, pass, challenges, metrics, unlocks, unwatchedCount] =
+  const [career, momentum, streak, stint, strategist, budget, pass, challenges, metrics, unlocks, unwatchedCount] =
     await Promise.all([
       getCareerView(userId, now),
       getMomentum(userId, now).catch(() => null),
       getStreak(userId, now).catch(() => null),
       getCurrentStint(userId),
-      getRecommendations(userId, { now }).catch(() => [] as Recommendation[]),
+      getStrategist(userId, { now }).catch((): StrategistView => ({
+        recommendations: [],
+        stillToCome: { count: 0, nextRaceDay: null },
+      })),
       getBudgetSnapshot(userId, now).catch(() => null),
       getSeasonPassView(userId).catch(() => null),
       getActiveChallenges(userId, now).catch(() => []),
@@ -96,7 +101,8 @@ export async function getDashboard(userId: string, now: Date = new Date()): Prom
     },
 
     stint,
-    recommendations,
+    recommendations: strategist.recommendations,
+    stillToCome: strategist.stillToCome,
     budget,
 
     seasonPass: pass

@@ -8,7 +8,9 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { CHANGELOG, formatReleaseDate, releaseNotesFor, renderChangelogMarkdown } from '@/lib/changelog';
+import {
+  CHANGELOG, formatReleaseDate, releaseNotesFor, releaseNotesSince, renderChangelogMarkdown, type ChangelogEntry,
+} from '@/lib/changelog';
 import { APP_VERSION } from '@/lib/version';
 
 function compare(a: string, b: string): number {
@@ -53,5 +55,38 @@ describe('the update log', () => {
   it('writes dates out in full', () => {
     expect(formatReleaseDate('2026-09-23')).toBe('23 September 2026');
     expect(formatReleaseDate('2027-01-01')).toBe('1 January 2027');
+  });
+});
+
+describe('notes since the last version seen', () => {
+  const entry = (version: string): ChangelogEntry => ({ version, date: '2026-09-24', title: version, summary: '', changes: [] });
+  const LOG = ['0.3.2', '0.3.1', '0.3.0', '0.2.0'].map(entry);
+  const versions = (entries: ChangelogEntry[]): string[] => entries.map((e) => e.version);
+
+  it('gives every version after the last one seen, newest first', () => {
+    expect(versions(releaseNotesSince('0.3.0', '0.3.2', LOG))).toEqual(['0.3.2', '0.3.1']);
+    expect(versions(releaseNotesSince('0.2.0', '0.3.2', LOG))).toEqual(['0.3.2', '0.3.1', '0.3.0']);
+    expect(versions(releaseNotesSince('0.3.1', '0.3.2', LOG))).toEqual(['0.3.2']);
+  });
+
+  it('gives nothing once the current version has been seen', () => {
+    expect(releaseNotesSince('0.3.2', '0.3.2', LOG)).toEqual([]);
+  });
+
+  it('gives only the current version when the last one seen is unknown', () => {
+    expect(versions(releaseNotesSince(null, '0.3.2', LOG))).toEqual(['0.3.2']);
+    expect(versions(releaseNotesSince('0.1.9-dev', '0.3.2', LOG))).toEqual(['0.3.2']);
+    // Running an older build than the one last seen.
+    expect(versions(releaseNotesSince('0.3.2', '0.3.1', LOG))).toEqual(['0.3.1']);
+  });
+
+  it('gives nothing for a version the log does not have', () => {
+    expect(releaseNotesSince('0.3.0', '9.9.9', LOG)).toEqual([]);
+  });
+
+  it('reaches the real log: 0.3.0 to this version includes 0.3.1', () => {
+    expect(versions(releaseNotesSince('0.3.0', APP_VERSION))).toEqual(
+      expect.arrayContaining([APP_VERSION, '0.3.1']),
+    );
   });
 });

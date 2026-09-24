@@ -8,20 +8,24 @@
  */
 
 import { prisma } from '@/lib/db/client';
-import { releaseNotesFor, type ChangelogEntry } from '@/lib/changelog';
+import { releaseNotesSince, type ChangelogEntry } from '@/lib/changelog';
 import { APP_VERSION } from '@/lib/version';
 
 /** The `ConfigOverride` key holding the last version whose notes were seen. */
 export const LAST_SEEN_VERSION_KEY = 'lastSeenVersion';
 
-/** The notes this account has not seen yet, or null. */
-export async function pendingReleaseNotes(userId: string): Promise<ChangelogEntry | null> {
+/**
+ * The notes this account has not seen yet, newest first: every version since
+ * the last one it saw, so a skipped version is not skipped silently. Empty
+ * when there is nothing new.
+ */
+export async function pendingReleaseNotes(userId: string): Promise<ChangelogEntry[]> {
   const row = await prisma.configOverride.findUnique({
     where: { userId_key: { userId, key: LAST_SEEN_VERSION_KEY } },
     select: { value: true },
   });
-  if (row?.value === APP_VERSION) return null;
-  return releaseNotesFor(APP_VERSION);
+  const lastSeen = typeof row?.value === 'string' ? row.value : null;
+  return releaseNotesSince(lastSeen, APP_VERSION);
 }
 
 export async function markReleaseNotesSeen(userId: string, version: string = APP_VERSION): Promise<void> {

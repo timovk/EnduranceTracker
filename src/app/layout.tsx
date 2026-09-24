@@ -69,7 +69,7 @@ export default async function RootLayout({ children }: LayoutProps<'/'>) {
               <TopNav user={user} />
               <main className="min-w-0 flex-1 px-4 py-5 sm:px-6 lg:px-8 lg:py-7">{children}</main>
             </div>
-            {releaseNotes ? <WhatsNew entry={releaseNotes} /> : null}
+            {releaseNotes && releaseNotes.length > 0 ? <WhatsNew entries={releaseNotes} /> : null}
           </div>
         ) : (
           /*

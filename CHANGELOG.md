@@ -2,13 +2,27 @@
 
 <!-- Generated from src/lib/changelog.ts by `npm run changelog`. Edit that file, not this one. -->
 
+## 0.3.2 — Only races you can watch
+
+*24 September 2026*
+
+The Race Strategist no longer suggests races that have not been run yet. A race dated after today stays in your library as it is, and the strategist suggests it from its race day on.
+
+### Fixed
+
+- The Race Strategist, on its own page and on the dashboard, no longer suggests a race whose race date is after today. From the race day itself, it is suggested like any other race.
+- A race you have already logged a stint on is still suggested, whatever its date, so a story you have started never drops out.
+- Races without a race date are suggested as before.
+- When races are left out because they have not been run yet, the strategist says how many. When they are all that is left to watch, it says the date of the first one.
+- If you skip a version, "What's new" now shows the notes for every version since you last opened the app, not only the newest. Going straight from 0.3.0 to this version, you also see what 0.3.1 changed.
+
 ## 0.3.1 — Season pass closed until 1 October
 
 *23 September 2026*
 
 The season pass and seasonal challenges are closed until 1 October 2026, when the Q4 2026 pass opens. What they gave so far — their rewards, and the XP those rewards paid — has been removed, and your level is worked out again without it. Your races, stints, achievements and the rest of your career stay as they were.
 
-> Before it changes anything, the desktop app saves a copy of your career as it was, in %APPDATA%\Endurance Racing Career\backups. Its name starts with pre-update-0.3.1.
+> Before it changes anything, the desktop app saves a copy of your career as it was, in %APPDATA%\Endurance Racing Career\backups. Its name starts with pre-update- and the version you installed.
 
 ### Changed
 

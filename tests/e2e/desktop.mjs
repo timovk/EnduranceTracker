@@ -25,14 +25,10 @@
  *   --keep         leave the throwaway user-data folder behind to look at
  *   --headed       ignored; kept so the command reads the same as Playwright's
  *
- * This has been run against the packaged Linux build under xvfb: 29 checks,
- * including a simulated update from 0.2.0, all passing in about a minute and
- * a half. It is not a paper exercise.
- *
- * The season checks added in 0.3.1 — the closed season pass, and the one-time
- * season reset on update — were written where there is no display to run
- * them, and have only been syntax-checked. Their first run is their first
- * test.
+ * This has been run against the packaged Linux build of 0.3.2 under xvfb:
+ * 40 checks, including the closed season pass, races still to come on the
+ * planner and dashboard, and a simulated update from 0.3.0 that runs the
+ * one-time season reset, all passing. It is not a paper exercise.
  */
 
 import { _electron as electron } from 'playwright';
@@ -401,6 +397,54 @@ try {
       await page.keyboard.press('Escape');
     });
 
+    section('Races still to come');
+
+    /** A race dated a year from today: in the library, not run yet. */
+    const UPCOMING_RACE = '8 Hours of Bahrain';
+
+    await step('adds a race dated next year', async () => {
+      const nextYear = new Date();
+      nextYear.setFullYear(nextYear.getFullYear() + 1);
+      const typed = [
+        nextYear.getFullYear(),
+        String(nextYear.getMonth() + 1).padStart(2, '0'),
+        String(nextYear.getDate()).padStart(2, '0'),
+      ].join('-');
+      await go(page, '/races/new');
+      await page.fill('input[name="name"]', UPCOMING_RACE);
+      await page.fill('input[name="scheduledDuration"]', '08:00:00');
+      await page.fill('input[name="raceDate"]', typed);
+      await page.click('button[type="submit"]');
+      await page.waitForURL((url) => url.pathname === '/races' && url.searchParams.has('added'), {
+        timeout: ACTION_TIMEOUT_MS,
+      });
+      const body = (await page.textContent('body')) ?? '';
+      check(body.includes(UPCOMING_RACE), 'the race dated next year is not in the library');
+    });
+
+    await step('leaves it out of the Race Strategist, and says so', async () => {
+      await go(page, '/planner');
+      await page.waitForSelector('h1:has-text("Race Strategist")', { timeout: ACTION_TIMEOUT_MS });
+      const body = (await page.textContent('body')) ?? '';
+      check(!body.includes(UPCOMING_RACE), 'the strategist suggested a race that has not been run yet');
+      check(body.includes('6 Hours of Fuji'), 'the strategist stopped suggesting the race under way');
+      check(
+        body.includes('One race dated after today joins the suggestions on its race day.'),
+        'the strategist did not say a race was left out',
+      );
+    });
+
+    await step('leaves it out of the dashboard\'s strategist panel too', async () => {
+      await go(page, '/');
+      const panel = page
+        .locator('h2:text-is("Race Strategist")')
+        .locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " panel ")][1]');
+      await panel.waitFor({ timeout: ACTION_TIMEOUT_MS });
+      const text = (await panel.textContent()) ?? '';
+      check(!text.includes(UPCOMING_RACE), 'the dashboard suggested a race that has not been run yet');
+      check(text.includes('joins the suggestions on its race day'), 'the dashboard did not say a race was left out');
+    });
+
     section('A second account');
 
     await step('signs out', async () => {
@@ -498,12 +542,13 @@ try {
     check(marked === 2, `expected 2 accounts marked, found ${marked}`);
   });
 
-  await step('is made to look like 0.2.0 was the last version here', async () => {
-    // 0.2.0 kept no version marker, knew nothing of release notes and never
-    // ran the 0.3.1 season reset, so an update from it looks exactly like this.
-    rmSync(markerFile);
+  await step('is made to look like 0.3.0 was the last version here', async () => {
+    // 0.3.0 wrote the version marker and remembered the last release notes
+    // each account saw, but never ran the 0.3.1 season reset. Going straight
+    // from it to this version skips 0.3.1, whose notes are then owed too.
+    writeFileSync(markerFile, `${JSON.stringify({ version: '0.3.0', startedAt: new Date().toISOString() }, null, 2)}\n`);
     inDatabase('forget-notes', `
-      db.prepare("DELETE FROM config_overrides WHERE key = 'lastSeenVersion'").run();
+      db.prepare("UPDATE config_overrides SET value = '\\"0.3.0\\"' WHERE key = 'lastSeenVersion'").run();
       db.prepare("DELETE FROM config_overrides WHERE key = 'seasonReset'").run();
     `);
   });
@@ -522,6 +567,9 @@ try {
       await waitForPath(page, (path) => path === '/');
     }
     await page.waitForSelector(`text=What's new in ${VERSION}`, { timeout: ACTION_TIMEOUT_MS });
+    const dialog = (await page.textContent('dialog[open]')) ?? '';
+    check(dialog.includes('Season pass closed until 1 October'), 'the notes for the skipped 0.3.1 were not shown');
+    check(dialog.indexOf(VERSION) < dialog.indexOf('0.3.1'), 'the newest notes did not come first');
     await page.click('button:has-text("Got it")');
     await page.waitForSelector(`text=What's new in ${VERSION}`, { state: 'hidden', timeout: ACTION_TIMEOUT_MS });
     await page.waitForTimeout(500);

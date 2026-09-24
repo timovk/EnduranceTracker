@@ -29,7 +29,7 @@ export default async function DashboardPage() {
       {/* -- Current stint and the strategist ------------------------------- */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <CurrentStint stint={data.stint} />
-        <StrategistPanel recommendations={data.recommendations} />
+        <StrategistPanel recommendations={data.recommendations} stillToCome={data.stillToCome} />
       </div>
 
       {/* -- Fuel tanks ----------------------------------------------------- */}

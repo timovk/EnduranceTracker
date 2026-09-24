@@ -4,13 +4,18 @@
  * Three suggestions, each with its reasoning. The footnote is not decoration:
  * these are suggestions, and the application says so out loud so that opening
  * the dashboard never feels like being handed a task list.
+ *
+ * Races that have not been run yet are never suggested (0.3.2). The panel says
+ * how many were left out, so a race that is missing is missing for a reason
+ * the user can see — but it does not name them.
  */
 
 import Link from 'next/link';
 import { ArrowRight, Compass, PlayCircle, Shuffle } from 'lucide-react';
-import type { Recommendation, RecommendationKind } from '@/lib/engines/contracts';
+import type { Recommendation, RecommendationKind, StillToCome } from '@/lib/engines/contracts';
 import { formatDuration } from '@/lib/domain/time';
-import { RECOMMENDATION_FOOTNOTE } from '@/lib/copy/tone';
+import { RECOMMENDATION_FOOTNOTE, stillToComeEmptyNote, stillToComeNote } from '@/lib/copy/tone';
+import { formatDate } from '@/lib/utils';
 import { Badge, EmptyState, Panel, PanelHeader, TimingBar } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 
@@ -21,8 +26,10 @@ const KIND_META: Record<RecommendationKind, { label: string; icon: typeof PlayCi
 };
 
 export function StrategistPanel({
-  recommendations, windowMinutes,
-}: { recommendations: Recommendation[]; windowMinutes?: number }) {
+  recommendations, stillToCome, windowMinutes,
+}: { recommendations: Recommendation[]; stillToCome?: StillToCome; windowMinutes?: number }) {
+  const waiting = stillToCome !== undefined && stillToCome.count > 0 ? stillToCome : null;
+
   return (
     <Panel>
       <PanelHeader
@@ -37,7 +44,11 @@ export function StrategistPanel({
       {recommendations.length === 0 ? (
         <EmptyState
           title="Nothing to suggest just yet"
-          body="Add a race to your library and the strategist will start making suggestions."
+          body={
+            waiting !== null && waiting.nextRaceDay !== null
+              ? stillToComeEmptyNote(waiting.count, formatDate(waiting.nextRaceDay, 'long'))
+              : 'Add a race to your library and the strategist will start making suggestions.'
+          }
           action={<Link href="/races/new"><Button size="sm" variant="primary">Add a race</Button></Link>}
         />
       ) : (
@@ -51,6 +62,7 @@ export function StrategistPanel({
       <p className="border-t border-hairline px-4 py-2.5 text-[0.6875rem] text-ink-faint">
         {RECOMMENDATION_FOOTNOTE}
         {windowMinutes ? ` Sized for about ${formatDuration(windowMinutes * 60)}.` : null}
+        {waiting !== null && recommendations.length > 0 ? ` ${stillToComeNote(waiting.count)}` : null}
       </p>
     </Panel>
   );

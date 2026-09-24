@@ -208,6 +208,23 @@ export interface Recommendation {
   score: number;
 }
 
+/**
+ * Unfinished races the strategist left out because they have not been run yet
+ * (0.3.2). The races themselves are not exposed: they are not shown until they
+ * can be watched.
+ */
+export interface StillToCome {
+  count: number;
+  /** Local midnight on the first day one of them is on; null when count is 0. */
+  nextRaceDay: Date | null;
+}
+
+/** Everything the Race Strategist panel shows. */
+export interface StrategistView {
+  recommendations: Recommendation[];
+  stillToCome: StillToCome;
+}
+
 // ---------------------------------------------------------------------------
 // Session removal — what deleting a stint took back
 // ---------------------------------------------------------------------------

@@ -27,6 +27,30 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: readonly ChangelogEntry[] = [
   {
+    version: '0.3.2',
+    date: '2026-09-24',
+    title: 'Only races you can watch',
+    summary:
+      'The Race Strategist no longer suggests races that have not been run yet. A race dated after today stays ' +
+      'in your library as it is, and the strategist suggests it from its race day on.',
+    changes: [
+      {
+        kind: 'Fixed',
+        items: [
+          'The Race Strategist, on its own page and on the dashboard, no longer suggests a race whose race date is ' +
+            'after today. From the race day itself, it is suggested like any other race.',
+          'A race you have already logged a stint on is still suggested, whatever its date, so a story you have ' +
+            'started never drops out.',
+          'Races without a race date are suggested as before.',
+          'When races are left out because they have not been run yet, the strategist says how many. When they are ' +
+            'all that is left to watch, it says the date of the first one.',
+          "If you skip a version, \"What's new\" now shows the notes for every version since you last opened the " +
+            'app, not only the newest. Going straight from 0.3.0 to this version, you also see what 0.3.1 changed.',
+        ],
+      },
+    ],
+  },
+  {
     version: '0.3.1',
     date: '2026-09-23',
     title: 'Season pass closed until 1 October',
@@ -36,7 +60,7 @@ export const CHANGELOG: readonly ChangelogEntry[] = [
       'is worked out again without it. Your races, stints, achievements and the rest of your career stay as they were.',
     note:
       'Before it changes anything, the desktop app saves a copy of your career as it was, in ' +
-      '%APPDATA%\\Endurance Racing Career\\backups. Its name starts with pre-update-0.3.1.',
+      '%APPDATA%\\Endurance Racing Career\\backups. Its name starts with pre-update- and the version you installed.',
     changes: [
       {
         kind: 'Changed',
@@ -178,6 +202,26 @@ export function formatReleaseDate(iso: string): string {
 /** The entry for a version, if the log has one. */
 export function releaseNotesFor(version: string): ChangelogEntry | null {
   return CHANGELOG.find((entry) => entry.version === version) ?? null;
+}
+
+/**
+ * Every entry after `lastSeen`, up to and including `current`, newest first.
+ *
+ * Somebody who skips a version still gets its notes: going straight from
+ * 0.3.0 to 0.3.2 also runs what 0.3.1 did, so the notes for 0.3.1 belong in
+ * front of them too. When `lastSeen` is not in the log — never recorded, or
+ * from a build the log does not know — only `current` is shown. Nothing is
+ * shown once `current` itself has been seen.
+ */
+export function releaseNotesSince(
+  lastSeen: string | null,
+  current: string,
+  log: readonly ChangelogEntry[] = CHANGELOG,
+): ChangelogEntry[] {
+  const at = log.findIndex((entry) => entry.version === current);
+  if (at === -1 || lastSeen === current) return [];
+  const seenAt = lastSeen === null ? -1 : log.findIndex((entry) => entry.version === lastSeen);
+  return seenAt > at ? log.slice(at, seenAt) : [log[at]!];
 }
 
 /** CHANGELOG.md, exactly as `npm run changelog` writes it. */
