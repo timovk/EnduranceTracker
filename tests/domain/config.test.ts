@@ -13,14 +13,18 @@ import { MILESTONES } from '@/lib/config/milestones';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  ACHIEVEMENT_BOARD_CONFIG, AWARDS_CONFIG, BUDGET_CONFIG, BUDGET_SHAPE, CHALLENGE_CONFIG, CHALLENGE_SHAPE,
+  ACHIEVEMENT_BOARD_CONFIG, AWARDS_CONFIG, BUDGET_CONFIG, BUDGET_SHAPE, CAREER_MILESTONES, CAREER_MILESTONES_BY_ID,
+  CAREER_STATS_SHAPE, CHALLENGE_CONFIG, CHALLENGE_SHAPE, CHRONICLE_SHAPE, DURATION_CLASSES, EVENT_SHAPE,
+  EXPEDITION_CONFIG, EXPEDITION_SHAPE,
   CHAMPIONSHIP_PRESETS, DEFAULT_CONFIG, LEVEL_CONFIG, LEVEL_TITLES, MAJOR_EVENT_SUGGESTIONS,
   MASTERY_CONFIG, MASTERY_SHAPE, MILESTONE_CONFIG, MILESTONE_REWARDS, MOMENTUM_CONFIG,
   MOMENTUM_SHAPE, PRESTIGE_CONFIG, RACE_CARD_STYLES, RACE_TYPE_PRESETS, SEASON_CLOSURE_CONFIG, SEASON_PASS_CONFIG,
   SEASON_PASS_SHAPE, STANDARD_REWARDS, STATS_CONFIG, STORY_CONFIG, STRATEGIST_CONFIG, STRATEGIST_SHAPE, THEMES,
-  THEME_ROTATION, DEFAULT_THEME_KEY, DEFAULT_RACE_CARD_KEY,
-  TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG,
+  THEME_ROTATION, DEFAULT_THEME_KEY, DEFAULT_RACE_CARD_KEY, TIMELINE_SHAPE,
+  TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG, careerMilestoneDedupeKey, careerMilestoneMetricKey, careerMilestoneThreshold,
+  careerMilestoneTitle, isMajorMilestone,
 } from '@/lib/config';
+import type { MilestonePrecision, XPSource } from '@/lib/domain/types';
 
 describe('XP', () => {
   it('keeps ordinary watching worthwhile', () => {
@@ -369,7 +373,7 @@ describe('the configuration barrel', () => {
     for (const key of [
       'xp', 'level', 'budget', 'story', 'momentum', 'seasonPass', 'challenge',
       'strategist', 'prestige', 'longHaul', 'mastery', 'milestone', 'achievementBoard', 'awards', 'stats',
-      'seasonClosure',
+      'seasonClosure', 'expedition',
     ]) {
       expect(DEFAULT_CONFIG).toHaveProperty(key);
     }
@@ -382,6 +386,7 @@ describe('the configuration barrel', () => {
     for (const key of [
       'budgetShape', 'strategistShape', 'challengeShape',
       'masteryShape', 'seasonPassShape', 'momentumShape',
+      'expeditionShape', 'careerStatsShape', 'durationClasses', 'chronicleShape', 'timelineShape', 'eventShape',
     ]) {
       expect(DEFAULT_CONFIG).toHaveProperty(key);
     }
@@ -406,6 +411,9 @@ describe('the configuration barrel', () => {
       ['BUDGET_SHAPE', BUDGET_SHAPE], ['STRATEGIST_SHAPE', STRATEGIST_SHAPE],
       ['CHALLENGE_SHAPE', CHALLENGE_SHAPE], ['MASTERY_SHAPE', MASTERY_SHAPE],
       ['SEASON_PASS_SHAPE', SEASON_PASS_SHAPE], ['MOMENTUM_SHAPE', MOMENTUM_SHAPE],
+      ['EXPEDITION_CONFIG', EXPEDITION_CONFIG], ['EXPEDITION_SHAPE', EXPEDITION_SHAPE],
+      ['CAREER_STATS_SHAPE', CAREER_STATS_SHAPE], ['CHRONICLE_SHAPE', CHRONICLE_SHAPE],
+      ['TIMELINE_SHAPE', TIMELINE_SHAPE], ['EVENT_SHAPE', EVENT_SHAPE],
     ]);
 
     for (const name of blocks) {
@@ -438,5 +446,131 @@ describe('milestone labels read correctly at any count', () => {
     expect(milestoneLabel(1, 'Real viewing hours')).toBe('1 real viewing hour');
     expect(milestoneLabel(1_000, 'Real viewing hours')).toBe('1,000 real viewing hours');
     expect(milestoneLabel(1, 'Countries')).toBe('1 country');
+  });
+});
+
+describe('race expeditions (0.4.0)', () => {
+  it('checkpoint shares sum to 1', () => {
+    const total = EXPEDITION_CONFIG.checkpoints.reduce((sum, checkpoint) => sum + checkpoint.poolShare, 0);
+    expect(total).toBeCloseTo(1, 12);
+  });
+
+  it('orders the checkpoints and keeps Story Complete out of them', () => {
+    const percents = EXPEDITION_CONFIG.checkpoints.map((checkpoint) => checkpoint.percent);
+    expect([...percents].sort((a, b) => a - b)).toEqual(percents);
+    expect(percents.every((percent) => percent > 0 && percent < 100)).toBe(true);
+  });
+
+  it('pays checkpoints only on races an Expedition could be followed over sittings', () => {
+    expect(EXPEDITION_SHAPE.checkpointXpMinimumHours).toBeLessThanOrEqual(EXPEDITION_SHAPE.autoThresholdHours);
+    expect(EXPEDITION_CONFIG.checkpointPoolShare).toBeGreaterThan(0);
+    expect(EXPEDITION_CONFIG.checkpointPoolShare).toBeLessThan(1);
+  });
+});
+
+describe('career history shapes (0.4.0)', () => {
+  it('duration classes are ordered and cover every length', () => {
+    for (let i = 1; i < DURATION_CLASSES.length; i += 1) {
+      expect(DURATION_CLASSES[i]!.maxHours).toBeGreaterThan(DURATION_CLASSES[i - 1]!.maxHours);
+    }
+    expect(DURATION_CLASSES[DURATION_CLASSES.length - 1]!.maxHours).toBe(Infinity);
+    expect(new Set(DURATION_CLASSES.map((entry) => entry.key)).size).toBe(DURATION_CLASSES.length);
+  });
+
+  it('freezes a finished year only after the longest possible stint window', () => {
+    // A 48-hour race at the 0.75x credit floor reaches 64 hours back.
+    expect(CHRONICLE_SHAPE.freezeGraceHours).toBeGreaterThanOrEqual(48 / XP_CONFIG.xpMinSpeed);
+  });
+
+  it('keeps the timeline guards small', () => {
+    expect(TIMELINE_SHAPE.reliableWindowShare).toBeGreaterThan(0);
+    expect(TIMELINE_SHAPE.reliableWindowShare).toBeLessThanOrEqual(1);
+    expect(TIMELINE_SHAPE.futureWatchedAtSlackMinutes).toBeLessThanOrEqual(15);
+    expect(CAREER_STATS_SHAPE.experiencedCoverageShare).toBeLessThan(1);
+    expect(EVENT_SHAPE.maxMergeHops).toBeGreaterThan(0);
+  });
+});
+
+describe('the career milestone catalogue (0.4.0)', () => {
+  const ladderPairs = new Set(MILESTONES.flatMap((def) => def.thresholds.map((threshold) => `${def.metric}:${threshold}`)));
+  const pairOf = (def: (typeof CAREER_MILESTONES)[number]) => `${def.metric}:${careerMilestoneThreshold(def)}`;
+
+  it('the career milestone catalogue never repeats a paying ladder rung', () => {
+    for (const def of CAREER_MILESTONES) {
+      if (def.owner === 'ladder') {
+        expect(ladderPairs.has(pairOf(def)), `${def.id} should be a rung of the lifetime ladders`).toBe(true);
+        expect(def.xp, `${def.id} is paid by its ladder`).toBe(0);
+      } else {
+        expect(ladderPairs.has(pairOf(def)), `${def.id} would share a key with a ladder rung`).toBe(false);
+      }
+    }
+  });
+
+  it('career milestones with no XP say who pays', () => {
+    for (const def of CAREER_MILESTONES.filter((candidate) => candidate.owner === 'career')) {
+      expect(def.xp === 0, def.id).toBe(def.alsoPaidBy.length > 0);
+      expect(def.xp, def.id).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('no career dedupe key contains a configurable number', () => {
+    const year = CAREER_MILESTONES_BY_ID.get('year-plan')!;
+    expect(careerMilestoneDedupeKey(year, 2027)).toBe('milestone:realHoursYear:2027');
+    expect(careerMilestoneDedupeKey(year, 2027)).not.toContain(`${BUDGET_CONFIG.annualHours}`);
+    expect(careerMilestoneMetricKey(year, 2027)).toBe('realHoursYear:2027');
+    expect(careerMilestoneThreshold(year)).toBe(BUDGET_CONFIG.annualHours);
+    expect(() => careerMilestoneMetricKey(year)).toThrow();
+    // Every other key is the ladder shape, built from the catalogue's own fixed threshold.
+    for (const def of CAREER_MILESTONES.filter((candidate) => candidate.metric !== 'realHoursYear')) {
+      expect(careerMilestoneDedupeKey(def)).toBe(`milestone:${def.metric}:${def.threshold}`);
+      expect(typeof def.threshold, def.id).toBe('number');
+    }
+  });
+
+  it('has unique ids, one year rung, and a title that names its year', () => {
+    expect(new Set(CAREER_MILESTONES.map((def) => def.id)).size).toBe(CAREER_MILESTONES.length);
+    expect(CAREER_MILESTONES_BY_ID.size).toBe(CAREER_MILESTONES.length);
+    const years = CAREER_MILESTONES.filter((def) => def.metric === 'realHoursYear');
+    expect(years).toHaveLength(1);
+    expect(careerMilestoneTitle(years[0]!, 2027)).toBe(`${BUDGET_CONFIG.annualHours} hours in 2027 — two full weeks of racing`);
+    expect(careerMilestoneTitle(years[0]!)).toContain('in a calendar year');
+    expect(isMajorMilestone(years[0]!)).toBe(true);
+    expect(isMajorMilestone(CAREER_MILESTONES_BY_ID.get('first-race-started')!)).toBe(false);
+  });
+
+  it('pays the new rungs the modest amounts the economy was checked with', () => {
+    const paid = CAREER_MILESTONES.filter((def) => def.owner === 'career' && def.xp > 0)
+      .map((def) => [def.id, def.xp]);
+    expect(paid).toEqual([
+      ['first-6h', 500], ['hours-250', 1_000], ['races-100', 500], ['races-250', 750], ['races-500', 1_000],
+      ['races-1000', 1_500], ['year-plan', 1_000],
+    ]);
+  });
+});
+
+describe('the enum mirrors', () => {
+  /** Every value of a Prisma enum, read from the schema. */
+  function schemaEnum(name: string): string[] {
+    const schema = readFileSync(resolve(process.cwd(), 'prisma/schema.prisma'), 'utf8');
+    const body = new RegExp(`^enum ${name} \\{([\\s\\S]*?)^\\}`, 'm').exec(schema)?.[1] ?? '';
+    return body.split('\n').map((line) => line.trim()).filter((line) => /^[A-Z_]+$/.test(line));
+  }
+
+  // Listed here so the type checker can hold each list to its union exactly:
+  // a value added to the union and not here, or here and not in the union,
+  // fails `tsc` before it fails this test.
+  const XP_SOURCES = [
+    'VIEWING', 'REWATCH', 'STORY_COMPLETE', 'RACE_COMPLETE', 'ACHIEVEMENT', 'CHALLENGE', 'MASTERY_NODE',
+    'SEASON_COMPLETE', 'MAJOR_EVENT', 'MILESTONE', 'SEASON_PASS_TIER', 'PRESTIGE', 'HALL_OF_FAME',
+    'MANUAL_ADJUSTMENT', 'EXPEDITION',
+  ] as const satisfies readonly XPSource[];
+  const PRECISIONS = ['INTERPOLATED', 'STINT', 'RECOGNISED'] as const satisfies readonly MilestonePrecision[];
+  const everySource: [Exclude<XPSource, (typeof XP_SOURCES)[number]>] extends [never] ? true : false = true;
+  const everyPrecision: [Exclude<MilestonePrecision, (typeof PRECISIONS)[number]>] extends [never] ? true : false = true;
+
+  it('XPSource and MilestonePrecision mirrors match the schema', () => {
+    expect(everySource && everyPrecision).toBe(true);
+    expect(schemaEnum('XPSource')).toEqual([...XP_SOURCES]);
+    expect(schemaEnum('MilestonePrecision')).toEqual([...PRECISIONS]);
   });
 });

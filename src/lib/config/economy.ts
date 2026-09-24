@@ -745,20 +745,27 @@ export const CHALLENGE_NOMINALS = {
 // ---------------------------------------------------------------------------
 // Mastery — how the scoped metrics behind a node are measured
 //
-// `MASTERY_CONFIG` above decides what a mastery node asks for. The two figures
+// `MASTERY_CONFIG` above decides what a mastery node asks for. The figures
 // here decide how the scoped metrics behind those nodes are measured, and they
-// are deliberately the same numbers `engines/metrics.ts` uses for the career-
-// wide `stories12h` and `stories24h` counts: a race that counts as a twelve-
-// hour story on the statistics page has to count as one inside a mastery tree
+// are deliberately the same numbers the career-wide `stories6h` … `stories24h`
+// counts use: a race that counts as a twelve-hour story on the statistics page
+// has to count as one inside a mastery tree and on the Career Milestones page
 // too, or the same race would be two different things in two places.
 //
 // The tolerance below the nominal runtime is on purpose. A twelve-hour race
 // shortened to 11h40m by a red flag is still a twelve-hour race, and a node
 // that quietly refused to acknowledge it would be reading the regulations
-// rather than the race.
+// rather than the race. Every band allows half an hour, and the 24-hour band
+// a full hour.
 // ---------------------------------------------------------------------------
 
 export const MASTERY_SHAPE = {
+  /** Runtime (hours) at or above which a Story Complete counts as a 6-hour race. */
+  stories6hMinHours: 5.5,
+  /** Runtime (hours) at or above which a Story Complete counts as an 8-hour race. */
+  stories8hMinHours: 7.5,
+  /** Runtime (hours) at or above which a Story Complete counts as a 10-hour race. */
+  stories10hMinHours: 9.5,
   /** Runtime (hours) at or above which a Story Complete counts as a 12-hour race. */
   stories12hMinHours: 11.5,
   /** Runtime (hours) at or above which a Story Complete counts as a 24-hour race. */
@@ -925,4 +932,205 @@ export const STATS_CONFIG = {
    * has changed shape is not described only by its lifetime average.
    */
   recentMonthsWindow: 6,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Race Expeditions (0.4.0)
+//
+// An Expedition is a way of following a long race, not a second economy. The
+// checkpoints celebrate the story as it is uncovered, and what they pay is
+// deliberately a slice of something that already exists — the race's own
+// Story Complete bonus — so a re-balance of that bonus moves the checkpoints
+// with it and the two can never drift apart.
+//
+// Checkpoints pay career XP only (`seasonAmount` 0), and each is held at most
+// once per race: its dedupe key is `expedition:<raceId>:<percent>`, with no
+// amount in it, so changing a number here can never pay one twice. They follow
+// coverage, the way the Story Complete bonus does — deleting the viewing that
+// reached one takes it back — and never the Expedition Mode switch.
+// ---------------------------------------------------------------------------
+
+export const EXPEDITION_CONFIG = {
+  /**
+   * The checkpoint pool, as a share of the race's non-major Story Complete
+   * bonus. A 24-hour race: 7,500 × 0.4 = 3,000 across all five checkpoints. At
+   * 1× that is at most 9% of the viewing XP the race itself pays, and at the
+   * fastest playback it is still less per real minute than watching earns.
+   */
+  checkpointPoolShare: 0.4,
+
+  /**
+   * Coverage percentages, and the share of the pool each pays. The shares sum
+   * to 1. Story Complete is the sixth checkpoint on the page, but it pays the
+   * existing Story Complete bonus only, never a share of this pool.
+   */
+  checkpoints: [
+    { percent: 10, poolShare: 0.1 },
+    { percent: 25, poolShare: 0.15 },
+    { percent: 50, poolShare: 0.25 },
+    { percent: 75, poolShare: 0.25 },
+    { percent: 90, poolShare: 0.25 },
+  ],
+
+  /** Checkpoint XP is rounded to this step so the numbers read cleanly. */
+  roundingStep: 10,
+} as const;
+
+export const EXPEDITION_SHAPE = {
+  /**
+   * A race scheduled for at least this long is an Expedition unless it is
+   * switched off (owner decision 3). The scheduled length, not the runtime, so
+   * a 10-hour race cut short by a red flag is still one.
+   */
+  autoThresholdHours: 10,
+
+  /**
+   * Checkpoints pay XP only on races at least this long. Six hours is the
+   * shortest format usually watched over more than one sitting, and its
+   * checkpoints are still at least 60 XP; below it a 10% checkpoint is a few
+   * minutes of racing. Shorter races can still be followed as Expeditions,
+   * with every checkpoint shown and dated, just without the XP.
+   */
+  checkpointXpMinimumHours: 6,
+
+  /** Most stint lanes the expedition timeline draws before folding the rest into "+n more". */
+  stintLaneLimit: 6,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Career history — statistics, records and the Chronicle (0.4.0)
+//
+// Nothing below pays or costs anything. These figures decide what counts as a
+// meaningful session or an experienced race, when a percentage is worth
+// showing, and how much of a long history a page puts in front of the user at
+// once. The history itself is replayed from the stints every time, so moving a
+// number here re-reads the same career differently; it never rewrites it.
+// ---------------------------------------------------------------------------
+
+export const CAREER_STATS_SHAPE = {
+  /** Shorter stints are left out of "shortest meaningful session" (typos, test stints). */
+  meaningfulSessionMinutes: 10,
+
+  /**
+   * A race counts as experienced once this much of it was credited…
+   * (Ten credited minutes is up to 300 viewing XP, less where it was a
+   * re-watch, so a glimpse of a throw-away race can never count towards
+   * anything that pays.)
+   */
+  experiencedMinimumCreditedMinutes: 10,
+  /** …and its coverage reached this share of the runtime… */
+  experiencedCoverageShare: 0.1,
+  /** …or this much coverage, whichever is smaller (one hour of a 24-hour race is an experience). */
+  experiencedCoverageEnoughMinutes: 60,
+
+  /**
+   * Below these bases a percentage change is hidden and only the difference
+   * is shown: "up 400%" on a base of two hours says nothing true.
+   */
+  percentChangeMinimumBase: { hours: 10, count: 5, xp: 5_000 },
+
+  /** A Story Complete rate needs at least this many races started, or one race decides it. */
+  rateMinimumRaces: 5,
+
+  /** The rolling window of the "most in seven days" record, in days. */
+  recordRollingDays: 7,
+
+  /** In-memory career timelines kept (one per account in practice). */
+  timelineCacheEntries: 4,
+
+  /** Rows shown before "Show all" in breakdown tables. */
+  topListSize: 10,
+
+  /** A chart needs at least this many points; below it the figure is said in a sentence. */
+  chartMinimumPoints: 3,
+
+  /** Most races offered by the Statistics race filter. */
+  raceOptionLimit: 200,
+  /** Most races offered at once by an event's "Add races" dialog. */
+  addRacesDialogLimit: 50,
+} as const;
+
+/**
+ * Race-length bands for every length breakdown and the Statistics length
+ * filter. The first band whose `maxHours` is above the runtime wins, and the
+ * labels say what a band holds, so a 10-hour race is a "10 hours" race: each
+ * top sits an hour above the length it names (half an hour for the shortest),
+ * so a race extended a little past its format stays in its band. These are not
+ * the Story Complete bonus bands in `XP_CONFIG`, which pay; these only group,
+ * and one page never shows two length taxonomies.
+ */
+export const DURATION_CLASSES = [
+  { key: 'short', label: 'Up to 3 hours', maxHours: 3.5 },
+  { key: 'h4', label: '4 hours', maxHours: 5 },
+  { key: 'h6', label: '6 hours', maxHours: 7 },
+  { key: 'h8', label: '8 hours', maxHours: 9 },
+  { key: 'h10', label: '10 hours', maxHours: 11 },
+  { key: 'h12', label: '12 hours', maxHours: 13 },
+  { key: 'h13to20', label: '13 to 20 hours', maxHours: 21 },
+  { key: 'h24', label: '24 hours', maxHours: Infinity },
+] as const;
+
+export const CHRONICLE_SHAPE = {
+  /** Version of the frozen ChronicleChapter snapshot. */
+  snapshotSchemaVersion: 1,
+
+  /**
+   * A finished year is frozen only this long after local midnight on 1 January.
+   * A stint's window reaches back up to 64 hours from when it is logged (a 48-hour
+   * race at the 0.75× credit floor), so a stint logged on 1 January can still hold
+   * time from 31 December. 72 covers the longest possible window.
+   */
+  freezeGraceHours: 72,
+
+  /** Notable races picked per chapter. */
+  notableRacesCount: 6,
+
+  /** Personal records shown on the Wrapped records card. */
+  wrappedRecordsShown: 3,
+
+  /**
+   * The favourite-circuit card appears only if races with a circuit carry at
+   * least this share of the year's hours. Below it, a "favourite" would be a
+   * guess from a minority of the viewing, and Wrapped does not invent.
+   */
+  favouriteCircuitMinimumShare: 0.5,
+
+  /** Story Complete list page size inside a chapter. */
+  storyListPageSize: 25,
+} as const;
+
+export const TIMELINE_SHAPE = {
+  /** A stint may be dated at most this far after the server's now (clock skew), never further. */
+  futureWatchedAtSlackMinutes: 5,
+
+  /**
+   * A replayed landmark instant is accepted only if it is at most this long
+   * after the app recorded the landmark; also the stint-unlock window.
+   */
+  recognitionSlackMinutes: 5,
+
+  /**
+   * A stint window cut short by batch logging keeps "about" precision only if
+   * at least this share of it is left. Below it the stint's own instant is used.
+   */
+  reliableWindowShare: 0.5,
+
+  /** Interpolated times are shown rounded to this many minutes: they rest on when stints were logged. */
+  displayRoundingMinutes: 5,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Event Legacy (0.4.0)
+//
+// Events are the recurring races — a Le Mans, a Sebring — that a career comes
+// back to year after year. What they pay lives in `MASTERY_CONFIG.raceEventNodes`
+// above; the figures here are guards on how events are managed, not rewards.
+// ---------------------------------------------------------------------------
+
+export const EVENT_SHAPE = {
+  /** A merge chain is followed at most this many hops (a guard; merges cannot form a cycle). */
+  maxMergeHops: 10,
+
+  /** Most dismissed suggestion ids remembered per account. */
+  dismissedSuggestionLimit: 500,
 } as const;

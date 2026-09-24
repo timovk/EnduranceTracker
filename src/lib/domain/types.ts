@@ -21,7 +21,14 @@ export type RewardType =
 export type XPSource =
   | 'VIEWING' | 'REWATCH' | 'STORY_COMPLETE' | 'RACE_COMPLETE' | 'ACHIEVEMENT'
   | 'CHALLENGE' | 'MASTERY_NODE' | 'SEASON_COMPLETE' | 'MAJOR_EVENT' | 'MILESTONE'
-  | 'SEASON_PASS_TIER' | 'PRESTIGE' | 'HALL_OF_FAME' | 'MANUAL_ADJUSTMENT';
+  | 'SEASON_PASS_TIER' | 'PRESTIGE' | 'HALL_OF_FAME' | 'MANUAL_ADJUSTMENT' | 'EXPEDITION';
+
+/**
+ * How exactly a landmark's date is known: interpolated inside the stint that
+ * crossed a running total, the instant of the stint that reached a count, or
+ * only when the app recorded it because history cannot say.
+ */
+export type MilestonePrecision = 'INTERPOLATED' | 'STINT' | 'RECOGNISED';
 
 export const RARITY_ORDER: readonly Rarity[] = ['COMMON', 'UNCOMMON', 'RARE', 'EPIC', 'LEGENDARY', 'MYTHIC'];
 

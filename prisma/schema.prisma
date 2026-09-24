@@ -96,6 +96,21 @@ enum XPSource {
   PRESTIGE
   HALL_OF_FAME
   MANUAL_ADJUSTMENT
+  /// Race Expedition checkpoint (0.4.0). Career XP only; seasonAmount is always 0.
+  EXPEDITION
+}
+
+/// How exactly a landmark's `achievedAt` is known (0.4.0).
+///   INTERPOLATED  a running total crossed its threshold inside a stint; the
+///                 instant is interpolated along that stint's wall-clock window.
+///   STINT         a count reached its threshold with a stint; the instant is
+///                 that stint's `watchedAt`.
+///   RECOGNISED    history cannot say when; the date shown is when the app
+///                 recorded it (`reachedAt` / `unlockedAt`).
+enum MilestonePrecision {
+  INTERPOLATED
+  STINT
+  RECOGNISED
 }
 
 enum MasteryKind {
@@ -197,6 +212,9 @@ model User {
   milestones        MilestoneProgress[]
   raceMasteries     RaceMastery[]
   configOverrides   ConfigOverride[]
+  expeditionSummaries ExpeditionSummary[]
+  chronicleYears      ChronicleYear[]
+  eventStepCredits    EventStepCredit[]
 
   @@map("users")
 }
@@ -367,6 +385,14 @@ model Race {
   lastWatchedAt     DateTime?
   /// Set the moment timeline coverage crosses the Story Complete threshold.
   storyCompletedAt  DateTime?
+  /// Sum of credited real seconds over this race's stints (0.4.0). A cache,
+  /// rebuilt by recomputeRaceAggregates; null only until the 0.4.0 upgrade
+  /// has filled it. See creditedSeconds() in domain/career-timeline.
+  creditedViewingSec Int?
+
+  /// Expedition Mode (0.4.0): null = automatic by runtime, true = switched on,
+  /// false = switched off. The user's choice, so it is persisted.
+  expeditionMode Boolean?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -377,12 +403,14 @@ model Race {
   hallOfFame      HallOfFameEntry[]
   raceMasteryId   String?
   raceMastery     RaceMastery?         @relation(fields: [raceMasteryId], references: [id], onDelete: SetNull)
+  expeditionSummaries ExpeditionSummary[]
 
   @@index([userId, status])
   @@index([userId, championshipId])
   @@index([userId, seasonId])
   @@index([userId, iconicKey])
   @@index([userId, raceDate])
+  @@index([userId, raceMasteryId])
   @@map("races")
 }
 
@@ -444,6 +472,8 @@ model WatchedInterval {
   createdAt DateTime @default(now())
 
   @@index([raceId, startSec])
+  /// 0.4.0. Serves SQLite's ON DELETE SET NULL search when a stint is deleted.
+  @@index([sessionId])
   @@map("watched_intervals")
 }
 
@@ -464,6 +494,17 @@ model RaceMastery {
   firstCompletedYear   Int?
   latestCompletedYear  Int?
   longestConsecutiveEditions Int @default(0)
+
+  // -- Event Legacy (0.4.0). `key` is the event's permanent identity and is
+  // never rewritten; everything the user can change lives below.
+  /// The user's name for the event. Null = `name` (derived from the key).
+  displayName   String?
+  /// True when the user created the event on the Events page.
+  createdByUser Boolean?
+  /// Hidden from the Events list. Only an event with no races can be archived.
+  archivedAt    DateTime?
+  /// Set when this event was merged into another; its races now belong there.
+  mergedIntoId  String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -514,6 +555,11 @@ model XPTransaction {
   @@unique([userId, dedupeKey])
   @@index([userId, createdAt])
   @@index([userId, source])
+  /// 0.4.0. Leftmost `sessionId` on purpose: SQLite's ON DELETE SET NULL
+  /// searches this table by sessionId for every deleted stint, and only an
+  /// index that starts with the FK column serves that search. It also serves
+  /// the per-stint revocations and the Expedition Summary XP sums.
+  @@index([sessionId])
   @@map("xp_transactions")
 }
 
@@ -570,6 +616,18 @@ model MilestoneProgress {
   reachedAt DateTime?
   valueAtReach Float?
   xpAwarded Int @default(0)
+
+  // -- Career Milestones (0.4.0). Written once, when achievedPrecision is
+  // null, and never again: a milestone keeps its date whatever happens to the
+  // history later. No foreign keys on purpose — a landmark outlives the stint,
+  // race or event it points at.
+  achievedAt        DateTime?
+  achievedPrecision MilestonePrecision?
+  sessionId         String?
+  raceId            String?
+  eventId           String?
+  /// Race or event name at the moment it was reached, for when it is gone.
+  subjectName       String?
 
   updatedAt DateTime @updatedAt
 
@@ -745,6 +803,12 @@ model MasteryProgress {
   value      Float     @default(0)
   target     Float
   unlockedAt DateTime?
+
+  /// Event Legacy steps (0.4.0): when the step was reached in viewing history.
+  /// Same write-once rule as MilestoneProgress.
+  achievedAt        DateTime?
+  achievedPrecision MilestonePrecision?
+  achievedSessionId String?
 
   updatedAt DateTime @updatedAt
 
@@ -944,4 +1008,88 @@ model ConfigOverride {
 
   @@unique([userId, key])
   @@map("config_overrides")
+}
+
+// ===========================================================================
+// Career history (0.4.0)
+// ===========================================================================
+
+/// The permanent record of a completed Race Expedition. Written once, the
+/// first time a stint, the upgrade, recompute or switching Expedition Mode on
+/// finds the race Story Complete while it is an Expedition, and never
+/// rewritten. Survives the race being deleted (raceId SetNull).
+model ExpeditionSummary {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  raceId   String?
+  race     Race?   @relation(fields: [raceId], references: [id], onDelete: SetNull)
+  raceName String
+
+  /// Wall-clock start of the first stint, and `watchedAt` of the completing stint.
+  startedAt   DateTime
+  completedAt DateTime
+  /// True when written after the fact (the 0.4.0 upgrade, recompute,
+  /// Expedition Mode switched on later) rather than by a stint.
+  retrospective Boolean @default(false)
+  schemaVersion Int
+  /// ExpeditionSummarySnapshotV1 — see src/lib/domain/expedition.ts.
+  snapshot      Json
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, raceId])
+  @@index([userId, completedAt])
+  /// Serves SQLite's ON DELETE SET NULL search when a race is deleted.
+  @@index([raceId])
+  @@map("expedition_summaries")
+}
+
+/// A completed calendar year of the Career Chronicle, frozen. The current
+/// year is never stored: it is derived on every read.
+model ChronicleYear {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  year          Int
+  schemaVersion Int
+  /// ChronicleChapterV1 — see src/lib/domain/chronicle.ts.
+  snapshot      Json
+  frozenAt      DateTime
+  /// Set only when the user explicitly rebuilt the chapter.
+  rebuiltAt     DateTime?
+  /// When the year's Endurance Wrapped was clicked through to its last card.
+  wrappedSeenAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, year])
+  @@map("chronicle_years")
+}
+
+/// "This race has already helped pay this kind of event step" (0.4.0).
+/// Stops the same editions paying the same Event Legacy step twice when races
+/// are moved between events, events are merged, or a race is deleted and added
+/// again. raceId has no foreign key on purpose: the credit must outlive the race.
+model EventStepCredit {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// A RACE_EVENT mastery node key, e.g. "edition_5".
+  nodeKey  String
+  raceId   String
+  /// The event whose step it helped pay (audit only).
+  eventKey String
+  /// Set when the race is deleted: the edition's fingerprint (year, rounded
+  /// hours, circuit slug, name signature) as JSON — see domain/edition.ts.
+  fingerprint String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, nodeKey, raceId])
+  @@map("event_step_credits")
 }

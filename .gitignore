@@ -61,3 +61,7 @@ next-env.d.ts
 *.db-journal
 *.db-wal
 *.db-shm
+# ...except the test fixtures: databases written by a released version, kept so
+# every later version is tested against what that one really wrote. They hold
+# only demonstration data. See tests/fixtures/README.md.
+!tests/fixtures/*.db

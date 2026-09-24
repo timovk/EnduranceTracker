@@ -4,9 +4,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  formatDuration, formatHoursMinutes, formatTimestamp, hoursToSeconds,
+  formatCoveragePercent, formatDuration, formatHoursMinutes, formatTimestamp, hoursToSeconds,
   parseTimestamp, TimeParseError, toHours, tryParseTimestamp,
 } from '@/lib/domain/time';
+import { isStoryComplete } from '@/lib/domain/intervals';
+import { STORY_CONFIG } from '@/lib/config';
 import {
   averagePlaybackSpeed, clampSpeed, estimateRemaining, realSecondsFor,
   suggestStints, timelineSecondsFor,
@@ -89,6 +91,30 @@ describe('formatting', () => {
   it('converts to and from hours', () => {
     expect(toHours(5400)).toBe(1.5);
     expect(hoursToSeconds(1.5)).toBe(5400);
+  });
+});
+
+describe('formatCoveragePercent', () => {
+  it('floors to one decimal', () => {
+    expect(formatCoveragePercent(6 * H, 24 * H)).toBe('25%');
+    expect(formatCoveragePercent(Math.round(0.624 * 24 * H), 24 * H)).toBe('62.4%');
+    expect(formatCoveragePercent(1, 3)).toBe('33.3%');
+    expect(formatCoveragePercent(2, 3)).toBe('66.6%');
+  });
+
+  it('a Story Complete race with a 40 s gap never shows 100%', () => {
+    const runtime = 24 * H;
+    const intervals = [{ start: 0, end: 12 * H }, { start: 12 * H + 40, end: runtime }];
+    expect(isStoryComplete(intervals, runtime, STORY_CONFIG)).toBe(true);
+    expect(formatCoveragePercent(runtime - 40, runtime)).toBe('99.9%');
+    expect(formatCoveragePercent(runtime - 1, runtime)).toBe('99.9%');
+  });
+
+  it('says 100% only when every second is covered, and 0% for no race at all', () => {
+    expect(formatCoveragePercent(24 * H, 24 * H)).toBe('100%');
+    expect(formatCoveragePercent(0, 24 * H)).toBe('0%');
+    expect(formatCoveragePercent(0, 0)).toBe('0%');
+    expect(formatCoveragePercent(-5, 60)).toBe('0%');
   });
 });
 

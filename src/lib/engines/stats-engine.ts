@@ -62,6 +62,7 @@ import type { Prisma } from '@/generated/prisma/client';
 import { ACHIEVEMENTS, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG, STATS_CONFIG } from '@/lib/config';
 import { EXPIRED_CHALLENGE_NOTE, backlogFraming } from '@/lib/copy/tone';
 import { prisma } from '@/lib/db/client';
+import { localDayKey, yearWindow } from '@/lib/domain/calendar';
 import { isoWeekParts, monthPeriod } from '@/lib/domain/periods';
 import { averagePlaybackSpeed } from '@/lib/domain/playback';
 import { levelFromXp, prestigeForLevel, titleForLevel, totalXpForLevel } from '@/lib/domain/progression';
@@ -607,19 +608,6 @@ function divide(part: number, whole: number): number {
   return whole <= 0 ? 0 : part / whole;
 }
 
-/**
- * Local calendar day as `YYYY-MM-DD`.
- *
- * Built from local date parts rather than `toISOString`, which would be UTC:
- * a session logged at 00:30 in a timezone ahead of UTC belongs to the day the
- * user was living in, not to the previous one.
- */
-function localDayKey(date: Date): string {
-  const month = `${date.getMonth() + 1}`.padStart(2, '0');
-  const day = `${date.getDate()}`.padStart(2, '0');
-  return `${date.getFullYear()}-${month}-${day}`;
-}
-
 /** Half-open window of a calendar year, in local time. */
 export interface DateWindow {
   start: Date;
@@ -627,9 +615,10 @@ export interface DateWindow {
   end: Date;
 }
 
-export function yearWindow(year: number): DateWindow {
-  return { start: new Date(year, 0, 1, 0, 0, 0, 0), end: new Date(year + 1, 0, 1, 0, 0, 0, 0) };
-}
+// Local calendar days and years come from `domain/calendar`, the one place the
+// application buckets time by the local clock. `yearWindow` is re-exported so
+// this module's surface is unchanged, with exactly one definition behind it.
+export { yearWindow };
 
 /** The months covering `[start, end)`, each with the key and label the app uses. */
 function monthWindowsBetween(start: Date, end: Date): { key: string; label: string; year: number; month: number; start: Date; end: Date }[] {

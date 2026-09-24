@@ -109,6 +109,22 @@ export function hoursToSeconds(hours: number): number {
   return Math.round(hours * 3600);
 }
 
+/**
+ * Unique coverage as a percentage of the race: "62.4%".
+ *
+ * The one coverage formatter every screen uses, and it floors rather than
+ * rounds. Story Complete allows up to two minutes of a race to go unwatched,
+ * and a rounding formatter would print such a race as "100%" — reaching the
+ * end would look like having seen all of it. So "100%" appears only when every
+ * second is covered, and anything short of that reads at most "99.9%".
+ */
+export function formatCoveragePercent(coverageSec: number, runtimeSec: number): string {
+  if (!(runtimeSec > 0)) return '0%';
+  if (coverageSec >= runtimeSec) return '100%';
+  const tenths = Math.min(999, Math.floor((Math.max(0, coverageSec) * 1000) / runtimeSec));
+  return tenths % 10 === 0 ? `${tenths / 10}%` : `${(tenths / 10).toFixed(1)}%`;
+}
+
 function pad(value: number): string {
   return value.toString().padStart(2, '0');
 }

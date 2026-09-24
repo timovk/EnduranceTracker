@@ -144,7 +144,9 @@ describe('applying the migrations to a fresh database', () => {
 
   it('creates every table the schema declares', () => {
     const tables = tablesIn(file);
-    expect(EXPECTED_TABLES.length).toBe(28);
+    // 28 through 0.3.x, and 0.4.0 adds three: `expedition_summaries`,
+    // `chronicle_years` and `event_step_credits`.
+    expect(EXPECTED_TABLES.length).toBe(31);
 
     const missing = EXPECTED_TABLES.filter((table) => !tables.has(table));
     expect(missing, 'tables the runtime migrator did not create').toEqual([]);
