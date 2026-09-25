@@ -1,3 +1,5 @@
+import Link from 'next/link';
+import { Milestone } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { CareerLadder } from '@/components/dashboard/career-ladder';
 import { XpLedgerTable } from '@/components/dashboard/xp-ledger-table';
@@ -6,14 +8,15 @@ import { getCareerView, getXpLedger, levelLadder } from '@/lib/server/career';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { xpBySource } from '@/lib/engines/xp-ledger';
+import { listRecentCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
 import { getAccount } from '@/lib/auth/accounts';
 import { getEffectiveCosmetics } from '@/lib/server/cosmetics';
 import { BadgeEmblem } from '@/components/cosmetics/badge-emblem';
 import { BannerArt } from '@/components/cosmetics/banner-art';
-import { welcomeBack, momentumNote } from '@/lib/copy/tone';
-import { formatHours, formatNumber } from '@/lib/utils';
+import { welcomeBack, momentumNote, precisionLabel } from '@/lib/copy/tone';
+import { cn, formatHours, formatNumber } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Career' };
@@ -22,7 +25,7 @@ export default async function CareerPage() {
   const userId = await requireUserId();
   await ensureCareer(userId);
 
-  const [career, ledger, momentum, streak, metrics, bySource, cosmetics, account] = await Promise.all([
+  const [career, ledger, momentum, streak, metrics, bySource, cosmetics, account, milestones] = await Promise.all([
     getCareerView(userId),
     getXpLedger(userId),
     getMomentum(userId).catch(() => null),
@@ -31,6 +34,7 @@ export default async function CareerPage() {
     xpBySource(userId),
     getEffectiveCosmetics(userId),
     getAccount(userId),
+    listRecentCareerMilestones(userId, 3),
   ]);
 
   return (
@@ -130,6 +134,45 @@ export default async function CareerPage() {
           </PanelBody>
         </Panel>
       </div>
+
+      <Panel>
+        <PanelHeader
+          title="Career Milestones"
+          icon={<Milestone size={13} />}
+          action={
+            <Link href="/career/milestones" className="text-[0.6875rem] text-ink-dim transition-colors hover:text-ink-muted">
+              See all
+            </Link>
+          }
+        />
+        {milestones.length === 0 ? (
+          <PanelBody>
+            <p className="text-sm text-ink-dim">
+              The first milestone arrives with your first stint, and each one keeps the date it happened.
+            </p>
+          </PanelBody>
+        ) : (
+          <ul className="divide-y divide-hairline">
+            {milestones.map((milestone) => (
+              <li key={milestone.key} className="flex items-start gap-3 px-4 py-2.5">
+                <span
+                  aria-hidden
+                  className={cn(
+                    'mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full',
+                    milestone.celebration === 'none' ? 'bg-ink-faint' : 'bg-[var(--accent)]',
+                  )}
+                />
+                <div className="min-w-0">
+                  <div className="truncate text-sm text-ink">{milestone.title}</div>
+                  <div className="text-[0.6875rem] text-ink-faint">
+                    {precisionLabel(milestone.precision, milestone.date, milestone.subjectName)}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
 
       <CareerLadder rungs={levelLadder(career.level)} />
 

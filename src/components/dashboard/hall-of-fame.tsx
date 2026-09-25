@@ -51,7 +51,9 @@ export function HallOfFameTimeline({ hall }: { hall: HallOfFameView }) {
             {year.entries.map((entry) => {
               const color = rarityColor(entry.rarity);
               return (
-                <li key={entry.key} className="relative px-4 py-3.5">
+                // The id is the entry's key, so a Career Milestone can link
+                // straight to its plaque.
+                <li key={entry.key} id={entry.key} className="relative scroll-mt-4 px-4 py-3.5">
                   <span
                     aria-hidden
                     className="absolute inset-y-3.5 left-0 w-0.5 rounded-full"

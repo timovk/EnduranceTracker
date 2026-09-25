@@ -39,6 +39,12 @@ import {
 import { computeCareerMetricsWithHistory } from './metrics';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from './race-engine';
 import { storyBonusKey } from './progression-resync';
+import {
+  fillLandmarkDates, isCareerMilestoneRung, listStintCareerMilestones, syncCareerMilestones,
+} from './career-milestone-engine';
+import {
+  highestMilestoneCelebration, levelForMilestone, louderLevel, type MilestoneCelebration,
+} from '@/lib/domain/celebration';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
 import {
@@ -313,8 +319,9 @@ export async function logViewingSession(
     // -- 9. Achievements and milestones ------------------------------------
     //
     // Metrics are read through the TRANSACTION client so they include the
-    // session that was just written.
-    const { metrics } = await computeCareerMetricsWithHistory(userId, db);
+    // session that was just written. The career history they were computed
+    // from comes with them, for the Career Milestones below.
+    const { metrics, history } = await computeCareerMetricsWithHistory(userId, db);
     const achievements = await syncAchievements(db, userId, metrics, now);
     for (const achievement of achievements) {
       if (achievement.xpAwarded > 0) {
@@ -330,6 +337,20 @@ export async function logViewingSession(
         careerXpAwarded += milestone.xpAwarded;
       }
     }
+
+    // -- 9a. Career Milestones (0.4.0) -------------------------------------
+    //
+    // The new rungs are reached and paid, then every landmark still without
+    // a date is dated from the replay — which is built only when there is
+    // one, so an ordinary stint never pays for it.
+    const careerSync = await syncCareerMilestones(db, userId, { metrics, history, now });
+    for (const reached of careerSync.reached) {
+      if (reached.xpAwarded > 0) {
+        xpBreakdown.push({ label: `Career milestone — ${reached.title}`, amount: reached.xpAwarded });
+        careerXpAwarded += reached.xpAwarded;
+      }
+    }
+    await fillLandmarkDates(db, userId, { history, now, recognisedBySessionId: session.id });
 
     // -- 10. Season pass ---------------------------------------------------
     //
@@ -391,6 +412,7 @@ export async function logViewingSession(
 
     const runtime = Math.max(1, race.runtimeSec);
     const realMinutes = window.realSeconds / 60;
+    const careerMilestones = await listStintCareerMilestones(db, userId, session.id);
 
     return {
       sessionId: session.id,
@@ -423,7 +445,9 @@ export async function logViewingSession(
       storyCompleteBonus: storyBonusAwarded,
 
       achievements,
-      milestones,
+      // A rung that is also a Career Milestone is shown with those instead.
+      milestones: milestones.filter((milestone) => !isCareerMilestoneRung(milestone)),
+      careerMilestones,
       mastery,
       challenges,
       seasonPassTiers,
@@ -450,6 +474,7 @@ export async function logViewingSession(
         prestigeGained: profileAfter.prestige - profileBefore.prestige,
         rareUnlock: achievements.some((a) => a.rarity === 'LEGENDARY' || a.rarity === 'MYTHIC'),
         levelsGained: profileAfter.level - levelBefore,
+        careerMilestoneCelebration: highestMilestoneCelebration(careerMilestones),
       }),
     } satisfies SessionOutcome;
   }, TRANSACTION_OPTIONS).then(async (outcome) => {
@@ -468,8 +493,15 @@ export async function logViewingSession(
  *
  * Ordinary stints get a quiet, satisfying panel. The full-screen treatment is
  * reserved for the genuinely rare: a completed 24-hour race, a finished
- * season, a completed mastery tree, a prestige rank. Over-celebrating an
- * ordinary session is what turns a hobby into a slot machine.
+ * season, a completed mastery tree, a prestige rank, a major career
+ * milestone. Over-celebrating an ordinary session is what turns a hobby into
+ * a slot machine.
+ *
+ * `careerMilestoneCelebration` is the loudest celebration among the stint's
+ * Career Milestones (0.4.0): a `notable` one makes the stint at least
+ * NOTABLE, a `spectacular` one SPECTACULAR. Most milestones celebrate
+ * `none` and are simply listed. What the summary then draws is
+ * `celebrationView` (`domain/celebration`).
  */
 export function chooseCelebration(facts: {
   storyCompleted: boolean;
@@ -479,8 +511,10 @@ export function chooseCelebration(facts: {
   prestigeGained: number;
   rareUnlock: boolean;
   levelsGained: number;
+  careerMilestoneCelebration: MilestoneCelebration;
 }): 'QUIET' | 'NOTABLE' | 'SPECTACULAR' {
   const isLongHaul = facts.runtimeSec >= TWENTY_FOUR_HOUR_CONFIG.longHaulThresholdSec;
+  const fromMilestones = levelForMilestone(facts.careerMilestoneCelebration);
   if (
     facts.prestigeGained > 0 ||
     facts.seasonCompleted ||
@@ -489,9 +523,11 @@ export function chooseCelebration(facts: {
   ) {
     return 'SPECTACULAR';
   }
-  if (facts.storyCompleted || facts.rareUnlock || facts.levelsGained > 0) return 'NOTABLE';
-  return 'QUIET';
+  if (facts.storyCompleted || facts.rareUnlock || facts.levelsGained > 0) return louderLevel('NOTABLE', fromMilestones);
+  return fromMilestones;
 }
+
+export { celebrationView } from '@/lib/domain/celebration';
 
 /**
  * Remove a logged session.

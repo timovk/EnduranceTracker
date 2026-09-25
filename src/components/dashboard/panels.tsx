@@ -8,7 +8,7 @@
  */
 
 import Link from 'next/link';
-import { Award, Check, Clock, Layers, ListChecks, Ticket, Trophy } from 'lucide-react';
+import { Award, Check, Clock, Layers, ListChecks, Milestone, Ticket, Trophy } from 'lucide-react';
 import type { ChallengeScope, Rarity } from '@/lib/domain/types';
 import type { SeasonPassClosure } from '@/lib/engines/season-pass-engine';
 import {
@@ -252,7 +252,7 @@ function SeasonPassClosedPanel({ closure }: { closure: SeasonPassClosure }) {
 
 export interface UnlockRowData {
   key: string;
-  kind: 'achievement' | 'mastery' | 'trophy' | 'hall-of-fame';
+  kind: 'achievement' | 'mastery' | 'trophy' | 'hall-of-fame' | 'milestone';
   name: string;
   detail: string | null;
   rarity: Rarity | null;
@@ -265,6 +265,7 @@ const KIND_ICON = {
   mastery: Layers,
   trophy: Trophy,
   'hall-of-fame': Trophy,
+  milestone: Milestone,
 } as const;
 
 export function RecentUnlocks({ unlocks }: { unlocks: UnlockRowData[] }) {
@@ -274,7 +275,7 @@ export function RecentUnlocks({ unlocks }: { unlocks: UnlockRowData[] }) {
       {unlocks.length === 0 ? (
         <EmptyState
           title="Nothing unlocked yet"
-          body="Achievements, mastery nodes and trophies appear here as they arrive."
+          body="Career milestones, achievements, mastery nodes and trophies appear here as they arrive."
         />
       ) : (
         <ul className="divide-y divide-hairline">

@@ -11,6 +11,10 @@
  *
  *     npm run db:recompute                 every account on this machine
  *     npm run db:recompute -- Alex         one account, by name or by id
+ *     npm run db:recompute -- --rebuild-milestone-dates [Alex]
+ *                                          also date every milestone again from
+ *                                          the replay (developer repair; see
+ *                                          `recomputeCareer`)
  *
  * There is no signed-in session here, so the account cannot be inferred. Every
  * account is the default because a re-balance applies to all of them, and
@@ -43,8 +47,25 @@ async function resolveAccounts(target: string | undefined): Promise<Account[]> {
   return [match];
 }
 
-async function rebuild(account: Account, now: Date): Promise<void> {
-  const report = await recomputeCareer(account.id, { now });
+interface Arguments {
+  target: string | undefined;
+  rebuildMilestoneDates: boolean;
+}
+
+/** The account named on the command line, if any, and the flags. */
+function parseArguments(argv: readonly string[]): Arguments {
+  const flags = argv.filter((argument) => argument.startsWith('--'));
+  for (const flag of flags) {
+    if (flag !== '--rebuild-milestone-dates') throw new Error(`Unknown option "${flag}".`);
+  }
+  return {
+    target: argv.find((argument) => !argument.startsWith('--')),
+    rebuildMilestoneDates: flags.includes('--rebuild-milestone-dates'),
+  };
+}
+
+async function rebuild(account: Account, now: Date, options: Arguments): Promise<void> {
+  const report = await recomputeCareer(account.id, { now, rebuildMilestoneDates: options.rebuildMilestoneDates });
 
   console.log(`  races rebuilt from intervals and sessions   ${report.racesRebuilt}`);
   if (report.storyBonusesAwarded > 0) {
@@ -70,6 +91,17 @@ async function rebuild(account: Account, now: Date): Promise<void> {
   console.log(`  mastery nodes newly unlocked                ${report.masteryNodesUnlocked}`);
   console.log(`  achievements newly unlocked                 ${report.achievementsUnlocked}`);
   console.log(`  milestones newly reached                    ${report.milestonesReached}`);
+  console.log(`  career milestones newly reached             ${report.careerMilestonesReached}`);
+  if (report.careerMilestoneXp > 0) {
+    console.log(`    paid ${report.careerMilestoneXp} XP for them`);
+  }
+  console.log(`  milestone dates filled from history         ${report.datesFilled}`);
+  if (report.datesRecognised > 0) {
+    console.log(`    ${report.datesRecognised} history cannot place, kept with the date they were recorded`);
+  }
+  if (options.rebuildMilestoneDates) {
+    console.log(`  milestone dates rebuilt from history        ${report.milestoneDatesRebuilt}`);
+  }
 
   console.log('\n  Current totals');
   console.log(`    races               ${report.totals.races}`);
@@ -79,7 +111,8 @@ async function rebuild(account: Account, now: Date): Promise<void> {
 
 async function main(): Promise<void> {
   const started = Date.now();
-  const accounts = await resolveAccounts(process.argv[2]);
+  const options = parseArguments(process.argv.slice(2));
+  const accounts = await resolveAccounts(options.target);
 
   if (accounts.length === 0) {
     console.log('There are no accounts yet, so there is nothing to rebuild.');
@@ -91,7 +124,7 @@ async function main(): Promise<void> {
   const now = new Date();
   for (const account of accounts) {
     console.log(`\n${account.name}`);
-    await rebuild(account, now);
+    await rebuild(account, now, options);
   }
 
   console.log(`\nDone in ${((Date.now() - started) / 1000).toFixed(1)}s.`);

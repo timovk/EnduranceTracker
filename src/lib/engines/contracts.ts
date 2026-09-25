@@ -9,7 +9,9 @@
  * never open their own, so that one logged session is one atomic write.
  */
 
-import type { ChallengeScope, HallOfFameCategory, Rarity, RewardType, TrophyCategory } from '@/lib/domain/types';
+import type {
+  ChallengeScope, HallOfFameCategory, MilestonePrecision, Rarity, RewardType, TrophyCategory,
+} from '@/lib/domain/types';
 
 // ---------------------------------------------------------------------------
 // Unlocks — the things a session can produce
@@ -30,6 +32,30 @@ export interface MilestoneUnlock {
   threshold: number;
   value: number;
   xpAwarded: number;
+}
+
+/**
+ * A Career Milestone (0.4.0) as a stint summary shows it: a catalogue row
+ * whose moment this stint was. Dates are ISO strings, because the summary
+ * reaches the page through a JSON route.
+ */
+export interface CareerMilestoneUnlock {
+  /** The catalogue id (`CAREER_MILESTONES`); every year's rung is `year-plan`. */
+  id: string;
+  /** The title, with the year filled in for a year's rung. */
+  title: string;
+  /** `MilestoneProgress.metric`, e.g. `realHours` or `realHoursYear:2027`. */
+  metric: string;
+  threshold: number;
+  /** When it happened, when history can say; null for a RECOGNISED row. */
+  achievedAt: string | null;
+  precision: MilestonePrecision | null;
+  /** When the app recorded it (`reachedAt`). */
+  recordedAt: string | null;
+  /** The race or event it happened in, by the name it had then. */
+  subjectName: string | null;
+  xpAwarded: number;
+  celebration: 'none' | 'notable' | 'spectacular';
 }
 
 export interface MasteryUnlock {
@@ -328,7 +354,14 @@ export interface SessionOutcome {
   storyCompleteBonus: number;
 
   achievements: AchievementUnlock[];
+  /**
+   * Rungs of the lifetime ladders this stint reached, leaving out the rungs
+   * that are Career Milestones: those are in `careerMilestones`, so nothing is
+   * listed twice.
+   */
   milestones: MilestoneUnlock[];
+  /** The Career Milestones whose moment was this stint (0.4.0). */
+  careerMilestones: CareerMilestoneUnlock[];
   mastery: MasteryUnlock[];
   challenges: ChallengeCompletion[];
   seasonPassTiers: SeasonPassTierUnlock[];

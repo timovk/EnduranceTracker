@@ -286,6 +286,34 @@ export const CAREER_MILESTONES_BY_ID: ReadonlyMap<string, CareerMilestoneDef> = 
   CAREER_MILESTONES.map((def) => [def.id, def]),
 );
 
+/** Every rung but the year's, by the `metric:threshold` pair it is stored under. */
+const BY_STORED_PAIR: ReadonlyMap<string, CareerMilestoneDef> = new Map(
+  CAREER_MILESTONES
+    .filter((def) => def.metric !== 'realHoursYear')
+    .map((def) => [`${def.metric}:${careerMilestoneThreshold(def)}`, def]),
+);
+
+const YEAR_ROW = /^realHoursYear:(\d{4})$/;
+
+/**
+ * The catalogue milestone a stored `MilestoneProgress` row is, if it is one,
+ * with the year of a year's rung. A year's rung is recognised by its metric
+ * alone, whatever threshold it was reached at, so a row written before the
+ * annual hours were re-balanced is still that year's rung.
+ */
+export function careerMilestoneOfRow(
+  metric: string,
+  threshold: number,
+): { def: CareerMilestoneDef; year?: number } | null {
+  const year = YEAR_ROW.exec(metric);
+  if (year) {
+    const def = CAREER_MILESTONES.find((candidate) => candidate.metric === 'realHoursYear');
+    return def === undefined ? null : { def, year: Number.parseInt(year[1]!, 10) };
+  }
+  const def = BY_STORED_PAIR.get(`${metric}:${threshold}`);
+  return def === undefined ? null : { def };
+}
+
 /** A milestone big enough to be celebrated when it is reached, not only listed. */
 export function isMajorMilestone(def: CareerMilestoneDef): boolean {
   return def.celebration !== 'none';
