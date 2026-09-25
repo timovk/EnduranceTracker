@@ -55,14 +55,19 @@ const REVIEW_SCHEMA = {
   required: ['checks_passed', 'check_output', 'issues', 'spec_gaps'],
 }
 
-const WPS = [1, 2, 3, 4, 5, 6, 7, 8]
+const WPS = (args && Array.isArray(args.wps)) ? args.wps : [1, 2, 3, 4, 5, 6, 7, 8]
+const PARTIAL = args && typeof args.partial === 'number' ? args.partial : null
 const results = []
 
 for (const n of WPS) {
   phase(`WP${n}`)
-  const extra = n === 8
+  const wp8 = n === 8
     ? `\nWP8 specifics: do the documentation, version bump to 0.4.0 everywhere, the changelog entry (plain, warm, owner-facing voice like the existing entries) and CHANGELOG.md via npm run changelog, and add the e2e checks to tests/e2e/desktop.mjs (syntax-check with node --check). Do NOT run the packaged e2e or any build that rebuilds better-sqlite3 — the lead will run desktop:pack and the e2e afterwards. DO run the production web build (npm run build) and fix anything it reports. Write the owner notes from SPEC §9.4 into ${DIR}/OWNER-NOTES.md.`
     : ''
+  const resume = n === PARTIAL
+    ? `\nRESUMING: WP${n} was started earlier and stopped part-way at the owner's request, before it was finished, tested or reviewed. Its unfinished changes are present in the working tree as uncommitted changes (git diff HEAD, git status). There is no hand-off note for it yet. Read those changes critically first: keep what is correct and matches the spec, fix what is wrong or incomplete, and finish everything WP${n} requires.`
+    : ''
+  const extra = `${wp8}${resume}`
   const impl = await agent(`${COMMON}
 Implement WORK PACKAGE WP${n} exactly as SPEC.md §10 WP${n} specifies, including every file, function, hook, test and acceptance criterion it lists and every section it references.${extra}
 Where the spec is wrong about the current code or impossible as written, make the smallest sound deviation and record it. When done, run: ${CHECKS} plus the targeted tests and perf checks your WP names; iterate until all pass (fix causes, never bypass).
