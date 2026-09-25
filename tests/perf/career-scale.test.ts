@@ -16,13 +16,16 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CAREER_STATS_SHAPE, EXPEDITION_SHAPE } from '@/lib/config';
-import { disconnectDb, prisma } from '@/lib/db/client';
+import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { buildCareerTimeline } from '@/lib/domain/career-timeline';
 import { yearWindow } from '@/lib/domain/calendar';
 import { computeRecordProgression } from '@/lib/domain/records';
 import { summariseWindow } from '@/lib/domain/window-summary';
 import { getCareerTimeline, loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
 import { deleteRace, deleteViewingSession } from '@/lib/engines/session-engine';
+import {
+  backfillMilestones, backfillRaces, buildPhaseContext, runCareerBackfillFor,
+} from '@/lib/server/upgrades/career-backfill';
 import { ledgerProblems, logStint } from '../helpers/career-db';
 import type { LargeCareerDatabase, SeededCareer } from '../helpers/large-career-db';
 import { createLargeCareerDatabase } from '../helpers/large-career-db';
@@ -45,6 +48,23 @@ async function timedAsync<T>(work: () => Promise<T>): Promise<{ result: T; ms: n
 
 /** Generous per-test limits: a timing assertion should fail, not the test runner's clock. */
 const SLOW = 180_000;
+
+/** The backfill's chunk transaction, as `career-backfill.ts` opens it. */
+const CHUNK_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
+
+/**
+ * Put a career's landmarks back to undated and its races back to no credited
+ * time, as 0.3.2 left them, so the paths that fill them in have everything to
+ * do.
+ */
+async function undate(userId: string, options: { credited: boolean }): Promise<void> {
+  await prisma.milestoneProgress.updateMany({
+    where: { userId },
+    data: { achievedAt: null, achievedPrecision: null, sessionId: null, raceId: null, eventId: null, subjectName: null },
+  });
+  await prisma.masteryProgress.updateMany({ where: { userId }, data: { achievedAt: null, achievedPrecision: null, achievedSessionId: null } });
+  if (options.credited) await prisma.race.updateMany({ where: { userId }, data: { creditedViewingSec: null } });
+}
 
 describe.skipIf(process.env.PERF !== '1')('a career at scale (pure)', () => {
   let large: SyntheticCareer;
@@ -157,6 +177,60 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
     expect(realLog.result.sessionId).toBeTruthy();
     expect(realLog.ms).toBeLessThan(1_000);
     expect(largeLog.ms).toBeLessThan(6_000);
+  }, SLOW);
+
+  it('logs a stint that dates every undated landmark in under 1 s for a real career and 6 s for a large one', async () => {
+    // The first stint after the update, while the backfill has not yet dated
+    // anything: the stint builds the replay and dates every landmark itself.
+    for (const career of [real, large]) await undate(career.userId, { credited: false });
+    const realLog = await timedAsync(() => logStint(real.userId, real.openRaceId, { from: 1_800, to: 2_400, now: real.now }));
+    const largeLog = await timedAsync(() => logStint(large.userId, large.openRaceId, { from: 1_800, to: 2_400, now: large.now }));
+    for (const career of [real, large]) {
+      expect(await prisma.milestoneProgress.count({ where: { userId: career.userId, achievedPrecision: null } })).toBe(0);
+    }
+    expect(realLog.result.sessionId).toBeTruthy();
+    expect(realLog.ms).toBeLessThan(1_000);
+    expect(largeLog.ms).toBeLessThan(6_000);
+  }, SLOW);
+
+  it('backfills a real career in one start, in under 5 s', async () => {
+    await undate(real.userId, { credited: true });
+    const { result, ms } = await timedAsync(() =>
+      runCareerBackfillFor(real.userId, { now: real.now, clock: { shouldStartChunk: () => true }, force: true }));
+    expect(result.completed).toBe(true);
+    expect(result.racesCredited).toBeGreaterThan(0);
+    expect(result.datesFilled).toBeGreaterThan(0);
+    expect(ms).toBeLessThan(5_000);
+    expect(await ledgerProblems(real.userId)).toEqual([]);
+  }, SLOW);
+
+  it('backfills a large career with its context in under 3 s and every chunk in under 5 s', async () => {
+    await undate(large.userId, { credited: true });
+    const context = await timedAsync(() => buildPhaseContext(large.userId, large.now));
+    expect(context.ms).toBeLessThan(3_000);
+
+    // P1, 500 races a chunk, as the backfill runs it.
+    const ids = [...context.result.timeline.racesById.keys()].sort();
+    let slowestRaceChunk = 0;
+    let credited = 0;
+    for (let index = 0; index < ids.length; index += 500) {
+      const chunk = ids.slice(index, index + 500);
+      const { result, ms } = await timedAsync(() =>
+        prisma.$transaction((tx) => backfillRaces(tx as Tx, context.result, chunk), CHUNK_TRANSACTION));
+      credited += result.racesCredited;
+      slowestRaceChunk = Math.max(slowestRaceChunk, ms);
+    }
+    expect(credited).toBe(ids.length);
+    expect(slowestRaceChunk).toBeLessThan(5_000);
+
+    // P3, one chunk.
+    const milestones = await timedAsync(() => prisma.$transaction(
+      (tx) => backfillMilestones(tx as Tx, large.userId, large.now, context.result.timeline),
+      CHUNK_TRANSACTION,
+    ));
+    expect(milestones.result.filled).toBeGreaterThan(0);
+    expect(milestones.ms).toBeLessThan(5_000);
+    expect(await prisma.milestoneProgress.count({ where: { userId: large.userId, achievedPrecision: null } })).toBe(0);
   }, SLOW);
 
   it('deletes a stint from the last month in under 1 s for a real career and 2 s for a large one', async () => {

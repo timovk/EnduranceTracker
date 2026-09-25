@@ -12,6 +12,9 @@
  * `tests/domain/tone.test.ts` asserts no forbidden word ever appears here.
  */
 
+import { TIMELINE_SHAPE } from '@/lib/config';
+import type { MilestonePrecision } from '@/lib/domain/types';
+
 /** Words this application does not say to its user. */
 export const FORBIDDEN_TONE_WORDS = [
   'failed',
@@ -159,6 +162,85 @@ export function raceRemovedNotice(raceName: string, xpRemoved: number): string {
     `${raceName} was removed from the library, with the ${xp.toLocaleString('en-GB')} XP it earned. ` +
     'Achievements and milestones you reached stay.'
   );
+}
+
+// ---------------------------------------------------------------------------
+// Career Milestones (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// A milestone says when it happened and how exactly that is known, and never
+// claims more precision than the history holds. A time worked out inside a
+// stint rests on when the stint was logged, so it is shown to the nearest
+// few minutes and says so.
+
+function clockTime(at: Date): string {
+  return at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function longDate(at: Date): string {
+  return at.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+/**
+ * How a milestone's date is known, in one sentence.
+ *
+ * `at` is `achievedAt`, or the moment the app recorded the milestone when
+ * history cannot place it. `subjectName` names the race an interpolated time
+ * fell inside. A milestone whose date is still being worked out (the upgrade
+ * has not reached it yet) says only when it was recorded.
+ */
+export function precisionLabel(
+  precision: MilestonePrecision | null,
+  at: Date,
+  subjectName?: string | null,
+): string {
+  if (precision === 'INTERPOLATED') {
+    const step = TIMELINE_SHAPE.displayRoundingMinutes * 60_000;
+    const rounded = new Date(Math.round(at.getTime() / step) * step);
+    const during = subjectName ? `, during a stint of ${subjectName}` : '';
+    return `Reached around ${clockTime(rounded)} on ${longDate(rounded)}${during} (worked out from when the stint was logged)`;
+  }
+  if (precision === 'STINT') return `Reached with the stint logged at ${clockTime(at)} on ${longDate(at)}`;
+  if (precision === 'RECOGNISED') return `Recorded on ${longDate(at)} (history cannot place it more exactly)`;
+  return `Recorded on ${longDate(at)}`;
+}
+
+/**
+ * Who celebrates a milestone that pays no XP of its own, because something
+ * else already pays that moment: "Celebrated by the Green Flag achievement
+ * and the first viewing-session rung." The payers are written as they read
+ * mid-sentence (`alsoPaidBy`), so a name such as The Archive keeps its
+ * capital; they are only joined here.
+ */
+export function celebratedBy(payers: readonly string[]): string {
+  if (payers.length === 0) return '';
+  const list = payers.length === 1
+    ? payers[0]
+    : `${payers.slice(0, -1).join(', ')} and ${payers[payers.length - 1]}`;
+  return `Celebrated by ${list}.`;
+}
+
+/**
+ * A milestone still to come, as a position rather than a gap: "Still ahead:
+ * 212 of 250 hours". Hours are shown whole and never rounded up, so a
+ * milestone never reads as reached before it is.
+ */
+export function stillAheadNote(value: number, target: number, unit: 'hours' | 'count'): string {
+  const shown = Math.min(Math.floor(Math.max(0, value)), target);
+  const figures = `${shown.toLocaleString('en-GB')} of ${target.toLocaleString('en-GB')}`;
+  return `Still ahead: ${figures}${unit === 'hours' ? ' hours' : ''}`;
+}
+
+/**
+ * The current year's hours as a plain fact — "2026 so far: 36 hours". Never a
+ * bar and never a remaining figure: a yearly target that resets every January
+ * would be a quota.
+ */
+export function yearToDateFact(year: number, creditedSeconds: number): string {
+  const hours = Math.max(0, creditedSeconds) / 3600;
+  const shown = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
+  const figure = shown.toLocaleString('en-GB');
+  return `${year} so far: ${figure} ${shown === 1 ? 'hour' : 'hours'}`;
 }
 
 /** Recommendation framing. Suggestions, never instructions. */

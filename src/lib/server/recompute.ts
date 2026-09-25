@@ -20,13 +20,21 @@
  *   2. The ledger repair (`repairXpLedger`): viewing XP whose stint is gone and
  *      Story Complete bonuses whose race is not complete are removed.
  *   3. One transaction for the rest: mastery trees and event caches,
- *      collections, mastery, metrics, achievements and milestone ladders.
+ *      collections, mastery, metrics, achievements, milestone ladders and
+ *      Career Milestones, and a date for every landmark that has none. Only
+ *      when asked (`rebuildMilestoneDates`) is every landmark dated again
+ *      from the replay, where the replay's instant passes the same test a
+ *      first dating does: the one deliberate exception to "a landmark's date
+ *      is written once", for developer repair.
+ *   4. The account's 0.4.0 backfill is recorded as done: recompute has just
+ *      done all of it.
  */
 
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
 import { buildCareerTimeline, type CareerTimeline } from '@/lib/domain/career-timeline';
 import { syncAchievements, syncMilestones } from '@/lib/engines/achievement-engine';
+import { fillLandmarkDates, rebuildLandmarkDates, syncCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
 import { ensureSeasonCollections, syncCollections } from '@/lib/engines/collection-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from '@/lib/engines/mastery-engine';
@@ -35,10 +43,17 @@ import { reconcileStoryBonus } from '@/lib/engines/progression-resync';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { repairXpLedger, type LedgerRepair } from '@/lib/engines/session-engine';
 import { settleLedger, type XpRevocation } from '@/lib/engines/xp-ledger';
+import { markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 
 export interface RecomputeOptions {
   /** The instant recorded as "now" by anything the rebuild completes. Defaults to the clock. */
   now?: Date;
+  /**
+   * Date every milestone and event step again from the replay (`db:recompute
+   * --rebuild-milestone-dates`). Only rows whose replayed instant passes the
+   * dating test are rewritten; every other row is left as it is.
+   */
+  rebuildMilestoneDates?: boolean;
 }
 
 export interface RecomputeReport {
@@ -52,6 +67,14 @@ export interface RecomputeReport {
   masteryNodesUnlocked: number;
   achievementsUnlocked: number;
   milestonesReached: number;
+  /** Career Milestone rungs newly written, and the XP they paid. */
+  careerMilestonesReached: number;
+  careerMilestoneXp: number;
+  /** Landmarks given a date from history, and those history cannot place. */
+  datesFilled: number;
+  datesRecognised: number;
+  /** Landmarks dated again on request; 0 unless `rebuildMilestoneDates` was set. */
+  milestoneDatesRebuilt: number;
   totals: { races: number; coverageSec: number; creditedViewingSec: number };
 }
 
@@ -108,16 +131,36 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     await recomputeRaceMasteries(db, userId, now);
     const collections = await syncCollections(db, userId, now);
     const mastery = await syncMastery(db, userId, now);
-    const { metrics } = await computeCareerMetricsWithHistory(userId, db);
+    const { metrics, history } = await computeCareerMetricsWithHistory(userId, db);
     const achievements = await syncAchievements(db, userId, metrics, now);
     const milestones = await syncMilestones(db, userId, metrics, now);
+    const careerMilestones = await syncCareerMilestones(db, userId, { metrics, history, now });
+    // Dated from what this transaction sees rather than from the replay step 1
+    // built: the event links were just recomputed, and an event step is
+    // replayed inside its event's races. The replay is built here only when a
+    // rebuild of every date needs it anyway; otherwise only if some landmark
+    // is still undated.
+    const replay = options.rebuildMilestoneDates ? buildCareerTimeline(history.sessions, history.races) : undefined;
+    const dates = await fillLandmarkDates(db, userId, { history, now, timeline: replay });
+    const milestoneDatesRebuilt = replay === undefined ? 0 : await rebuildLandmarkDates(db, userId, replay);
     return {
       collectionCardsFilled: collections.filledItems.length,
       masteryNodesUnlocked: mastery.length,
       achievementsUnlocked: achievements.length,
       milestonesReached: milestones.length,
+      careerMilestonesReached: careerMilestones.created,
+      careerMilestoneXp: careerMilestones.xpAwarded,
+      datesFilled: dates.milestones + dates.eventSteps,
+      datesRecognised: dates.recognised,
+      milestoneDatesRebuilt,
     };
   }, SYNC_TRANSACTION);
+
+  // -- 4. The upgrade --------------------------------------------------------
+  //
+  // Everything the 0.4.0 backfill would do has just been done, so the next
+  // start has nothing left to do for this account.
+  await markCareerBackfillApplied(userId);
 
   const totals = await prisma.race.aggregate({
     where: { userId },

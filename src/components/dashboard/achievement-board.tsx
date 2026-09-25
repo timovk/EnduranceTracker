@@ -12,7 +12,8 @@
  */
 
 import * as React from 'react';
-import { Lock } from 'lucide-react';
+import Link from 'next/link';
+import { Lock, Milestone } from 'lucide-react';
 import type { AchievementBoard, MilestoneBoard } from '@/lib/engines/achievement-engine';
 import {
   Panel, PanelBody, PanelHeader, RarityBadge, rarityColor, Stat, TimingBar,
@@ -39,7 +40,7 @@ export function AchievementBoardView({
             <Stat label="From achievements" value={formatNumber(achievements.xpEarned)} sub="career XP" size="sm" tone="accent" />
             <Stat label="Still waiting" value={formatNumber(achievements.xpWaiting)} sub="career XP in the cabinet" size="sm" tone="muted" />
             <Stat
-              label="Milestones"
+              label="Ladder rungs"
               value={`${milestones.reached}/${milestones.total}`}
               sub={`${milestones.completionPercent.toFixed(1)}%`}
               size="sm"
@@ -80,9 +81,15 @@ export function AchievementBoardView({
           onChange={setTab}
           options={[
             { value: 'achievements', label: 'Achievements' },
-            { value: 'milestones', label: 'Milestones' },
+            { value: 'milestones', label: 'Lifetime ladders' },
           ]}
         />
+        <Link
+          href="/career/milestones"
+          className="inline-flex items-center gap-1.5 text-[0.8125rem] text-ink-dim transition-colors hover:text-ink-muted"
+        >
+          <Milestone size={13} /> Career Milestones
+        </Link>
       </div>
 
       {tab === 'achievements' ? (
@@ -180,8 +187,15 @@ function MilestoneList({ board }: { board: MilestoneBoard }) {
   return (
     <div className="space-y-4">
       <Panel>
-        <PanelBody>
+        <PanelBody className="space-y-2">
           <p className="text-sm text-ink-muted">{board.headline}</p>
+          <p className="text-xs text-ink-dim">
+            The major moments along these ladders, each with the day it happened, are kept on{' '}
+            <Link href="/career/milestones" className="text-ink-muted underline-offset-2 hover:underline">
+              Career Milestones
+            </Link>
+            .
+          </p>
         </PanelBody>
       </Panel>
 

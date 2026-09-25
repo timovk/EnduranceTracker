@@ -10,12 +10,14 @@
 import { prisma } from '@/lib/db/client';
 import type { SessionOutcome } from '@/lib/engines/contracts';
 import { stintHeading } from '@/lib/copy/tone';
+import { highestMilestoneCelebration } from '@/lib/domain/celebration';
 import { chooseCelebration } from '@/lib/engines/session-engine';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getMasteryForChampionship } from '@/lib/engines/mastery-engine';
-import { MILESTONES, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
-import { isSeasonClosed } from '@/lib/domain/season-closure';
+import { isCareerMilestoneRung, listStintCareerMilestones } from '@/lib/engines/career-milestone-engine';
+import { reconstructStintUnlocks } from '@/lib/engines/stint-unlocks';
+import { TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
 import { seasonClosureNotice } from '@/lib/engines/season-pass-engine';
 
 export async function buildOutcomeForSession(
@@ -44,41 +46,17 @@ export async function buildOutcomeForSession(
   if (!session) return null;
 
   const runtime = Math.max(1, session.race.runtimeSec);
-  // Everything awarded in the same transaction as this session belongs to it.
-  const windowStart = new Date(session.watchedAt.getTime() - 5 * 60_000);
 
-  const [profile, momentum, streak, budget, achievements, mastery, challenges, milestones, tiers, trophies, hallOfFame] =
-    await Promise.all([
-      prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
-      getMomentum(userId).catch(() => null),
-      getStreak(userId).catch(() => null),
-      getBudgetSnapshot(userId).catch(() => null),
-      prisma.achievementProgress.findMany({
-        where: { userId, unlockedAt: { gte: windowStart } },
-        select: { achievement: true, unlockedAt: true },
-      }),
-      prisma.masteryProgress.findMany({
-        where: { userId, unlockedAt: { gte: windowStart } },
-        select: { node: { select: { key: true, name: true, description: true, rarity: true, xpReward: true, tree: { select: { key: true, name: true } } } } },
-      }),
-      prisma.challengeProgress.findMany({
-        where: { challenge: { userId }, completedAt: { gte: windowStart } },
-        select: {
-          completedAt: true,
-          challenge: { select: { id: true, scope: true, title: true, xpReward: true, seasonXpReward: true } },
-        },
-      }),
-      prisma.milestoneProgress.findMany({
-        where: { userId, reachedAt: { gte: windowStart } },
-        select: { metric: true, threshold: true, valueAtReach: true, xpAwarded: true },
-      }),
-      prisma.seasonPassProgress.findMany({
-        where: { seasonPass: { userId }, unlockedAt: { gte: windowStart } },
-        orderBy: { tier: 'asc' },
-      }),
-      prisma.trophy.findMany({ where: { userId, awardedAt: { gte: windowStart } } }),
-      prisma.hallOfFameEntry.findMany({ where: { userId, occurredAt: { gte: windowStart } } }),
-    ]);
+  // What unlocked with this stint: stamped close to its instant, and not
+  // claimed by the stints logged just before or after it (`stint-unlocks`).
+  const [profile, momentum, streak, budget, unlocks, careerMilestones] = await Promise.all([
+    prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
+    getMomentum(userId).catch(() => null),
+    getStreak(userId).catch(() => null),
+    getBudgetSnapshot(userId).catch(() => null),
+    reconstructStintUnlocks(prisma, userId, session),
+    listStintCareerMilestones(prisma, userId, session.id),
+  ]);
 
   const careerXpAwarded = session.xpTransactions.reduce((sum, t) => sum + t.amount, 0);
   const seasonXpAwarded = session.xpTransactions.reduce((sum, t) => sum + t.seasonAmount, 0);
@@ -123,59 +101,16 @@ export async function buildOutcomeForSession(
     storyCompleted: storyBonus > 0,
     storyCompleteBonus: storyBonus,
 
-    achievements: achievements.map((a) => ({
-      key: a.achievement.key,
-      name: a.achievement.name,
-      description: a.achievement.description,
-      rarity: a.achievement.rarity,
-      iconKey: a.achievement.iconKey,
-      xpAwarded: a.achievement.xpReward,
-    })),
-    milestones: milestones.map((m) => ({
-      metric: m.metric,
-      // The stored row holds the metric key; the human label lives with the
-      // definition. Falling back to the key would print "1 realhours".
-      label: MILESTONE_LABELS.get(m.metric) ?? m.metric,
-      threshold: m.threshold,
-      value: m.valueAtReach ?? m.threshold,
-      xpAwarded: m.xpAwarded,
-    })),
-    mastery: mastery.map((m) => ({
-      treeKey: m.node.tree.key,
-      treeName: m.node.tree.name,
-      nodeKey: m.node.key,
-      nodeName: m.node.name,
-      description: m.node.description,
-      rarity: m.node.rarity,
-      xpAwarded: m.node.xpReward,
-      treeProgress: 0,
-      treeCompleted: false,
-    })),
-    challenges: challenges.map((c) => ({
-      id: c.challenge.id,
-      scope: c.challenge.scope,
-      title: c.challenge.title,
-      xpAwarded: c.challenge.xpReward,
-      // A challenge completed while the season was closed (0.3.1) paid no
-      // season XP, whatever its row says it offered.
-      seasonXpAwarded: isSeasonClosed(c.completedAt ?? session.watchedAt) ? 0 : c.challenge.seasonXpReward,
-    })),
-    seasonPassTiers: tiers.map((t) => ({
-      tier: t.tier,
-      rewardKey: t.rewardKey,
-      rewardName: t.rewardName,
-      rewardType: t.rewardType,
-      rarity: t.rewardRarity,
-      isMilestone: t.isMilestone,
-    })),
+    achievements: unlocks.achievements,
+    // A rung that is also a Career Milestone is shown with those instead.
+    milestones: unlocks.milestones.filter((milestone) => !isCareerMilestoneRung(milestone)),
+    careerMilestones,
+    mastery: unlocks.mastery,
+    challenges: unlocks.challenges,
+    seasonPassTiers: unlocks.seasonPassTiers,
     collections: { completedCollections: [], filledItems: [] },
-    trophies: trophies.map((t) => ({
-      key: t.key, name: t.name, description: t.description,
-      category: t.category, rarity: t.rarity, iconKey: t.iconKey,
-    })),
-    hallOfFame: hallOfFame.map((h) => ({
-      key: h.key, title: h.title, subtitle: h.subtitle, category: h.category, rarity: h.rarity,
-    })),
+    trophies: unlocks.trophies,
+    hallOfFame: unlocks.hallOfFame,
 
     momentum: momentum ?? FALLBACK_MOMENTUM,
     streak: streak ?? FALLBACK_STREAK,
@@ -194,8 +129,9 @@ export async function buildOutcomeForSession(
       seasonCompleted: false,
       masteryTreeCompleted: false,
       prestigeGained: 0,
-      rareUnlock: achievements.some((a) => a.achievement.rarity === 'LEGENDARY' || a.achievement.rarity === 'MYTHIC'),
+      rareUnlock: unlocks.achievements.some((a) => a.rarity === 'LEGENDARY' || a.rarity === 'MYTHIC'),
       levelsGained: 0,
+      careerMilestoneCelebration: highestMilestoneCelebration(careerMilestones),
     }),
   };
 }
@@ -210,10 +146,5 @@ const FALLBACK_STREAK = {
   currentDays: 0, longestDays: 0, lifetimeActiveDays: 0, lifetimeActiveWeeks: 0,
   lastActiveDate: null, daysSinceLastActive: 0,
 };
-
-/** Metric key to the human label the milestone was defined with. */
-const MILESTONE_LABELS: ReadonlyMap<string, string> = new Map(
-  MILESTONES.map((def) => [def.metric, def.label]),
-);
 
 export const LONG_HAUL_THRESHOLD = TWENTY_FOUR_HOUR_CONFIG.longHaulThresholdSec;

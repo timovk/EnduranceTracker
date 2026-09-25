@@ -8,26 +8,40 @@
  *
  * This file grows with the release: the migration is checked here first, and
  * the career backfill, Event Legacy, Expeditions and the Chronicle add their
- * own checks against the same data.
+ * own checks against the same data. Prisma is pointed at the copy before the
+ * first query, so the backfill runs on it exactly as it would at start-up.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { join, resolve } from 'node:path';
 import { runMigrations } from '../../desktop/src/migrate';
+import { disconnectDb, prisma } from '@/lib/db/client';
+import {
+  CAREER_BACKFILL_PHASES, deadlineClock, isCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill,
+  runCareerBackfillFor,
+} from '@/lib/server/upgrades/career-backfill';
+import { ledgerProblems } from '../helpers/career-db';
 import type { FixtureCopy } from '../helpers/fixture-db';
-import { copyFixtureDatabase, FIXTURE_USER_ID } from '../helpers/fixture-db';
+import { FIXTURE_GENERATED_AT, FIXTURE_USER_ID, pointPrismaAtFixture } from '../helpers/fixture-db';
 
 const MIGRATIONS = join(resolve(process.cwd()), 'prisma', 'migrations');
 const CAREER_HISTORY = '20260924120000_career_history';
 
+/** The first start after the update: a few minutes after the fixture was written. */
+const STARTED = new Date(FIXTURE_GENERATED_AT.getTime() + 20 * 60_000);
+
+/** A start-up clock that always has time: the fixture is small. */
+const PLENTY_OF_TIME = { shouldStartChunk: () => true };
+
 let copy: FixtureCopy;
 
 beforeAll(() => {
-  copy = copyFixtureDatabase();
+  copy = pointPrismaAtFixture();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await disconnectDb();
   copy.cleanup();
 });
 
@@ -124,5 +138,174 @@ describe('migrating the 0.3.2 fixture', () => {
     const again = runMigrations(copy.file, MIGRATIONS);
     expect(again.applied).toEqual([]);
     expect(counts(copy.file)).toEqual(settled);
+  });
+});
+
+describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
+  /** What the backfill writes to a race: the credited-time cache, and so its `updatedAt`. */
+  const CACHE_COLUMNS = new Set(['creditedViewingSec', 'updatedAt']);
+
+  /** The rows the backfill may not change: stints and intervals whole, races but for the credited-time cache. */
+  function untouchable(file: string): { stints: unknown[]; intervals: unknown[]; races: unknown[] } {
+    const db = new Database(file, { readonly: true });
+    try {
+      return {
+        stints: db.prepare('SELECT * FROM "race_viewing_sessions" ORDER BY "id"').all(),
+        intervals: db.prepare('SELECT * FROM "watched_intervals" ORDER BY "id"').all(),
+        races: (db.prepare('SELECT * FROM "races" ORDER BY "id"').all() as Record<string, unknown>[])
+          .map((race) => Object.fromEntries(Object.entries(race).filter(([column]) => !CACHE_COLUMNS.has(column)))),
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Everything the backfill writes, for comparing one run with the next. */
+  async function written() {
+    const [ledger, milestones, steps, races] = await Promise.all([
+      prisma.xPTransaction.findMany({
+        where: { userId: FIXTURE_USER_ID },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        select: { id: true, amount: true, seasonAmount: true, careerXpAfter: true, levelAfter: true, dedupeKey: true },
+      }),
+      prisma.milestoneProgress.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
+      prisma.masteryProgress.findMany({
+        where: { userId: FIXTURE_USER_ID },
+        orderBy: { id: 'asc' },
+        select: { id: true, unlockedAt: true, achievedAt: true, achievedPrecision: true, achievedSessionId: true },
+      }),
+      prisma.race.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' }, select: { id: true, creditedViewingSec: true } }),
+    ]);
+    return { ledger, milestones, steps, races };
+  }
+
+  let before: ReturnType<typeof untouchable>;
+
+  beforeAll(() => {
+    before = untouchable(copy.file);
+  });
+
+  it('brings the career up to date in the first start after the update', async () => {
+    expect(await readCareerBackfillMarker(FIXTURE_USER_ID)).toBeNull();
+    const lines: string[] = [];
+    const summaries = await runCareerBackfill({
+      now: STARTED,
+      clock: deadlineClock(Date.now() + 30_000),
+      log: { info: (line) => lines.push(line), error: (line) => lines.push(line) },
+    });
+
+    expect(summaries.map((summary) => summary.userId)).toEqual([FIXTURE_USER_ID]);
+    const [summary] = summaries;
+    expect(summary).toMatchObject({ completed: true, skipped: false, pausedBefore: null, racesCredited: 11 });
+    expect(summary?.datesFilled).toBeGreaterThan(0);
+    expect(summary?.datesRecognised).toBeGreaterThan(0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^\[career-backfill\] Demo Driver \(00000000-0000-4000-8000-000000000001\): credited 11 races/);
+
+    expect(await isCareerBackfillApplied(FIXTURE_USER_ID)).toBe(true);
+    const marker = await readCareerBackfillMarker(FIXTURE_USER_ID);
+    expect(marker?.done).toEqual([...CAREER_BACKFILL_PHASES]);
+    expect(marker?.lastRunAt).toBe(STARTED.toISOString());
+  });
+
+  it('leaves every stint, interval and race status as 0.3.2 wrote them', async () => {
+    const after = untouchable(copy.file);
+    expect(after.stints).toEqual(before.stints);
+    expect(after.intervals).toEqual(before.intervals);
+    expect(after.races).toEqual(before.races);
+    // Credited time is the one thing written to the races, and every race has it.
+    const races = await prisma.race.findMany({ where: { userId: FIXTURE_USER_ID }, select: { creditedViewingSec: true, realViewingSec: true } });
+    expect(races).toHaveLength(11);
+    for (const race of races) expect(race.creditedViewingSec).not.toBeNull();
+  });
+
+  it('dates every milestone and event step, from history wherever history can say', async () => {
+    const milestones = await prisma.milestoneProgress.findMany({ where: { userId: FIXTURE_USER_ID } });
+    expect(milestones.length).toBeGreaterThan(30);
+    for (const row of milestones) {
+      expect(row.achievedPrecision, `${row.metric}:${row.threshold}`).not.toBeNull();
+      if (row.achievedPrecision === 'RECOGNISED') {
+        expect(row.achievedAt).toBeNull();
+      } else {
+        // Never after the moment 0.3.2 recorded it.
+        expect(row.achievedAt!.getTime(), `${row.metric}:${row.threshold}`).toBeLessThanOrEqual(row.reachedAt!.getTime() + 5 * 60_000);
+        expect(row.sessionId).not.toBeNull();
+        expect(row.subjectName).not.toBeNull();
+      }
+    }
+    const precisionOf = (metric: string) => new Set(milestones.filter((row) => row.metric === metric).map((row) => row.achievedPrecision));
+    expect(precisionOf('realHours')).toEqual(new Set(['INTERPOLATED']));
+    expect(precisionOf('storyCompletes')).toEqual(new Set(['STINT']));
+    // Counts of what else is in the library carry no instant of their own.
+    for (const metric of ['circuits', 'countries', 'championshipsCompleted', 'racesCompleted', 'level']) {
+      expect(precisionOf(metric), metric).toEqual(new Set(['RECOGNISED']));
+    }
+
+    const steps = await prisma.masteryProgress.findMany({
+      where: { userId: FIXTURE_USER_ID, unlockedAt: { not: null }, node: { tree: { kind: 'RACE_EVENT' } } },
+      include: { node: { select: { key: true, metric: true, tree: { select: { iconicKey: true } } } } },
+    });
+    expect(steps.length).toBeGreaterThan(0);
+    for (const step of steps) expect(step.achievedPrecision).not.toBeNull();
+
+    // A step counted in editions is found in the replay of its own event's
+    // races, and dated to the stint that reached it.
+    const counted = steps.filter((step) => ['editionsStoryComplete', 'editionsExperienced'].includes(step.node.metric));
+    expect(counted.length).toBeGreaterThan(0);
+    const stints = new Map((await prisma.raceViewingSession.findMany({
+      where: { userId: FIXTURE_USER_ID },
+      select: { id: true, watchedAt: true, race: { select: { iconicKey: true } } },
+    })).map((stint) => [stint.id, stint]));
+    for (const step of counted) {
+      const label = `${step.node.tree.iconicKey} ${step.node.key}`;
+      expect(step.achievedPrecision, label).toBe('STINT');
+      const stint = stints.get(step.achievedSessionId ?? '');
+      expect(stint, label).toBeDefined();
+      expect(stint!.race.iconicKey, label).toBe(step.node.tree.iconicKey);
+      expect(step.achievedAt, label).toEqual(stint!.watchedAt);
+      expect(step.achievedAt!.getTime(), label).toBeLessThanOrEqual(step.unlockedAt!.getTime() + 5 * 60_000);
+    }
+  });
+
+  it('writes the new rungs the career had already passed, once, as career XP only', async () => {
+    const started = await prisma.milestoneProgress.findUniqueOrThrow({
+      where: { userId_metric_threshold: { userId: FIXTURE_USER_ID, metric: 'racesStarted', threshold: 1 } },
+    });
+    // Recorded now, dated when it happened: the first stint of the career.
+    expect(started.reachedAt).toEqual(STARTED);
+    expect(started.achievedPrecision).toBe('STINT');
+    expect(started.achievedAt!.getTime()).toBeLessThan(new Date('2025-08-01T00:00:00Z').getTime());
+    expect(started.xpAwarded).toBe(0);
+    expect(await prisma.xPTransaction.count({ where: { userId: FIXTURE_USER_ID, dedupeKey: 'milestone:racesStarted:1' } })).toBe(0);
+
+    const sixHours = await prisma.xPTransaction.findMany({ where: { userId: FIXTURE_USER_ID, dedupeKey: 'milestone:stories6h:1' } });
+    expect(sixHours).toHaveLength(1);
+    expect(sixHours[0]).toMatchObject({ source: 'MILESTONE', amount: 500, seasonAmount: 0 });
+  });
+
+  it('keeps the ledger whole: every dedupe key once, and every running total right', async () => {
+    const keys = await prisma.xPTransaction.groupBy({
+      by: ['dedupeKey'],
+      where: { userId: FIXTURE_USER_ID, dedupeKey: { not: null } },
+      _count: { _all: true },
+    });
+    expect(keys.filter((key) => key._count._all > 1)).toEqual([]);
+    expect(await ledgerProblems(FIXTURE_USER_ID)).toEqual([]);
+  });
+
+  it('changes nothing on the next start, or when it is forced to run again', async () => {
+    const settled = await written();
+    expect(await runCareerBackfill({ now: new Date(STARTED.getTime() + 86_400_000), clock: PLENTY_OF_TIME, log: { info: () => undefined, error: () => undefined } }))
+      .toEqual([]);
+    const forced = await runCareerBackfillFor(FIXTURE_USER_ID, { now: new Date(STARTED.getTime() + 86_400_000), clock: PLENTY_OF_TIME, force: true });
+    expect(forced).toMatchObject({
+      completed: true, racesCredited: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
+      milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+    });
+    const again = await written();
+    expect(again.ledger).toEqual(settled.ledger);
+    expect(again.milestones).toEqual(settled.milestones);
+    expect(again.steps).toEqual(settled.steps);
+    expect(again.races).toEqual(settled.races);
   });
 });

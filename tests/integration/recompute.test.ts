@@ -12,6 +12,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { disconnectDb, prisma } from '@/lib/db/client';
 import { storyCompleteBonus } from '@/lib/domain/progression';
 import { recomputeCareer } from '@/lib/server/recompute';
+import { isCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 import {
   addRace, createCareerUser, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
@@ -64,7 +65,10 @@ async function derivedState() {
     prisma.milestoneProgress.findMany({
       where: { userId: USER },
       orderBy: [{ metric: 'asc' }, { threshold: 'asc' }],
-      select: { metric: true, threshold: true, reachedAt: true, xpAwarded: true },
+      select: {
+        metric: true, threshold: true, reachedAt: true, xpAwarded: true,
+        achievedAt: true, achievedPrecision: true, sessionId: true, raceId: true, subjectName: true,
+      },
     }),
     prisma.raceMastery.findMany({
       where: { userId: USER },
@@ -119,6 +123,11 @@ describe('recompute', () => {
       masteryNodesUnlocked: 0,
       achievementsUnlocked: 0,
       milestonesReached: 0,
+      careerMilestonesReached: 0,
+      careerMilestoneXp: 0,
+      datesFilled: 0,
+      datesRecognised: 0,
+      milestoneDatesRebuilt: 0,
     });
   });
 
@@ -178,5 +187,88 @@ describe('recompute', () => {
     expect(race.storyCompletedAt).toBeNull();
     expect(race.coverageSec).toBe(5 * H);
     expect(await ledgerProblems(USER)).toEqual([]);
+  });
+
+  it('writes and dates Career Milestones, and records the account’s backfill as done', async () => {
+    const raceId = await addRace(USER, { name: 'Six Hours' });
+    const watched = await logStint(USER, raceId, { from: 0, to: 6 * H, watchedAt: new Date(2026, 3, 1, 20, 0), now: NOW });
+    // As 0.3.2 left it: no new rungs, and no dates on the rest.
+    await prisma.xPTransaction.deleteMany({ where: { userId: USER, dedupeKey: 'milestone:stories6h:1' } });
+    await prisma.milestoneProgress.deleteMany({ where: { userId: USER, metric: { in: ['racesStarted', 'stories6h'] } } });
+    await prisma.milestoneProgress.updateMany({
+      where: { userId: USER },
+      data: { achievedAt: null, achievedPrecision: null, sessionId: null, raceId: null, subjectName: null },
+    });
+    expect(await isCareerBackfillApplied(USER)).toBe(false);
+
+    const report = await recomputeCareer(USER, { now: NOW });
+
+    expect(report).toMatchObject({ careerMilestonesReached: 2, careerMilestoneXp: 500 });
+    expect(report.datesFilled).toBeGreaterThan(0);
+    expect(report.datesRecognised).toBeGreaterThan(0);
+    expect(await prisma.milestoneProgress.count({ where: { userId: USER, achievedPrecision: null } })).toBe(0);
+    const sixHours = await prisma.milestoneProgress.findUniqueOrThrow({
+      where: { userId_metric_threshold: { userId: USER, metric: 'stories6h', threshold: 1 } },
+    });
+    expect(sixHours).toMatchObject({
+      reachedAt: NOW, xpAwarded: 500, achievedPrecision: 'STINT', achievedAt: new Date(2026, 3, 1, 20, 0), sessionId: watched.sessionId,
+    });
+    expect(await isCareerBackfillApplied(USER)).toBe(true);
+    expect(await ledgerProblems(USER)).toEqual([]);
+  });
+
+  it('never moves a milestone’s date unless asked, and then only where the replay passes the same test', async () => {
+    const raceId = await addRace(USER, { name: 'Six Hours' });
+    const at = new Date(2026, 3, 1, 20, 0);
+    await logStint(USER, raceId, { from: 0, to: 6 * H, watchedAt: at, now: NOW });
+    const key = (metric: string, threshold: number) => ({ userId_metric_threshold: { userId: USER, metric, threshold } });
+    const story = await prisma.milestoneProgress.findUniqueOrThrow({ where: key('storyCompletes', 1) });
+    expect(story).toMatchObject({ achievedPrecision: 'STINT', achievedAt: at });
+
+    // A date gone wrong, a rung the replay would place after it was recorded,
+    // and a rung history cannot place at all.
+    const wrong = new Date(at.getTime() - 3_600_000);
+    await prisma.milestoneProgress.update({ where: key('storyCompletes', 1), data: { achievedAt: wrong } });
+    const hoursBefore = await prisma.milestoneProgress.update({
+      where: key('realHours', 5),
+      data: { reachedAt: new Date(at.getTime() - 86_400_000), achievedAt: wrong },
+    });
+    const recognised = await prisma.milestoneProgress.findUniqueOrThrow({ where: key('racesCompleted', 1) });
+    expect(recognised.achievedPrecision).toBe('RECOGNISED');
+
+    const plain = await recomputeCareer(USER, { now: NOW });
+    expect(plain.milestoneDatesRebuilt).toBe(0);
+    expect((await prisma.milestoneProgress.findUniqueOrThrow({ where: key('storyCompletes', 1) })).achievedAt).toEqual(wrong);
+
+    const untouched = (await prisma.milestoneProgress.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } }))
+      .filter((row) => !(row.metric === 'storyCompletes' && row.threshold === 1));
+    const rebuilt = await recomputeCareer(USER, { now: NOW, rebuildMilestoneDates: true });
+    // Only the date that had gone wrong moves; the rest already match the replay.
+    expect(rebuilt.milestoneDatesRebuilt).toBe(1);
+    expect(await prisma.milestoneProgress.findUniqueOrThrow({ where: key('storyCompletes', 1) }))
+      .toMatchObject({ achievedAt: at, achievedPrecision: 'STINT' });
+    expect(await prisma.milestoneProgress.findUniqueOrThrow({ where: key('realHours', 5) })).toEqual(hoursBefore);
+    expect(await prisma.milestoneProgress.findUniqueOrThrow({ where: key('racesCompleted', 1) })).toEqual(recognised);
+    expect((await prisma.milestoneProgress.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } }))
+      .filter((row) => !(row.metric === 'storyCompletes' && row.threshold === 1))).toEqual(untouched);
+
+    // A second rebuild finds nothing to move, and writes nothing.
+    const settled = await prisma.milestoneProgress.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } });
+    const again = await recomputeCareer(USER, { now: NOW, rebuildMilestoneDates: true });
+    expect(again.milestoneDatesRebuilt).toBe(0);
+    expect(await prisma.milestoneProgress.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } })).toEqual(settled);
+  });
+
+  it('a rebuild counts only the dates it moves, not the ones the same run has just filled', async () => {
+    const raceId = await addRace(USER, { name: 'Six Hours' });
+    await logStint(USER, raceId, { from: 0, to: 6 * H, watchedAt: new Date(2026, 3, 1, 20, 0), now: NOW });
+    await prisma.milestoneProgress.updateMany({
+      where: { userId: USER },
+      data: { achievedAt: null, achievedPrecision: null, sessionId: null, raceId: null, subjectName: null },
+    });
+
+    const report = await recomputeCareer(USER, { now: NOW, rebuildMilestoneDates: true });
+    expect(report.datesFilled).toBeGreaterThan(0);
+    expect(report.milestoneDatesRebuilt).toBe(0);
   });
 });

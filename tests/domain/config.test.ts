@@ -21,8 +21,8 @@ import {
   MOMENTUM_SHAPE, PRESTIGE_CONFIG, RACE_CARD_STYLES, RACE_TYPE_PRESETS, SEASON_CLOSURE_CONFIG, SEASON_PASS_CONFIG,
   SEASON_PASS_SHAPE, STANDARD_REWARDS, STATS_CONFIG, STORY_CONFIG, STRATEGIST_CONFIG, STRATEGIST_SHAPE, THEMES,
   THEME_ROTATION, DEFAULT_THEME_KEY, DEFAULT_RACE_CARD_KEY, TIMELINE_SHAPE,
-  TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG, careerMilestoneDedupeKey, careerMilestoneMetricKey, careerMilestoneThreshold,
-  careerMilestoneTitle, isMajorMilestone,
+  TWENTY_FOUR_HOUR_CONFIG, XP_CONFIG, careerMilestoneDedupeKey, careerMilestoneMetricKey, careerMilestoneOfRow,
+  careerMilestoneThreshold, careerMilestoneTitle, isMajorMilestone,
 } from '@/lib/config';
 import type { MilestonePrecision, XPSource } from '@/lib/domain/types';
 
@@ -536,6 +536,21 @@ describe('the career milestone catalogue (0.4.0)', () => {
     expect(careerMilestoneTitle(years[0]!)).toContain('in a calendar year');
     expect(isMajorMilestone(years[0]!)).toBe(true);
     expect(isMajorMilestone(CAREER_MILESTONES_BY_ID.get('first-race-started')!)).toBe(false);
+  });
+
+  it('finds the catalogue milestone a stored row is, and a year’s rung by its metric alone', () => {
+    for (const def of CAREER_MILESTONES.filter((candidate) => candidate.metric !== 'realHoursYear')) {
+      expect(careerMilestoneOfRow(def.metric, careerMilestoneThreshold(def))?.def.id).toBe(def.id);
+    }
+    const year = careerMilestoneOfRow('realHoursYear:2027', BUDGET_CONFIG.annualHours);
+    expect(year?.def.id).toBe('year-plan');
+    expect(year?.year).toBe(2027);
+    // Written before a re-balance of the annual hours, it is still that year's rung.
+    expect(careerMilestoneOfRow('realHoursYear:2027', BUDGET_CONFIG.annualHours - 36)?.year).toBe(2027);
+    // Ladder rungs that are not in the catalogue stay with the ladders.
+    expect(careerMilestoneOfRow('sessions', 1)).toBeNull();
+    expect(careerMilestoneOfRow('realHours', 1)).toBeNull();
+    expect(careerMilestoneOfRow('realHoursYearly', 1)).toBeNull();
   });
 
   it('pays the new rungs the modest amounts the economy was checked with', () => {

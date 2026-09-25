@@ -9,14 +9,20 @@
  * reserved for the rare things: a completed 24-hour race, a finished season, a
  * major career milestone. Over-celebrating the ordinary is what turns a hobby
  * into homework.
+ *
+ * What is celebrated, and how loudly, is decided by `celebrationView`: a
+ * NOTABLE stint takes the accent in its heading and its unlocks rise into
+ * view; a major Career Milestone is drawn as a highlighted block rather than a
+ * row. It is all CSS, so the global reduced-motion rule covers it.
  */
 
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowRight, Award, Check, Layers, ListChecks, Ticket, Trophy, Zap } from 'lucide-react';
-import type { SessionOutcome } from '@/lib/engines/contracts';
+import { ArrowRight, Award, Check, Layers, ListChecks, Milestone, Ticket, Trophy, Zap } from 'lucide-react';
+import type { CareerMilestoneUnlock, SessionOutcome } from '@/lib/engines/contracts';
+import { celebrationView } from '@/lib/domain/celebration';
 import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
-import { seasonClosedStintNote } from '@/lib/copy/tone';
+import { precisionLabel, seasonClosedStintNote } from '@/lib/copy/tone';
 import { Panel, RarityBadge, SectorRule, TimingBar } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 import { cn, formatDate, formatHours, formatNumber } from '@/lib/utils';
@@ -28,7 +34,10 @@ export function StintSummary({
   onDismiss?: () => void;
   nextHref?: string;
 }) {
-  const spectacular = outcome.celebrate === 'SPECTACULAR';
+  const view = celebrationView(outcome);
+  const spectacular = view.level === 'SPECTACULAR';
+  const notable = view.level === 'NOTABLE';
+  const highlighted = new Set(view.highlighted);
 
   return (
     <div className={cn('animate-[rise_0.42s_var(--ease-out-quint)_both]', spectacular && 'space-y-4')}>
@@ -47,10 +56,10 @@ export function StintSummary({
             <h2
               className={cn(
                 'font-semibold uppercase tracking-[0.18em]',
-                spectacular ? 'text-lg text-[var(--accent)]' : 'text-sm text-ink-muted',
+                spectacular ? 'text-lg text-[var(--accent)]' : notable ? 'text-sm text-[var(--accent)]' : 'text-sm text-ink-muted',
               )}
             >
-              {outcome.storyCompleted ? 'Story Complete' : outcome.heading}
+              {view.headline}
             </h2>
             <span className="text-xs text-ink-dim">{outcome.raceName}</span>
           </div>
@@ -131,7 +140,29 @@ export function StintSummary({
         {hasUnlocks(outcome) ? (
           <>
             <SectorRule />
-            <div className="space-y-3 px-5 py-4">
+            <div
+              className={cn(
+                'space-y-3 px-5 py-4',
+                (notable || spectacular) && 'animate-[rise_0.42s_var(--ease-out-quint)_0.12s_both]',
+              )}
+            >
+              {view.highlighted.map((milestone) => (
+                <HighlightedMilestone key={`${milestone.id}:${milestone.metric}`} milestone={milestone} />
+              ))}
+
+              <UnlockGroup icon={<Milestone size={12} />} title="Career milestones">
+                {outcome.careerMilestones
+                  .filter((milestone) => !highlighted.has(milestone))
+                  .map((milestone) => (
+                    <UnlockRow
+                      key={`${milestone.id}:${milestone.metric}`}
+                      name={milestone.title}
+                      detail={milestoneWhen(milestone) ?? undefined}
+                      xp={milestone.xpAwarded}
+                    />
+                  ))}
+              </UnlockGroup>
+
               <UnlockGroup icon={<Award size={12} />} title="Achievements">
                 {outcome.achievements.map((a) => (
                   <UnlockRow key={a.key} name={a.name} detail={a.description} xp={a.xpAwarded}>
@@ -157,7 +188,7 @@ export function StintSummary({
                 ))}
               </UnlockGroup>
 
-              <UnlockGroup icon={<Zap size={12} />} title="Milestones">
+              <UnlockGroup icon={<Zap size={12} />} title="Lifetime ladders">
                 {outcome.milestones.map((m) => (
                   <UnlockRow
                     key={`${m.metric}:${m.threshold}`}
@@ -317,8 +348,34 @@ export function milestoneLabel(threshold: number, label: string): string {
   return `${formatNumber(threshold)} ${words.join(' ')}`;
 }
 
+/** How a milestone's moment is known, in the words of the Career Milestones page. */
+function milestoneWhen(milestone: CareerMilestoneUnlock): string | null {
+  const at = milestone.achievedAt ?? milestone.recordedAt;
+  return at === null ? null : precisionLabel(milestone.precision, new Date(at), milestone.subjectName);
+}
+
+/** A major Career Milestone, drawn like the "Season Complete" block rather than as a row. */
+function HighlightedMilestone({ milestone }: { milestone: CareerMilestoneUnlock }) {
+  const when = milestoneWhen(milestone);
+  return (
+    <div className="rounded-md border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-3 py-2.5">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="label flex items-center gap-1.5 text-[var(--accent)]">
+          <Milestone size={11} /> Career milestone
+        </div>
+        {milestone.xpAwarded > 0 ? (
+          <span className="timing shrink-0 text-[0.6875rem] text-ink-dim">+{formatNumber(milestone.xpAwarded)}</span>
+        ) : null}
+      </div>
+      <div className="mt-0.5 text-sm text-ink">{milestone.title}</div>
+      {when ? <div className="mt-0.5 text-xs text-ink-dim">{when}</div> : null}
+    </div>
+  );
+}
+
 function hasUnlocks(outcome: SessionOutcome): boolean {
   return (
+    outcome.careerMilestones.length > 0 ||
     outcome.achievements.length > 0 ||
     outcome.mastery.length > 0 ||
     outcome.challenges.length > 0 ||

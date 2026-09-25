@@ -20,6 +20,7 @@ import type { Tx } from '@/lib/db/client';
 import { replayRace, type RaceHistory } from '@/lib/domain/career-timeline';
 import { storyCompleteBonus } from '@/lib/domain/progression';
 import { syncAchievements, syncMilestones } from './achievement-engine';
+import { fillLandmarkDates, syncCareerMilestones } from './career-milestone-engine';
 import { loadRaceTimelineInputs } from './career-timeline-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from './mastery-engine';
 import { computeCareerMetricsWithHistory } from './metrics';
@@ -118,12 +119,13 @@ export interface RaceEditResync {
  *      it now is and measured against it.
  *   2. The event caches follow it: trees for a new event, and every event's
  *      editions and hours (`ensureMasteryTrees`, `recomputeRaceMasteries`).
- *   3. Only when the runtime did NOT change: mastery nodes, achievements and
- *      milestone ladders are synced. A runtime edit is exactly the edit most
- *      likely to be a typo corrected a minute later, and a landmark can never
- *      be taken back, so after one the landmarks wait for the next stint, as
- *      they did before 0.4.0. Balances followed at step 1, because they can
- *      follow the correction back.
+ *   3. Only when the runtime did NOT change: mastery nodes, achievements,
+ *      milestone ladders and Career Milestones are synced, and any landmark
+ *      still without a date is dated from the replay. A runtime edit is
+ *      exactly the edit most likely to be a typo corrected a minute later,
+ *      and a landmark can never be taken back, so after one the landmarks
+ *      wait for the next stint, as they did before 0.4.0. Balances followed
+ *      at step 1, because they can follow the correction back.
  *
  * So nothing permanent is ever written on the strength of a runtime edit
  * alone: a typo corrected a minute later leaves nothing behind.
@@ -144,10 +146,13 @@ export async function resyncAfterRaceEdit(
 
   if (!options.runtimeChanged) {
     const mastery = await syncMastery(tx, userId, now);
-    const { metrics } = await computeCareerMetricsWithHistory(userId, tx);
+    const { metrics, history } = await computeCareerMetricsWithHistory(userId, tx);
     const achievements = await syncAchievements(tx, userId, metrics, now);
     const milestones = await syncMilestones(tx, userId, metrics, now);
+    const careerMilestones = await syncCareerMilestones(tx, userId, { metrics, history, now });
+    await fillLandmarkDates(tx, userId, { history, now });
     for (const unlock of [...mastery, ...achievements, ...milestones]) xpAwarded += unlock.xpAwarded;
+    xpAwarded += careerMilestones.xpAwarded;
   }
 
   return {

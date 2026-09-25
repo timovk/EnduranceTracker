@@ -24,8 +24,8 @@ export default async function AchievementsPage() {
     <div className="mx-auto max-w-5xl">
       <PageHeader
         eyebrow="Collection"
-        title="Achievements and milestones"
-        description="Achievements are moments. Milestones are the numbers underneath them. Neither can ever be lost."
+        title="Achievements and lifetime ladders"
+        description="Achievements are moments. The lifetime ladders are the numbers underneath them. Neither can ever be lost."
       />
       <AchievementBoardView achievements={achievements} milestones={milestones} />
     </div>

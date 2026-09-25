@@ -47,7 +47,11 @@ export interface CareerMilestoneDef {
   owner: 'ladder' | 'career';
   /** Paid by `syncCareerMilestones` when `owner === 'career'`; 0 = recorded only. */
   xp: number;
-  /** Why `xp` is 0: whoever already pays this moment, in words. */
+  /**
+   * Why `xp` is 0: whoever already pays this moment, in words, written the way
+   * they read mid-sentence ("the Green Flag achievement", "The Archive
+   * achievement"), so a proper name keeps its capital.
+   */
   alsoPaidBy: readonly string[];
   /** Hall of Fame entries the milestone links to. Nothing is minted from here. */
   hallOfFameKeys: readonly string[];
@@ -80,7 +84,7 @@ export const CAREER_MILESTONES: readonly CareerMilestoneDef[] = [
     description: 'The first stint of your first race.',
     metric: 'racesStarted', threshold: 1, kind: 'count', owner: 'career', xp: 0,
     // The same instant as the first stint, which both of these already pay.
-    alsoPaidBy: ['The Green Flag achievement', 'The first viewing-session rung'],
+    alsoPaidBy: ['the Green Flag achievement', 'the first viewing-session rung'],
     hallOfFameKeys: [], celebration: 'none',
   },
   {
@@ -229,21 +233,21 @@ export const CAREER_MILESTONES: readonly CareerMilestoneDef[] = [
     id: 'event-editions-5', group: 'events', title: '5 editions of one recurring event',
     description: 'Five editions of the same recurring event experienced.',
     metric: 'eventEditions', threshold: 5, kind: 'count', owner: 'career', xp: 0,
-    alsoPaidBy: ["That event's own Five Editions Experienced step"],
+    alsoPaidBy: ["that event's own Five Editions Experienced step"],
     hallOfFameKeys: [], celebration: 'none',
   },
   {
     id: 'event-editions-10', group: 'events', title: '10 editions of one recurring event',
     description: 'Ten editions of the same recurring event experienced.',
     metric: 'eventEditions', threshold: 10, kind: 'count', owner: 'career', xp: 0,
-    alsoPaidBy: ["That event's own Ten Editions Experienced step"],
+    alsoPaidBy: ["that event's own Ten Editions Experienced step"],
     hallOfFameKeys: [], celebration: 'notable',
   },
   {
     id: 'event-editions-25', group: 'events', title: '25 editions of one recurring event',
     description: 'Twenty-five editions of the same recurring event experienced.',
     metric: 'eventEditions', threshold: 25, kind: 'count', owner: 'career', xp: 0,
-    alsoPaidBy: ["That event's own Twenty-Five Editions Experienced step"],
+    alsoPaidBy: ["that event's own Twenty-Five Editions Experienced step"],
     hallOfFameKeys: [], celebration: 'notable',
   },
 ];
@@ -285,6 +289,34 @@ export function careerMilestoneTitle(def: CareerMilestoneDef, year?: number): st
 export const CAREER_MILESTONES_BY_ID: ReadonlyMap<string, CareerMilestoneDef> = new Map(
   CAREER_MILESTONES.map((def) => [def.id, def]),
 );
+
+/** Every rung but the year's, by the `metric:threshold` pair it is stored under. */
+const BY_STORED_PAIR: ReadonlyMap<string, CareerMilestoneDef> = new Map(
+  CAREER_MILESTONES
+    .filter((def) => def.metric !== 'realHoursYear')
+    .map((def) => [`${def.metric}:${careerMilestoneThreshold(def)}`, def]),
+);
+
+const YEAR_ROW = /^realHoursYear:(\d{4})$/;
+
+/**
+ * The catalogue milestone a stored `MilestoneProgress` row is, if it is one,
+ * with the year of a year's rung. A year's rung is recognised by its metric
+ * alone, whatever threshold it was reached at, so a row written before the
+ * annual hours were re-balanced is still that year's rung.
+ */
+export function careerMilestoneOfRow(
+  metric: string,
+  threshold: number,
+): { def: CareerMilestoneDef; year?: number } | null {
+  const year = YEAR_ROW.exec(metric);
+  if (year) {
+    const def = CAREER_MILESTONES.find((candidate) => candidate.metric === 'realHoursYear');
+    return def === undefined ? null : { def, year: Number.parseInt(year[1]!, 10) };
+  }
+  const def = BY_STORED_PAIR.get(`${metric}:${threshold}`);
+  return def === undefined ? null : { def };
+}
 
 /** A milestone big enough to be celebrated when it is reached, not only listed. */
 export function isMajorMilestone(def: CareerMilestoneDef): boolean {

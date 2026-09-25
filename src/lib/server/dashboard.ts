@@ -9,6 +9,7 @@
 
 import { prisma } from '@/lib/db/client';
 import { computeCareerMetrics } from '@/lib/engines/metrics';
+import { listRecentCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getStrategist } from '@/lib/engines/strategist-engine';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
@@ -158,7 +159,7 @@ export async function getDashboard(userId: string, now: Date = new Date()): Prom
  * all about what has not.
  */
 async function recentUnlocks(userId: string, limit = 8): Promise<UnlockRowData[]> {
-  const [achievements, mastery, trophies, hallOfFame] = await Promise.all([
+  const [achievements, mastery, trophies, hallOfFame, milestones] = await Promise.all([
     prisma.achievementProgress.findMany({
       where: { userId, unlockedAt: { not: null } },
       orderBy: { unlockedAt: 'desc' },
@@ -186,6 +187,9 @@ async function recentUnlocks(userId: string, limit = 8): Promise<UnlockRowData[]
       take: limit,
       select: { key: true, title: true, subtitle: true, rarity: true, occurredAt: true },
     }),
+    // Career Milestones are the major permanent moments, so they belong on
+    // this shelf, dated when they happened.
+    listRecentCareerMilestones(userId, limit),
   ]);
 
   const rows: UnlockRowData[] = [
@@ -226,6 +230,15 @@ async function recentUnlocks(userId: string, limit = 8): Promise<UnlockRowData[]
       rarity: row.rarity,
       at: row.occurredAt.toISOString(),
       href: '/hall-of-fame',
+    })),
+    ...milestones.map((row) => ({
+      key: `milestone:${row.key}`,
+      kind: 'milestone' as const,
+      name: row.title,
+      detail: row.subjectName === null ? 'Career milestone' : `Career milestone · ${row.subjectName}`,
+      rarity: null,
+      at: row.date.toISOString(),
+      href: '/career/milestones',
     })),
   ];
 

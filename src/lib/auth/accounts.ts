@@ -17,6 +17,7 @@ import { ensureCareer } from '@/lib/server/bootstrap';
 import { DISPLAY_TITLE_KEY, resolveDisplayTitle } from '@/lib/domain/cosmetics';
 import { markReleaseNotesSeen } from '@/lib/server/whats-new';
 import { markSeasonResetApplied } from '@/lib/server/upgrades/season-reset';
+import { markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 
 export const MAX_ACCOUNT_NAME_LENGTH = 32;
 
@@ -193,6 +194,9 @@ export async function createAccount(input: NewAccountInput): Promise<string> {
   // Nor does it have anything from before 0.3.1 to reset. Marked now so the
   // one-time season reset never runs on it, whenever the server next starts.
   await markSeasonResetApplied(id);
+  // Nor anything recorded before 0.4.0 to backfill: its first stint writes
+  // and dates everything as it happens.
+  await markCareerBackfillApplied(id);
   return id;
 }
 

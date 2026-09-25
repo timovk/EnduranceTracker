@@ -15,11 +15,13 @@ import {
   weeksRemainingInYear, wholeWeeksRemainingInYear, yearPeriod, yearProgress,
 } from '@/lib/domain/periods';
 import {
-  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, EXPIRED_CHALLENGE_NOTE,
-  FORBIDDEN_TONE_WORDS, momentumNote, raceRemovedNotice, RECOMMENDATION_FOOTNOTE, seasonClosedStintNote,
-  seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
-  seasonPassClosedShortNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
+  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, EXPIRED_CHALLENGE_NOTE,
+  FORBIDDEN_TONE_WORDS, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
+  seasonClosedStintNote, seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
+  seasonPassClosedShortNote, stillAheadNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
+  yearToDateFact,
 } from '@/lib/copy/tone';
+import { CAREER_MILESTONES, CAREER_MILESTONES_BY_ID } from '@/lib/config';
 
 describe('viewing weeks', () => {
   it('starts on Monday by default', () => {
@@ -195,6 +197,15 @@ function everyUserFacingString(): string[] {
     strings.push(stillToComeNote(count), stillToComeEmptyNote(count, '7 November 2026'));
   }
   for (const xp of [0, 1, 360, 12_345]) strings.push(raceRemovedNotice('24 Hours of Le Mans', xp));
+  const at = new Date(2030, 5, 14, 21, 47);
+  for (const precision of ['INTERPOLATED', 'STINT', 'RECOGNISED', null] as const) {
+    strings.push(precisionLabel(precision, at, '24 Hours of Le Mans 2030'), precisionLabel(precision, at, null));
+  }
+  for (const seconds of [0, 1_800, 3_600, 5_400, 36 * 3_600, 400 * 3_600]) strings.push(yearToDateFact(2026, seconds));
+  for (const def of CAREER_MILESTONES) if (def.alsoPaidBy.length > 0) strings.push(celebratedBy(def.alsoPaidBy));
+  for (const [value, target] of [[0, 1], [0.4, 100], [212.7, 250], [9, 10]] as const) {
+    strings.push(stillAheadNote(value, target, 'hours'), stillAheadNote(value, target, 'count'));
+  }
   return strings;
 }
 
@@ -267,6 +278,55 @@ describe('tone', () => {
     );
     // Nothing to take back, nothing to mention.
     expect(raceRemovedNotice('6 Hours of Spa', 0)).toBe('6 Hours of Spa was removed from the library.');
+  });
+
+  it('says how exactly a milestone’s moment is known, and never claims more', () => {
+    const at = new Date(2030, 5, 14, 21, 47);
+    // An interpolated time rests on when the stint was logged: shown to five minutes, and it says so.
+    expect(precisionLabel('INTERPOLATED', at, '24 Hours of Le Mans 2030')).toBe(
+      'Reached around 21:45 on 14 June 2030, during a stint of 24 Hours of Le Mans 2030 '
+        + '(worked out from when the stint was logged)',
+    );
+    expect(precisionLabel('INTERPOLATED', new Date(2030, 5, 14, 23, 58))).toBe(
+      'Reached around 00:00 on 15 June 2030 (worked out from when the stint was logged)',
+    );
+    expect(precisionLabel('STINT', new Date(2030, 5, 14, 21, 50))).toBe('Reached with the stint logged at 21:50 on 14 June 2030');
+    expect(precisionLabel('RECOGNISED', at)).toBe('Recorded on 14 June 2030 (history cannot place it more exactly)');
+    expect(precisionLabel(null, at)).toBe('Recorded on 14 June 2030');
+  });
+
+  it('states the year so far as a fact, with no target in it', () => {
+    expect(yearToDateFact(2026, 36 * 3_600)).toBe('2026 so far: 36 hours');
+    expect(yearToDateFact(2026, 36.6 * 3_600)).toBe('2026 so far: 37 hours');
+    expect(yearToDateFact(2026, 5_400)).toBe('2026 so far: 1.5 hours');
+    expect(yearToDateFact(2026, 3_600)).toBe('2026 so far: 1 hour');
+    expect(yearToDateFact(2026, 0)).toBe('2026 so far: 0 hours');
+    for (const seconds of [0, 3_600, 400 * 3_600]) {
+      expect(yearToDateFact(2026, seconds)).not.toMatch(/left|remaining|of \d|target|still/i);
+    }
+  });
+
+  it('names who celebrates a milestone that pays nothing itself', () => {
+    const payers = (id: string) => CAREER_MILESTONES_BY_ID.get(id)!.alsoPaidBy;
+    expect(celebratedBy(payers('first-race-started'))).toBe(
+      'Celebrated by the Green Flag achievement and the first viewing-session rung.',
+    );
+    // The achievement is called The Archive, and keeps its capital mid-sentence.
+    expect(celebratedBy(payers('hours-2500'))).toBe('Celebrated by The Archive achievement.');
+    expect(celebratedBy(payers('event-editions-5'))).toBe(
+      "Celebrated by that event's own Five Editions Experienced step.",
+    );
+    expect(celebratedBy(['the first rung', 'the second', 'the third'])).toBe(
+      'Celebrated by the first rung, the second and the third.',
+    );
+    expect(celebratedBy([])).toBe('');
+  });
+
+  it('shows a milestone still ahead as where the career stands, never rounded up to it', () => {
+    expect(stillAheadNote(212.7, 250, 'hours')).toBe('Still ahead: 212 of 250 hours');
+    expect(stillAheadNote(249.99, 250, 'hours')).toBe('Still ahead: 249 of 250 hours');
+    expect(stillAheadNote(3, 10, 'count')).toBe('Still ahead: 3 of 10');
+    expect(stillAheadNote(1_234, 2_500, 'hours')).toBe('Still ahead: 1,234 of 2,500 hours');
   });
 
   it('makes even a short stint feel worthwhile', () => {
