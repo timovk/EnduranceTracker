@@ -46,6 +46,9 @@ vi.mock('next/navigation', () => ({
 import { prisma, disconnectDb } from '@/lib/db/client';
 import { createAccount } from '@/lib/auth/accounts';
 import { awardXpStandalone } from '@/lib/engines/xp-ledger';
+import {
+  clearCareerTimelineCache, getCareerTimeline, timelineFingerprint,
+} from '@/lib/engines/career-timeline-engine';
 import { getRaceDetail, listRaces } from '@/lib/server/races';
 import {
   createChampionshipAction,
@@ -173,6 +176,22 @@ describe('a race belongs to the account that added it', () => {
     expect(await prisma.race.count({ where: { id: raceId } })).toBe(1);
   });
 
+  it('deleting a race from the other account takes back no XP', async () => {
+    const raceId = await createRace(alex);
+    const logged = await as(alex, () => logSessionAction(stintForm(raceId, { endTimestamp: '06:00:00' })));
+    expect(logged.ok, logged.message).toBe(true);
+    const before = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: alex } });
+    const rowsBefore = await prisma.xPTransaction.count({ where: { userId: alex } });
+
+    const result = await as(sam, () => deleteRaceAction(raceId));
+
+    expect(result).toEqual({ ok: false, message: 'That race is no longer in the library.' });
+    const after = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: alex } });
+    expect(after.careerXp).toBe(before.careerXp);
+    expect(await prisma.xPTransaction.count({ where: { userId: alex } })).toBe(rowsBefore);
+    expect(await prisma.raceViewingSession.count({ where: { raceId } })).toBe(1);
+  });
+
   it('says it is gone rather than saying it is forbidden', async () => {
     // The tone rule applies here too. To Sam, Alex's race genuinely is not in
     // the library — there is nothing to explain and nobody to accuse.
@@ -225,6 +244,44 @@ describe('a stint belongs to the account that watched it', () => {
     expect(await prisma.xPTransaction.count({ where: { userId: alex } })).toBeGreaterThan(0);
     expect(await prisma.xPTransaction.count({ where: { userId: sam } })).toBe(0);
     expect(await prisma.watchedInterval.count({ where: { race: { userId: sam } } })).toBe(0);
+  });
+});
+
+describe('a career replay belongs to one account', () => {
+  it('the career-timeline cache never serves another account', async () => {
+    clearCareerTimelineCache();
+    const alexRace = await createRace(alex, { name: 'Alex Only' });
+    await as(alex, () => logSessionAction(stintForm(alexRace)));
+
+    const alexTimeline = await getCareerTimeline(alex);
+    const samTimeline = await getCareerTimeline(sam);
+
+    expect(alexTimeline.stints).toHaveLength(1);
+    expect(samTimeline).not.toBe(alexTimeline);
+    expect(samTimeline.stints).toHaveLength(0);
+    expect(samTimeline.racesById.has(alexRace)).toBe(false);
+  });
+
+  it('the timeline fingerprint changes only with this account’s data', async () => {
+    const samRace = await createRace(sam);
+    const alexBefore = await timelineFingerprint(alex);
+    const samBefore = await timelineFingerprint(sam);
+
+    // Everything the fingerprint watches, written to Alex's account: a race,
+    // a stint, a championship, and an event — made by the stint, then renamed.
+    const alexRace = await createRace(alex, { iconicKey: 'alex-event' });
+    await as(alex, () => logSessionAction(stintForm(alexRace)));
+    await as(alex, () => createChampionshipAction(form({ name: 'Alex Endurance Cup' })));
+    await prisma.raceMastery.update({
+      where: { userId_key: { userId: alex, key: 'alex-event' } },
+      data: { displayName: 'Alex’s Event' },
+    });
+
+    expect(await timelineFingerprint(alex)).not.toBe(alexBefore);
+    expect(await timelineFingerprint(sam)).toBe(samBefore);
+
+    await as(sam, () => logSessionAction(stintForm(samRace)));
+    expect(await timelineFingerprint(sam)).not.toBe(samBefore);
   });
 });
 

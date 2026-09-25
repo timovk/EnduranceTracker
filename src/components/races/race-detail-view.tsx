@@ -179,7 +179,12 @@ export function RaceDetailView({
               ) : null}
 
               <div className="grid grid-cols-2 gap-x-5 gap-y-3 border-t border-hairline pt-4 sm:grid-cols-4">
-                <Stat label="Real viewing" value={formatDuration(race.realViewingSec)} size="sm" tone="muted" />
+                <Stat
+                  label="Real viewing"
+                  value={formatDuration(race.creditedViewingSec ?? race.realViewingSec)}
+                  size="sm"
+                  tone="muted"
+                />
                 <Stat label="Timeline played" value={formatDuration(race.timelineWatchedSec)} size="sm" tone="muted" />
                 <Stat label="Sessions" value={formatNumber(race.sessionCount)} size="sm" tone="muted" />
                 <Stat
@@ -230,7 +235,7 @@ export function RaceDetailView({
                     <Badge tone="outline">{session.playbackSpeed}×</Badge>
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.6875rem] text-ink-dim">
-                    <span>Real viewing <span className="timing text-ink-muted">{formatDuration(session.realSeconds, { seconds: true })}</span></span>
+                    <span>Real viewing <span className="timing text-ink-muted">{formatDuration(session.creditedSeconds, { seconds: true })}</span></span>
                     <span>Timeline <span className="timing text-ink-muted">{formatDuration(session.timelineSeconds, { seconds: true })}</span></span>
                     {session.newCoverageSeconds < session.timelineSeconds ? (
                       <span title="Re-watched sections count towards your viewing time, but the race is only ever counted as watched once.">
@@ -282,9 +287,18 @@ export function RaceDetailView({
       <div className="flex justify-end">
         <form
           action={async () => {
-            if (!confirm(`Remove ${race.name} from the library? Its viewing history goes with it.`)) return;
-            await deleteRaceAction(race.id);
-            router.push('/races');
+            if (!confirm(
+              `Remove ${race.name} from the library? Its viewing history goes with it, and so does the XP it ` +
+                'earned — viewing and Story Complete. Achievements and milestones you reached stay.',
+            )) return;
+            const result = await deleteRaceAction(race.id);
+            if (!result.ok || !result.data) {
+              setNotice(result.message ?? 'That race is no longer in the library.');
+              return;
+            }
+            // The library says what went with it, once.
+            const params = new URLSearchParams({ removed: result.data.raceName, xp: String(result.data.xpRemoved) });
+            router.push(`/races?${params.toString()}`);
           }}
         >
           <Button type="submit" variant="ghost" size="sm" className="text-ink-faint">

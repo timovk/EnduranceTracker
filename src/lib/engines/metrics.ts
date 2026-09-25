@@ -11,11 +11,23 @@
 
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
-import { STORY_CONFIG } from '@/lib/config';
+import { MASTERY_SHAPE, STORY_CONFIG } from '@/lib/config';
+import { creditedSeconds, isRaceExperienced } from '@/lib/domain/career-timeline';
+import { editionIdentityOf, longestConsecutiveRun } from '@/lib/domain/edition';
+import {
+  loadTimelineSessions,
+  TIMELINE_RACE_SELECT,
+  toTimelineRaceRow,
+  type TimelineInputs,
+} from './career-timeline-engine';
 
 export interface CareerMetrics {
   // -- Time ----------------------------------------------------------------
-  /** Real-world hours in front of the screen, including re-watches. */
+  /**
+   * Real-world hours in front of the screen, including re-watches, credited
+   * the way XP credits them: a stint played slower than 0.75× counts no more
+   * than its timeline at 0.75× (`creditedSeconds`).
+   */
   realHours: number;
   /** Unique race-timeline hours covered. Re-watching does not increase this. */
   timelineHours: number;
@@ -28,8 +40,14 @@ export interface CareerMetrics {
   racesCompleted: number;
   storyCompletes: number;
   racesAbandoned: number;
+  /**
+   * Races experienced rather than glimpsed: ten credited minutes and a tenth
+   * of the race (or an hour of it) covered — `isRaceExperienced`.
+   */
+  racesExperienced: number;
 
   // -- Long races ----------------------------------------------------------
+  stories6h: number;
   stories8h: number;
   stories10h: number;
   stories12h: number;
@@ -47,8 +65,11 @@ export interface CareerMetrics {
 
   // -- Sessions ------------------------------------------------------------
   sessions: number;
+  /** The longest stint, in credited hours. */
   longestSessionHours: number;
+  /** Credited minutes per stint. */
   averageSessionMinutes: number;
+  /** Timeline played over real time spent: about playback, so not credited. */
   averagePlaybackSpeed: number;
   maxSessionsForOneStory: number;
   puristStories: number;
@@ -73,8 +94,12 @@ export interface CareerMetrics {
   hallOfFameEntries: number;
 
   // -- Recurring events ----------------------------------------------------
+  /** The longest run of consecutive years with a Story Complete edition, in one event. */
   longestConsecutiveEditions: number;
+  /** The most Story Complete editions of one event. Two races of one year are one edition. */
   maxEditionsOfOneEvent: number;
+  /** The most experienced editions of one event. */
+  maxEditionsExperiencedOfOneEvent: number;
 
   // -- Kind little counters ------------------------------------------------
   /** Times a race was picked back up after a break of 30+ days. */
@@ -84,7 +109,8 @@ export interface CareerMetrics {
 const EMPTY: CareerMetrics = {
   realHours: 0, timelineHours: 0, playedTimelineHours: 0,
   racesInLibrary: 0, racesStarted: 0, racesCompleted: 0, storyCompletes: 0, racesAbandoned: 0,
-  stories8h: 0, stories10h: 0, stories12h: 0, stories24h: 0, majorEventStories: 0,
+  racesExperienced: 0,
+  stories6h: 0, stories8h: 0, stories10h: 0, stories12h: 0, stories24h: 0, majorEventStories: 0,
   championships: 0, championshipsCompleted: 0, seasonsCompleted: 0, seasonsStoryComplete: 0,
   circuits: 0, countries: 0, distinctRaceTypesStoried: 0,
   sessions: 0, longestSessionHours: 0, averageSessionMinutes: 0, averagePlaybackSpeed: 1,
@@ -93,12 +119,22 @@ const EMPTY: CareerMetrics = {
   currentStreakDays: 0, longestStreakDays: 0, lifetimeActiveDays: 0, lifetimeActiveWeeks: 0,
   achievementsUnlocked: 0, masteryNodesUnlocked: 0, masteryTreesCompleted: 0,
   seasonPassesCompleted: 0, challengesCompleted: 0, trophies: 0, hallOfFameEntries: 0,
-  longestConsecutiveEditions: 0, maxEditionsOfOneEvent: 0, longBreakReturns: 0,
+  longestConsecutiveEditions: 0, maxEditionsOfOneEvent: 0, maxEditionsExperiencedOfOneEvent: 0,
+  longBreakReturns: 0,
 };
 
 export function emptyMetrics(): CareerMetrics {
   return { ...EMPTY };
 }
+
+/**
+ * The race fields the metrics read, besides what the replay reads. One query
+ * selects both (`computeCareerMetricsWithHistory`).
+ */
+const METRICS_RACE_SELECT = {
+  status: true, coverageSec: true, storyCompletedAt: true, startedAt: true,
+  sessionCount: true, avgPlaybackSpeed: true,
+} as const;
 
 /**
  * Compute every lifetime metric for a user.
@@ -113,29 +149,28 @@ export function emptyMetrics(): CareerMetrics {
  * milestone would then be evaluated one session behind.
  */
 export async function computeCareerMetrics(userId: string, db: Tx = prisma): Promise<CareerMetrics> {
-  const [races, sessionAgg, sessions, profile, counts, seasons, masteryTrees, passes] =
+  return (await computeCareerMetricsWithHistory(userId, db)).metrics;
+}
+
+/**
+ * The lifetime metrics, and the career history they were computed from.
+ *
+ * The stint path needs both — the metrics for achievements and milestones,
+ * the history for everything dated from the replay — and both come from the
+ * same two reads: every stint, and every race with the union of the fields
+ * the metrics and the replay need. Nothing is read twice.
+ */
+export async function computeCareerMetricsWithHistory(
+  userId: string,
+  db: Tx = prisma,
+): Promise<{ metrics: CareerMetrics; history: TimelineInputs }> {
+  const [raceRows, sessions, profile, counts, seasons, masteryTrees, passes] =
     await Promise.all([
       db.race.findMany({
         where: { userId },
-        select: {
-          id: true, status: true, runtimeSec: true, coverageSec: true, realViewingSec: true,
-          timelineWatchedSec: true, storyCompletedAt: true, completedAt: true, startedAt: true,
-          isMajorEvent: true, iconicKey: true, circuitSlug: true, country: true, raceType: true,
-          championshipId: true, seasonId: true, sessionCount: true, avgPlaybackSpeed: true,
-          raceDate: true,
-        },
+        select: { ...TIMELINE_RACE_SELECT, ...METRICS_RACE_SELECT },
       }),
-      db.raceViewingSession.aggregate({
-        where: { userId },
-        _sum: { realSeconds: true, timelineSeconds: true },
-        _max: { realSeconds: true },
-        _count: true,
-      }),
-      db.raceViewingSession.findMany({
-        where: { userId },
-        select: { raceId: true, watchedAt: true, realSeconds: true },
-        orderBy: { watchedAt: 'asc' },
-      }),
+      loadTimelineSessions(db, userId),
       db.careerProfile.findUnique({ where: { userId } }),
       Promise.all([
         db.achievementProgress.count({ where: { userId, unlockedAt: { not: null } } }),
@@ -159,35 +194,71 @@ export async function computeCareerMetrics(userId: string, db: Tx = prisma): Pro
       db.seasonPass.findMany({ where: { userId }, select: { tier: true } }),
     ]);
 
+  const races = raceRows.map((row) => ({ row, timeline: toTimelineRaceRow(row) }));
   const m = emptyMetrics();
   const [achievementsUnlocked, masteryNodesUnlocked, challengesCompleted, trophies, hofEntries, championshipCount] = counts;
 
-  m.realHours = round1((sessionAgg._sum.realSeconds ?? 0) / 3600);
-  m.playedTimelineHours = round1((sessionAgg._sum.timelineSeconds ?? 0) / 3600);
-  m.sessions = sessionAgg._count;
-  m.longestSessionHours = round2((sessionAgg._max.realSeconds ?? 0) / 3600);
-  m.averageSessionMinutes = m.sessions === 0 ? 0 : round1((sessionAgg._sum.realSeconds ?? 0) / m.sessions / 60);
-  m.averagePlaybackSpeed =
-    (sessionAgg._sum.realSeconds ?? 0) > 0
-      ? round2((sessionAgg._sum.timelineSeconds ?? 0) / (sessionAgg._sum.realSeconds ?? 1))
-      : 1;
+  // Every hour figure is credited time, the way XP credits it. Playback speed
+  // is the one exception: it is about how the timeline was played, so it keeps
+  // real seconds.
+  let credited = 0;
+  let longest = 0;
+  let real = 0;
+  let timeline = 0;
+  const creditedByRace = new Map<string, number>();
+  for (const session of sessions) {
+    const stint = creditedSeconds(session);
+    credited += stint;
+    longest = Math.max(longest, stint);
+    real += session.realSeconds;
+    timeline += session.timelineSeconds;
+    creditedByRace.set(session.raceId, (creditedByRace.get(session.raceId) ?? 0) + stint);
+  }
+
+  m.realHours = round1(credited / 3600);
+  m.playedTimelineHours = round1(timeline / 3600);
+  m.sessions = sessions.length;
+  m.longestSessionHours = round2(longest / 3600);
+  m.averageSessionMinutes = m.sessions === 0 ? 0 : round1(credited / m.sessions / 60);
+  m.averagePlaybackSpeed = real > 0 ? round2(timeline / real) : 1;
 
   const circuits = new Set<string>();
   const countries = new Set<string>();
   const storiedTypes = new Set<string>();
   const completedChampionships = new Set<string>();
-  const editionsByEvent = new Map<string, number[]>();
+  /** Per event: the distinct Story Complete editions, and the dated years among them. */
+  const storiedEditions = new Map<string, { editions: Set<string>; years: number[] }>();
+  /** Per event: the distinct experienced editions. */
+  const experiencedEditions = new Map<string, Set<string>>();
 
   let timelineSec = 0;
   m.racesInLibrary = races.length;
 
-  for (const race of races) {
-    timelineSec += Math.min(race.coverageSec, race.runtimeSec);
+  for (const { row: race, timeline: replayRow } of races) {
+    const coverageSec = Math.min(race.coverageSec, race.runtimeSec);
+    timelineSec += coverageSec;
     const storied = race.storyCompletedAt !== null;
     const completed = storied || race.status === 'COMPLETED';
+    const experienced = isRaceExperienced({
+      coverageSec,
+      runtimeSec: race.runtimeSec,
+      creditedSec: creditedByRace.get(race.id) ?? 0,
+    });
+    // Events are grouped the way the replay groups them, so a figure here and
+    // the same figure on a history page can never disagree.
+    const eventKey = replayRow.eventKey;
+    const edition = editionIdentityOf(race.id, replayRow.editionYear);
 
     if (race.startedAt !== null) m.racesStarted += 1;
     if (race.status === 'ABANDONED') m.racesAbandoned += 1;
+    if (experienced) {
+      m.racesExperienced += 1;
+      if (eventKey !== null) {
+        const editions = experiencedEditions.get(eventKey) ?? new Set<string>();
+        editions.add(edition);
+        experiencedEditions.set(eventKey, editions);
+      }
+    }
     if (completed) {
       m.racesCompleted += 1;
       if (race.circuitSlug) circuits.add(race.circuitSlug);
@@ -198,18 +269,19 @@ export async function computeCareerMetrics(userId: string, db: Tx = prisma): Pro
       m.storyCompletes += 1;
       storiedTypes.add(race.raceType);
       const hours = race.runtimeSec / 3600;
-      if (hours >= 7.5) m.stories8h += 1;
-      if (hours >= 9.5) m.stories10h += 1;
-      if (hours >= 11.5) m.stories12h += 1;
-      if (hours >= 23) m.stories24h += 1;
+      if (hours >= MASTERY_SHAPE.stories6hMinHours) m.stories6h += 1;
+      if (hours >= MASTERY_SHAPE.stories8hMinHours) m.stories8h += 1;
+      if (hours >= MASTERY_SHAPE.stories10hMinHours) m.stories10h += 1;
+      if (hours >= MASTERY_SHAPE.stories12hMinHours) m.stories12h += 1;
+      if (hours >= MASTERY_SHAPE.stories24hMinHours) m.stories24h += 1;
       if (race.isMajorEvent) m.majorEventStories += 1;
       if (race.sessionCount > m.maxSessionsForOneStory) m.maxSessionsForOneStory = race.sessionCount;
       if (Math.abs(race.avgPlaybackSpeed - 1) < 0.02) m.puristStories += 1;
-      if (race.iconicKey) {
-        const year = race.raceDate?.getFullYear();
-        const list = editionsByEvent.get(race.iconicKey) ?? [];
-        if (year !== undefined) list.push(year);
-        editionsByEvent.set(race.iconicKey, list);
+      if (eventKey !== null) {
+        const event = storiedEditions.get(eventKey) ?? { editions: new Set<string>(), years: [] };
+        event.editions.add(edition);
+        if (replayRow.editionYear !== null) event.years.push(replayRow.editionYear);
+        storiedEditions.set(eventKey, event);
       }
     }
   }
@@ -230,9 +302,12 @@ export async function computeCareerMetrics(userId: string, db: Tx = prisma): Pro
     if (storiedRaces >= target) m.seasonsStoryComplete += 1;
   }
 
-  for (const [, years] of editionsByEvent) {
-    m.maxEditionsOfOneEvent = Math.max(m.maxEditionsOfOneEvent, years.length);
-    m.longestConsecutiveEditions = Math.max(m.longestConsecutiveEditions, longestRun(years));
+  for (const event of storiedEditions.values()) {
+    m.maxEditionsOfOneEvent = Math.max(m.maxEditionsOfOneEvent, event.editions.size);
+    m.longestConsecutiveEditions = Math.max(m.longestConsecutiveEditions, longestRun(event.years));
+  }
+  for (const editions of experiencedEditions.values()) {
+    m.maxEditionsExperiencedOfOneEvent = Math.max(m.maxEditionsExperiencedOfOneEvent, editions.size);
   }
 
   m.masteryNodesUnlocked = masteryNodesUnlocked;
@@ -258,19 +333,12 @@ export async function computeCareerMetrics(userId: string, db: Tx = prisma): Pro
 
   m.longBreakReturns = countLongBreakReturns(sessions);
 
-  return m;
+  return { metrics: m, history: { sessions, races: races.map((race) => race.timeline) } };
 }
 
-/** Longest run of consecutive integers in a list of years. */
+/** Longest run of consecutive integers in a list of years. Repeats count once. */
 export function longestRun(years: readonly number[]): number {
-  const unique = [...new Set(years)].sort((a, b) => a - b);
-  let best = 0;
-  let run = 0;
-  for (let i = 0; i < unique.length; i += 1) {
-    run = i > 0 && unique[i]! === unique[i - 1]! + 1 ? run + 1 : 1;
-    best = Math.max(best, run);
-  }
-  return best;
+  return longestConsecutiveRun(years)?.length ?? 0;
 }
 
 /**

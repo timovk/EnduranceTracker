@@ -34,7 +34,9 @@
  *   4. REAL TIME AND TIMELINE TIME ARE DIFFERENT QUANTITIES. `realHours` is
  *      wall-clock time in front of the screen and grows when a section is
  *      re-watched; the edition counts are about unique coverage and do not.
- *      They are never added together or swapped for one another.
+ *      They are never added together or swapped for one another. Since 0.4.0
+ *      real time is credited the way XP credits it (`creditedSeconds`), so a
+ *      stint logged at 0.1× cannot make ten hours out of one.
  *
  * The write paths (`ensureMasteryTrees`, `syncMastery`,
  * `recomputeRaceMasteries`) take the caller's transaction client so that one
@@ -42,12 +44,13 @@
  * read-only and use the global client.
  */
 
-import { MAJOR_EVENT_SUGGESTIONS, MASTERY_CONFIG, MASTERY_SHAPE } from '@/lib/config';
+import { EVENT_SHAPE, MAJOR_EVENT_SUGGESTIONS, MASTERY_CONFIG, MASTERY_SHAPE } from '@/lib/config';
 import { createManySkippingDuplicates, prisma, type Tx } from '@/lib/db/client';
+import { isRaceExperienced } from '@/lib/domain/career-timeline';
+import { editionIdentityOf, editionYear, longestConsecutiveRun } from '@/lib/domain/edition';
 import { RARITY_ORDER, type MasteryKind, type Rarity, type RaceStatus } from '@/lib/domain/types';
 import type { MasteryUnlock } from '@/lib/engines/contracts';
-import { longestRun } from '@/lib/engines/metrics';
-import { awardXp } from '@/lib/engines/xp-ledger';
+import { awardXp, type XpAward } from '@/lib/engines/xp-ledger';
 
 // ---------------------------------------------------------------------------
 // Tree identity and presentation vocabulary
@@ -130,7 +133,10 @@ export interface MasteryRaceInput {
   iconicKey: string | null;
   circuitSlug: string | null;
   runtimeSec: number;
-  /** Wall-clock seconds watched, re-watches included. */
+  /**
+   * Credited real seconds watched, re-watches included: wall-clock time, but
+   * never more than the timeline at the slowest speed XP credits.
+   */
   realViewingSec: number;
   /** Timeline seconds played, re-watches included. A different quantity. */
   timelineWatchedSec: number;
@@ -139,6 +145,14 @@ export interface MasteryRaceInput {
   storyComplete: boolean;
   /** Story Complete, or marked finished by hand. */
   completed: boolean;
+  /**
+   * Experienced rather than glimpsed (`isRaceExperienced`). Optional so a
+   * fixture can leave it out; it then follows `storyComplete`, since a
+   * complete story has certainly been experienced.
+   */
+  experienced?: boolean;
+  /** The race's name, for the event pages. */
+  name?: string;
   /** The year this edition belongs to, when it is known. */
   year: number | null;
 }
@@ -179,8 +193,13 @@ export interface MasteryMetrics {
   circuits: number;
   /** Distinct championships among Story Completed races. */
   championships: number;
-  /** Story Completed races belonging to a recurring event. */
+  /**
+   * Story Complete editions of recurring events. Two races of one event in the
+   * same year are one edition; an undated race is an edition of its own.
+   */
   editionsStoryComplete: number;
+  /** Experienced editions of recurring events, counted the same way. */
+  editionsExperienced: number;
   /** Longest run of consecutive years with a Story Complete edition. */
   consecutiveEditions: number;
 }
@@ -195,6 +214,7 @@ const EMPTY_METRICS: MasteryMetrics = {
   circuits: 0,
   championships: 0,
   editionsStoryComplete: 0,
+  editionsExperienced: 0,
   consecutiveEditions: 0,
 };
 
@@ -215,6 +235,9 @@ function computeMetrics(
   const circuits = new Set<string>();
   const championships = new Set<string>();
   const editionYears = new Map<string, number[]>();
+  /** Editions as `event|identity`, so two events' 2026 editions stay two. */
+  const storiedEditions = new Set<string>();
+  const experiencedEditions = new Set<string>();
   const racesBySeason = new Map<string, MasteryRaceInput[]>();
 
   const metrics: MasteryMetrics = { ...EMPTY_METRICS };
@@ -235,6 +258,9 @@ function computeMetrics(
     // marked done by hand still puts its circuit on the map.
     if (race.completed && race.circuitSlug !== null) circuits.add(race.circuitSlug);
 
+    const edition = race.iconicKey !== null ? `${race.iconicKey}|${editionIdentityOf(race.id, race.year)}` : null;
+    if (edition !== null && (race.experienced ?? race.storyComplete)) experiencedEditions.add(edition);
+
     if (!race.storyComplete) continue;
 
     metrics.storyCompletes += 1;
@@ -245,8 +271,8 @@ function computeMetrics(
     if (hours >= MASTERY_SHAPE.stories12hMinHours) metrics.stories12h += 1;
     if (hours >= MASTERY_SHAPE.stories24hMinHours) metrics.stories24h += 1;
 
-    if (race.iconicKey !== null) {
-      metrics.editionsStoryComplete += 1;
+    if (race.iconicKey !== null && edition !== null) {
+      storiedEditions.add(edition);
       const years = editionYears.get(race.iconicKey);
       if (years) {
         if (race.year !== null) years.push(race.year);
@@ -259,6 +285,8 @@ function computeMetrics(
   metrics.realHours = round1(realSeconds / 3600);
   metrics.circuits = circuits.size;
   metrics.championships = championships.size;
+  metrics.editionsStoryComplete = storiedEditions.size;
+  metrics.editionsExperienced = experiencedEditions.size;
 
   for (const season of seasons) {
     const seasonRaces = racesBySeason.get(season.id) ?? [];
@@ -278,7 +306,7 @@ function computeMetrics(
   // streak you have going anywhere", which is what the career metric of the
   // same name means too.
   for (const years of editionYears.values()) {
-    metrics.consecutiveEditions = Math.max(metrics.consecutiveEditions, longestRun(years));
+    metrics.consecutiveEditions = Math.max(metrics.consecutiveEditions, longestConsecutiveRun(years)?.length ?? 0);
   }
 
   return metrics;
@@ -328,12 +356,16 @@ function metricValue(metrics: MasteryMetrics, metric: string): number {
 
 interface RaceRow {
   id: string;
+  name: string;
   championshipId: string | null;
   seasonId: string | null;
   iconicKey: string | null;
   circuitSlug: string | null;
   runtimeSec: number;
+  coverageSec: number;
   realViewingSec: number;
+  /** Null only until the 0.4.0 upgrade has filled it; real seconds stand in until then. */
+  creditedViewingSec: number | null;
   timelineWatchedSec: number;
   isMajorEvent: boolean;
   status: RaceStatus;
@@ -346,36 +378,39 @@ interface MasteryInputs {
   seasons: MasterySeasonInput[];
 }
 
-/**
- * Which year an edition belongs to.
- *
- * The race's own date is authoritative. When it is missing — and it often is,
- * because nothing is imported and the user types what they feel like typing —
- * the season it was filed under supplies the year instead. An edition without
- * a date still happened in a year, and refusing to count it would quietly
- * break a consecutive-editions run on a technicality of data entry.
- */
-function editionYear(race: { raceDate: Date | null; seasonId: string | null }, seasonYears: Map<string, number>): number | null {
-  if (race.raceDate !== null) return race.raceDate.getFullYear();
-  if (race.seasonId !== null) return seasonYears.get(race.seasonId) ?? null;
-  return null;
-}
-
-function toRaceInput(row: RaceRow, seasonYears: Map<string, number>): MasteryRaceInput {
+function toRaceInput(row: RaceRow, seasonYears: ReadonlyMap<string, number>): MasteryRaceInput {
   const storyComplete = row.storyCompletedAt !== null;
+  const creditedSec = row.creditedViewingSec ?? row.realViewingSec;
   return {
     id: row.id,
+    name: row.name,
     championshipId: row.championshipId,
     seasonId: row.seasonId,
     iconicKey: row.iconicKey,
     circuitSlug: row.circuitSlug,
     runtimeSec: row.runtimeSec,
-    realViewingSec: row.realViewingSec,
+    realViewingSec: creditedSec,
     timelineWatchedSec: row.timelineWatchedSec,
     isMajorEvent: row.isMajorEvent,
     storyComplete,
     completed: storyComplete || row.status === 'COMPLETED',
-    year: editionYear(row, seasonYears),
+    experienced: storyComplete || isRaceExperienced({
+      coverageSec: Math.min(row.coverageSec, row.runtimeSec),
+      runtimeSec: row.runtimeSec,
+      creditedSec,
+    }),
+    // Which year the edition belongs to (`domain/edition`). The race's own
+    // date is authoritative, by its UTC year: `raceDate` is stored as UTC
+    // midnight of the day the user typed, so a local year would move
+    // 1 January back into the year before west of Greenwich. When the date is
+    // missing — and it often is, because nothing is imported and the user
+    // types what they feel like typing — the season it was filed under
+    // supplies the year instead, so an undated edition does not break a
+    // consecutive-editions run on a technicality of data entry.
+    year: editionYear({
+      raceDate: row.raceDate,
+      seasonYear: row.seasonId !== null ? (seasonYears.get(row.seasonId) ?? null) : null,
+    }),
   };
 }
 
@@ -385,15 +420,22 @@ function toRaceInput(row: RaceRow, seasonYears: Map<string, number>): MasteryRac
  * `db` MUST be the active transaction client when this runs inside a logged
  * session, or the session that was just written would be invisible and every
  * tree would be evaluated one stint behind.
+ *
+ * Both reads are flat, and a season's year is joined from the second in
+ * memory rather than selected through the race's relation. The stint summary
+ * reads this through the global client while the stint's transaction is still
+ * open (`getMasteryForChampionship`), and Prisma runs a relation select over a
+ * large library as several statements inside a transaction of its own — one
+ * that would wait for the stint's transaction, which is waiting for it.
  */
 async function loadMasteryInputs(db: Tx, userId: string): Promise<MasteryInputs> {
   const [raceRows, seasonRows] = await Promise.all([
     db.race.findMany({
       where: { userId },
       select: {
-        id: true, championshipId: true, seasonId: true, iconicKey: true, circuitSlug: true,
-        runtimeSec: true, realViewingSec: true, timelineWatchedSec: true, isMajorEvent: true,
-        status: true, storyCompletedAt: true, raceDate: true,
+        id: true, name: true, championshipId: true, seasonId: true, iconicKey: true, circuitSlug: true,
+        runtimeSec: true, coverageSec: true, realViewingSec: true, creditedViewingSec: true,
+        timelineWatchedSec: true, isMajorEvent: true, status: true, storyCompletedAt: true, raceDate: true,
       },
     }),
     db.championshipSeason.findMany({
@@ -403,7 +445,6 @@ async function loadMasteryInputs(db: Tx, userId: string): Promise<MasteryInputs>
   ]);
 
   const seasonYears = new Map(seasonRows.map((season) => [season.id, season.year]));
-
   return {
     races: raceRows.map((row) => toRaceInput(row, seasonYears)),
     seasons: seasonRows.map((season) => ({
@@ -506,8 +547,11 @@ interface DesiredTree {
  * free to invent any key they like — is titled from the key itself rather than
  * from a race name, because race names carry years and an event tree outlives
  * every one of its editions.
+ *
+ * This is the event's own `name`. A name the user gives it is kept apart, in
+ * `RaceMastery.displayName`, and wins wherever the event is shown.
  */
-function eventDisplayName(iconicKey: string): string {
+export function eventDisplayName(iconicKey: string): string {
   for (const suggestion of MAJOR_EVENT_SUGGESTIONS) {
     if (suggestion.key === iconicKey) return suggestion.name;
   }
@@ -526,14 +570,17 @@ function eventDisplayName(iconicKey: string): string {
  * event to somebody whose Le Mans races all sit in WEC. Ties are broken by
  * championship ID so the choice is deterministic and the colour does not
  * wander between runs.
+ *
+ * Null when none of its races is filed under a championship, or it has no
+ * races at the moment, so the caller can keep the colour the tree already has.
  */
 function eventAccent(
   iconicKey: string,
   eventChampionships: Map<string, Map<string, number>>,
   accents: Map<string, string>,
-): string {
+): string | null {
   const counts = eventChampionships.get(iconicKey);
-  if (!counts) return FALLBACK_ACCENT;
+  if (!counts) return null;
 
   let bestId: string | null = null;
   let bestCount = 0;
@@ -543,7 +590,7 @@ function eventAccent(
       bestCount = count;
     }
   }
-  return bestId === null ? FALLBACK_ACCENT : (accents.get(bestId) ?? FALLBACK_ACCENT);
+  return bestId === null ? null : (accents.get(bestId) ?? FALLBACK_ACCENT);
 }
 
 /**
@@ -566,11 +613,17 @@ function eventAccent(
  * economy re-balance is not a reason to take something out of somebody's
  * career.
  *
+ * Events (0.4.0): an event has a tree when any race carries its key or it is
+ * an active event (neither archived nor merged into another), so an event the
+ * user has named is drawn before its first edition is watched. The tree takes
+ * the name the user gave the event. A merged or archived event's tree is left
+ * exactly as it is — never renamed, never removed.
+ *
  * Returns the number of trees CREATED by this call, which is zero on every run
  * after the first until the library grows.
  */
 export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new Date()): Promise<number> {
-  const [championships, iconicRaces, existingTrees] = await Promise.all([
+  const [championships, iconicRaces, events, existingTrees] = await Promise.all([
     tx.championship.findMany({
       where: { userId },
       select: { id: true, name: true, accentColor: true, sortOrder: true },
@@ -579,6 +632,10 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
     tx.race.findMany({
       where: { userId, iconicKey: { not: null } },
       select: { iconicKey: true, championshipId: true },
+    }),
+    tx.raceMastery.findMany({
+      where: { userId },
+      select: { key: true, displayName: true, archivedAt: true, mergedIntoId: true },
     }),
     tx.masteryTree.findMany({
       where: { userId },
@@ -597,6 +654,8 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
   const accents = new Map(championships.map((c) => [c.id, c.accentColor]));
   const eventChampionships = new Map<string, Map<string, number>>();
   const eventKeys = new Set<string>();
+  const eventsByKey = new Map(events.map((event) => [event.key, event]));
+  const existingByKey = new Map(existingTrees.map((tree) => [tree.key, tree]));
 
   for (const race of iconicRaces) {
     const iconicKey = race.iconicKey;
@@ -606,6 +665,9 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
     const counts = eventChampionships.get(iconicKey) ?? new Map<string, number>();
     counts.set(race.championshipId, (counts.get(race.championshipId) ?? 0) + 1);
     eventChampionships.set(iconicKey, counts);
+  }
+  for (const event of events) {
+    if (event.archivedAt === null && event.mergedIntoId === null) eventKeys.add(event.key);
   }
 
   const desired: DesiredTree[] = [
@@ -635,20 +697,24 @@ export async function ensureMasteryTrees(tx: Tx, userId: string, now: Date = new
   }
 
   for (const iconicKey of [...eventKeys].sort()) {
-    const name = eventDisplayName(iconicKey);
+    const event = eventsByKey.get(iconicKey);
+    if (event !== undefined && (event.archivedAt !== null || event.mergedIntoId !== null)) continue;
+    const name = event?.displayName ?? eventDisplayName(iconicKey);
+    const key = eventTreeKey(iconicKey);
     desired.push({
-      key: eventTreeKey(iconicKey),
+      key,
       kind: 'RACE_EVENT',
       name,
       description: `Every edition of ${name} in your library, however many years that comes to.`,
-      accentColor: eventAccent(iconicKey, eventChampionships, accents),
+      accentColor: eventAccent(iconicKey, eventChampionships, accents)
+        ?? existingByKey.get(key)?.accentColor
+        ?? FALLBACK_ACCENT,
       championshipId: null,
       iconicKey,
       nodes: RACE_EVENT_NODES,
     });
   }
 
-  const existingByKey = new Map(existingTrees.map((tree) => [tree.key, tree]));
   let created = 0;
 
   for (const tree of desired) {
@@ -758,7 +824,15 @@ function nodeData(treeId: string, template: MasteryNodeTemplate, index: number) 
  * therefore corrects the event's history rather than leaving it wrong forever.
  *
  * It also keeps `Race.raceMasteryId` pointing at the right row, which is what
- * lets the UI walk from an event straight to its editions.
+ * lets the UI walk from an event straight to its editions. A race still
+ * carrying the key of an event that was merged into another is moved to the
+ * event it was merged into — its `iconicKey` and its link both — by following
+ * the merge chain (`eventKeyResolver`).
+ *
+ * Editions are counted once per year (two races of one year are one edition)
+ * and hours are credited hours. The event's `name` is the one derived from its
+ * key; the name the user gave it (`displayName`) is theirs and never written
+ * here.
  *
  * A `RaceMastery` row whose event no longer has any races is left exactly as
  * it is: emptied counters would read as a record being withdrawn, and nothing
@@ -767,13 +841,17 @@ function nodeData(treeId: string, template: MasteryNodeTemplate, index: number) 
  * Returns the number of events recomputed.
  */
 export async function recomputeRaceMasteries(tx: Tx, userId: string, now: Date = new Date()): Promise<number> {
-  const raceRows = await tx.race.findMany({
-    where: { userId, iconicKey: { not: null } },
-    select: {
-      id: true, iconicKey: true, seasonId: true, raceDate: true, realViewingSec: true,
-      timelineWatchedSec: true, storyCompletedAt: true, raceMasteryId: true,
-    },
-  });
+  const [raceRows, events] = await Promise.all([
+    tx.race.findMany({
+      where: { userId, iconicKey: { not: null } },
+      select: {
+        id: true, iconicKey: true, raceDate: true, realViewingSec: true, creditedViewingSec: true,
+        timelineWatchedSec: true, storyCompletedAt: true, raceMasteryId: true,
+        season: { select: { year: true } },
+      },
+    }),
+    tx.raceMastery.findMany({ where: { userId }, select: { id: true, key: true, mergedIntoId: true } }),
+  ]);
 
   // Races that used to belong to an event and no longer do should not keep
   // pointing at it. Tidying the link is not the same as removing a record —
@@ -785,34 +863,34 @@ export async function recomputeRaceMasteries(tx: Tx, userId: string, now: Date =
 
   if (raceRows.length === 0) return 0;
 
-  const seasonIds = [...new Set(raceRows.map((row) => row.seasonId).filter((id): id is string => id !== null))];
-  const seasonRows = seasonIds.length === 0
-    ? []
-    : await tx.championshipSeason.findMany({ where: { id: { in: seasonIds } }, select: { id: true, year: true } });
-  const seasonYears = new Map(seasonRows.map((season) => [season.id, season.year]));
-
+  const resolve = eventKeyResolver(events);
   const byEvent = new Map<string, typeof raceRows>();
+  const moved = new Map<string, string[]>();
   for (const row of raceRows) {
     if (row.iconicKey === null) continue;
-    const bucket = byEvent.get(row.iconicKey);
-    if (bucket) bucket.push(row);
-    else byEvent.set(row.iconicKey, [row]);
+    const key = resolve(row.iconicKey);
+    if (key !== row.iconicKey) push(moved, key, row.id);
+    push(byEvent, key, row);
+  }
+
+  for (const [key, raceIds] of moved) {
+    await tx.race.updateMany({ where: { id: { in: raceIds }, userId }, data: { iconicKey: key } });
   }
 
   for (const [iconicKey, editions] of byEvent) {
     let totalRealSec = 0;
     let totalTimelineSec = 0;
-    let editionsStoryComplete = 0;
+    const completedEditions = new Set<string>();
     const completedYears: number[] = [];
 
     for (const edition of editions) {
-      totalRealSec += Math.max(0, edition.realViewingSec);
+      totalRealSec += Math.max(0, edition.creditedViewingSec ?? edition.realViewingSec);
       // Timeline seconds PLAYED, the companion figure to real seconds. Unique
       // coverage is a different quantity and is deliberately not summed here.
       totalTimelineSec += Math.max(0, edition.timelineWatchedSec);
       if (edition.storyCompletedAt === null) continue;
-      editionsStoryComplete += 1;
-      const year = editionYear(edition, seasonYears);
+      const year = editionYear({ raceDate: edition.raceDate, seasonYear: edition.season?.year ?? null });
+      completedEditions.add(editionIdentityOf(edition.id, year));
       if (year !== null) completedYears.push(year);
     }
 
@@ -822,12 +900,12 @@ export async function recomputeRaceMasteries(tx: Tx, userId: string, now: Date =
     const figures = {
       name: eventDisplayName(iconicKey),
       editionsTracked: editions.length,
-      editionsStoryComplete,
+      editionsStoryComplete: completedEditions.size,
       totalRealSec,
       totalTimelineSec,
       firstCompletedYear,
       latestCompletedYear,
-      longestConsecutiveEditions: longestRun(completedYears),
+      longestConsecutiveEditions: longestConsecutiveRun(completedYears)?.length ?? 0,
     };
 
     const row = await tx.raceMastery.upsert({
@@ -846,6 +924,34 @@ export async function recomputeRaceMasteries(tx: Tx, userId: string, now: Date =
   }
 
   return byEvent.size;
+}
+
+/**
+ * Where an event key leads once merges are followed.
+ *
+ * A merged event's row keeps its key and points at the event it was merged
+ * into (`mergedIntoId`), which may itself have been merged since. The chain is
+ * followed through this account's own rows only — the column has no foreign
+ * key, so an id is never trusted to lead anywhere else — and at most
+ * `EVENT_SHAPE.maxMergeHops` steps: merging refuses a cycle, and the limit is
+ * the guard in case one ever exists. A key with no row, or a chain that runs
+ * out, stays where it is.
+ */
+function eventKeyResolver(
+  events: readonly { id: string; key: string; mergedIntoId: string | null }[],
+): (key: string) => string {
+  const byKey = new Map(events.map((event) => [event.key, event]));
+  const byId = new Map(events.map((event) => [event.id, event]));
+  return (key) => {
+    let current = byKey.get(key);
+    if (current === undefined) return key;
+    for (let hop = 0; hop < EVENT_SHAPE.maxMergeHops && current.mergedIntoId !== null; hop += 1) {
+      const next = byId.get(current.mergedIntoId);
+      if (next === undefined) break;
+      current = next;
+    }
+    return current.key;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -974,15 +1080,9 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
   const unlocks: MasteryUnlock[] = [];
 
   for (const unlock of pending) {
-    const award = await awardXp(tx, userId, {
-      source: 'MASTERY_NODE',
-      amount: unlock.xpReward,
-      description: `Mastery — ${unlock.treeName}: ${unlock.nodeName}`,
-      sourceRef: `${unlock.treeKey}:${unlock.nodeKey}`,
-      // The structural double-award guard: unique in the database, stable
-      // across re-balances, and the reason re-running this engine is safe.
-      dedupeKey: `mastery:${unlock.treeKey}:${unlock.nodeKey}`,
-    });
+    // A node worth nothing is recorded as unlocked and writes no ledger row.
+    const payment = masteryUnlockAward(unlock);
+    const award = payment === null ? { granted: 0 } : await awardXp(tx, userId, payment);
 
     // Several nodes of one tree can land in a single stint, so tree progress
     // is advanced as each one is granted. Only the node that actually finishes
@@ -1006,6 +1106,32 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
   }
 
   return unlocks.sort(compareUnlocksByImpact);
+}
+
+/**
+ * The ledger entry an unlocked node pays, or null when it pays nothing.
+ *
+ * A node can be worth 0 XP on purpose — a step that is shown and dated but
+ * paid by something else — and a zero-amount row would be a ledger entry for
+ * nothing, so none is written.
+ */
+export function masteryUnlockAward(unlock: {
+  treeKey: string;
+  treeName: string;
+  nodeKey: string;
+  nodeName: string;
+  xpReward: number;
+}): XpAward | null {
+  if (!(unlock.xpReward > 0)) return null;
+  return {
+    source: 'MASTERY_NODE',
+    amount: unlock.xpReward,
+    description: `Mastery — ${unlock.treeName}: ${unlock.nodeName}`,
+    sourceRef: `${unlock.treeKey}:${unlock.nodeKey}`,
+    // The structural double-award guard: unique in the database, stable
+    // across re-balances, and the reason re-running this engine is safe.
+    dedupeKey: `mastery:${unlock.treeKey}:${unlock.nodeKey}`,
+  };
 }
 
 // ---------------------------------------------------------------------------

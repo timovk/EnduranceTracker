@@ -29,6 +29,7 @@ import {
   createSession, requireUserId, signOut, signOutEverywhere,
 } from '@/lib/auth/session';
 import { accentKeyOf, avatarKeyOf } from '@/components/accounts/identity';
+import { clearCareerTimelineCache } from '@/lib/engines/career-timeline-engine';
 import {
   ACCOUNT_GONE_NOTE, PASSWORDS_DIFFER_NOTE, WRONG_PASSWORD_NOTE,
 } from '@/components/accounts/copy';
@@ -209,6 +210,8 @@ export async function deleteAccountAction(form: FormData): Promise<ActionResult>
   }
 
   await deleteAccount(userId);
+  // The career went with it, so its replay is no use to anyone now.
+  clearCareerTimelineCache(userId);
   // The cascade has already taken the session row; this clears the cookie
   // that still points at it.
   await signOut();

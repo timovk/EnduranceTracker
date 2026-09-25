@@ -100,6 +100,11 @@ export async function buildOutcomeForSession(
 
     coverageBeforePercent: Math.round((session.coverageBeforeSec / runtime) * 1000) / 10,
     coverageAfterPercent: Math.round((session.coverageAfterSec / runtime) * 1000) / 10,
+    // The stint's own snapshot of the race's coverage, taken when it was
+    // logged: the summary shows the stint as it was, not the race as it is.
+    coverageBeforeSec: session.coverageBeforeSec,
+    coverageAfterSec: session.coverageAfterSec,
+    runtimeSec: session.race.runtimeSec,
 
     careerXpAwarded,
     seasonXpAwarded,

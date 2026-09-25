@@ -63,6 +63,22 @@ export function coverageSeconds(intervals: readonly Interval[]): number {
 }
 
 /**
+ * A merged set cut at `limit`: whatever runs past it is dropped, and an
+ * interval that lies wholly past it goes altogether.
+ *
+ * Timeline past a race's runtime is not coverage. A race whose runtime was
+ * shortened under 0.3.x can still hold intervals that run past its new end,
+ * so coverage is always measured on the set cut at the runtime.
+ */
+export function clampIntervals(intervals: readonly Interval[], limit: number): Interval[] {
+  return mergeIntervals(
+    intervals
+      .map((iv) => normalizeInterval(iv, limit))
+      .filter((iv): iv is Interval => iv !== null),
+  );
+}
+
+/**
  * Add one interval to an existing merged set.
  *
  * Returns the new merged set plus `addedSeconds` — the amount of timeline that

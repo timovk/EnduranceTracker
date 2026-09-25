@@ -9,6 +9,7 @@
 import type { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/db/client';
 import { STORY_CONFIG } from '@/lib/config';
+import { creditedSeconds } from '@/lib/domain/career-timeline';
 import { coverageSeconds, fromRows, gapsIn, resumePoint } from '@/lib/domain/intervals';
 import { estimateRemaining } from '@/lib/domain/playback';
 import type { Interval, RacePriority, RaceStatus, RaceType } from '@/lib/domain/types';
@@ -43,6 +44,7 @@ const RACE_SELECT = {
 /** The race select plus its full session history, for the race detail page. */
 const RACE_DETAIL_SELECT = {
   ...RACE_SELECT,
+  creditedViewingSec: true,
   sessions: {
     select: {
       id: true, startTimestampSec: true, endTimestampSec: true, playbackSpeed: true,
@@ -149,6 +151,12 @@ export interface RaceDetail {
   coverageSec: number;
   coveragePercent: number;
   realViewingSec: number;
+  /**
+   * Real viewing credited the way XP credits it (0.4.0): the race's "Real
+   * viewing" figure, so it agrees with every other hour figure. Null only
+   * until the 0.4.0 upgrade has filled it.
+   */
+  creditedViewingSec: number | null;
   timelineWatchedSec: number;
   sessionCount: number;
   avgPlaybackSpeed: number;
@@ -172,6 +180,11 @@ export interface RaceDetail {
     playbackSpeed: number;
     timelineSeconds: number;
     realSeconds: number;
+    /**
+     * The stint's real time credited the way XP credits it (0.4.0): what its
+     * row shows as "Real viewing", so the rows add up to the race's figure.
+     */
+    creditedSeconds: number;
     newCoverageSeconds: number;
     coverageBeforeSec: number;
     coverageAfterSec: number;
@@ -220,6 +233,7 @@ export async function getRaceDetail(userId: string, raceId: string): Promise<Rac
     coverageSec: coverage,
     coveragePercent: estimate.completionPercent,
     realViewingSec: race.realViewingSec,
+    creditedViewingSec: race.creditedViewingSec,
     timelineWatchedSec: race.timelineWatchedSec,
     sessionCount: race.sessionCount,
     avgPlaybackSpeed: speed,
@@ -235,7 +249,7 @@ export async function getRaceDetail(userId: string, raceId: string): Promise<Rac
     lastWatchedAt: race.lastWatchedAt,
     storyCompletedAt: race.storyCompletedAt,
 
-    sessions: race.sessions,
+    sessions: race.sessions.map((session) => ({ ...session, creditedSeconds: creditedSeconds(session) })),
   };
 }
 

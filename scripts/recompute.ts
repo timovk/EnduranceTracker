@@ -1,11 +1,13 @@
 /**
  * Rebuild every derived figure from the sources of truth.
  *
- * The cached counters on `Race`, the career XP total, mastery progress,
- * achievement progress and collection state are all DERIVED. This script
- * rebuilds all of them from `WatchedInterval`, `RaceViewingSession` and the
- * XP ledger — which is the safety net if a cache ever drifts, and the way a
- * configuration re-balance is applied to an existing career.
+ * The cached counters on `Race`, the merged coverage, the career XP total,
+ * mastery progress, achievement progress and collection state are all
+ * DERIVED. This script rebuilds all of them from `RaceViewingSession`, the
+ * races and the XP ledger — which is the safety net if a cache ever drifts,
+ * and the way a configuration re-balance is applied to an existing career.
+ * The work itself is `recomputeCareer` (`src/lib/server/recompute.ts`); this
+ * is its command line.
  *
  *     npm run db:recompute                 every account on this machine
  *     npm run db:recompute -- Alex         one account, by name or by id
@@ -19,14 +21,8 @@
 // Prisma client is lazy, so this only has to happen before the first query.
 import 'dotenv/config';
 
-import type { Tx } from '@/lib/db/client';
 import { disconnectDb, prisma } from '@/lib/db/client';
-import { recomputeAllRaces } from '@/lib/engines/race-engine';
-import { repairXpLedger } from '@/lib/engines/session-engine';
-import { computeCareerMetrics } from '@/lib/engines/metrics';
-import { syncAchievements, syncMilestones } from '@/lib/engines/achievement-engine';
-import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from '@/lib/engines/mastery-engine';
-import { ensureSeasonCollections, syncCollections } from '@/lib/engines/collection-engine';
+import { recomputeCareer } from '@/lib/server/recompute';
 
 interface Account {
   id: string;
@@ -47,16 +43,18 @@ async function resolveAccounts(target: string | undefined): Promise<Account[]> {
   return [match];
 }
 
-async function rebuild(account: Account): Promise<void> {
-  const userId = account.id;
+async function rebuild(account: Account, now: Date): Promise<void> {
+  const report = await recomputeCareer(account.id, { now });
 
-  const races = await recomputeAllRaces(userId);
-  console.log(`  races rebuilt from intervals and sessions   ${races}`);
+  console.log(`  races rebuilt from intervals and sessions   ${report.racesRebuilt}`);
+  if (report.storyBonusesAwarded > 0) {
+    console.log(`    paid ${report.storyBonusesAwarded} Story Complete bonus(es) a runtime edit had skipped`);
+  }
+  if (report.storyBonusesRevoked > 0) {
+    console.log(`    released ${report.storyBonusesRevoked} Story Complete bonus(es) the coverage no longer supports`);
+  }
 
-  // Repairs before it rebuilds: XP left behind by a deleted stint, and Story
-  // Complete bonuses held by races that are no longer complete, both inflate
-  // the total and neither can be corrected by summing what is there.
-  const xp = await repairXpLedger(userId);
+  const xp = report.ledger;
   console.log(`  career XP rebuilt from the ledger           ${xp.careerXpBefore} -> ${xp.careerXpAfter}`);
   if (xp.orphanedTransactions > 0) {
     console.log(`    removed ${xp.orphanedTransactions} award(s) whose stint had been deleted`);
@@ -68,36 +66,15 @@ async function rebuild(account: Account): Promise<void> {
     console.log(`    level ${xp.levelBefore} -> ${xp.levelAfter}`);
   }
 
-  // The remaining engines are idempotent, so simply running them re-derives
-  // everything they own without awarding anything twice — the unique dedupe
-  // keys on the XP ledger are what guarantee that.
-  await prisma.$transaction(async (tx) => {
-    const db = tx as Tx;
-    await ensureMasteryTrees(db, userId);
-    await ensureSeasonCollections(db, userId);
-    await recomputeRaceMasteries(db, userId);
-    const collections = await syncCollections(db, userId);
-    const mastery = await syncMastery(db, userId);
-    const metrics = await computeCareerMetrics(userId, db);
-    const achievements = await syncAchievements(db, userId, metrics);
-    const milestones = await syncMilestones(db, userId, metrics);
-
-    console.log(`  collections reconciled                      ${collections.filledItems.length} cards filled`);
-    console.log(`  mastery nodes newly unlocked                ${mastery.length}`);
-    console.log(`  achievements newly unlocked                 ${achievements.length}`);
-    console.log(`  milestones newly reached                    ${milestones.length}`);
-  }, { maxWait: 15_000, timeout: 120_000 });
-
-  const summary = await prisma.race.aggregate({
-    where: { userId },
-    _sum: { coverageSec: true, realViewingSec: true },
-    _count: true,
-  });
+  console.log(`  collections reconciled                      ${report.collectionCardsFilled} cards filled`);
+  console.log(`  mastery nodes newly unlocked                ${report.masteryNodesUnlocked}`);
+  console.log(`  achievements newly unlocked                 ${report.achievementsUnlocked}`);
+  console.log(`  milestones newly reached                    ${report.milestonesReached}`);
 
   console.log('\n  Current totals');
-  console.log(`    races               ${summary._count}`);
-  console.log(`    unique coverage     ${((summary._sum.coverageSec ?? 0) / 3600).toFixed(1)}h`);
-  console.log(`    real viewing time   ${((summary._sum.realViewingSec ?? 0) / 3600).toFixed(1)}h`);
+  console.log(`    races               ${report.totals.races}`);
+  console.log(`    unique coverage     ${(report.totals.coverageSec / 3600).toFixed(1)}h`);
+  console.log(`    real viewing time   ${(report.totals.creditedViewingSec / 3600).toFixed(1)}h`);
 }
 
 async function main(): Promise<void> {
@@ -111,9 +88,10 @@ async function main(): Promise<void> {
 
   console.log(`Rebuilding derived state for ${accounts.length} account${accounts.length === 1 ? '' : 's'}…`);
 
+  const now = new Date();
   for (const account of accounts) {
     console.log(`\n${account.name}`);
-    await rebuild(account);
+    await rebuild(account, now);
   }
 
   console.log(`\nDone in ${((Date.now() - started) / 1000).toFixed(1)}s.`);

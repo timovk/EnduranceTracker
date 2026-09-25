@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  addInterval, coverageRatio, coverageSeconds, fromRows, furthestPoint, gapsIn,
+  addInterval, clampIntervals, coverageRatio, coverageSeconds, fromRows, furthestPoint, gapsIn,
   isStoryComplete, largestGap, mergeIntervals, newCoverageOf, normalizeInterval,
   resumePoint, subtract,
 } from '@/lib/domain/intervals';
@@ -34,6 +34,22 @@ describe('normalizeInterval', () => {
 
   it('collapses an interval entirely beyond the runtime', () => {
     expect(normalizeInterval({ start: 6000, end: 7000 }, 5000)).toBeNull();
+  });
+});
+
+describe('clampIntervals', () => {
+  it('cuts a set at the runtime, dropping what lies wholly past it', () => {
+    // A race shortened to six hours after 0:00-1:00, 2:00-7:00 and 7:30-8:00
+    // were watched: five hours of it are covered, not six and a half.
+    const stored = [{ start: 0, end: H }, { start: 2 * H, end: 7 * H }, { start: 7.5 * H, end: 8 * H }];
+    const clamped = clampIntervals(stored, 6 * H);
+    expect(clamped).toEqual([{ start: 0, end: H }, { start: 2 * H, end: 6 * H }]);
+    expect(coverageSeconds(clamped)).toBe(5 * H);
+  });
+
+  it('leaves a set inside the runtime as it was', () => {
+    const inside = [{ start: 0, end: H }, { start: 2 * H, end: 3 * H }];
+    expect(clampIntervals(inside, 6 * H)).toEqual(inside);
   });
 });
 

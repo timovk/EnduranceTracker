@@ -14,27 +14,35 @@
 
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
-import { STORY_CONFIG, XP_CONFIG, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
-import { addInterval, coverageSeconds, fromRows } from '@/lib/domain/intervals';
+import { STORY_CONFIG, TIMELINE_SHAPE, XP_CONFIG, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
+import { addInterval, clampIntervals, coverageSeconds, fromRows } from '@/lib/domain/intervals';
 import { clampSpeed, realSecondsFor, timelineSecondsFor } from '@/lib/domain/playback';
 import { storyCompleteBonus, xpForSession } from '@/lib/domain/progression';
 import { stintHeading } from '@/lib/copy/tone';
 import { isSeasonClosed } from '@/lib/domain/season-closure';
 import type { SessionInput } from '@/lib/validation/schemas';
-import type { SessionOutcome, SessionRemoval } from './contracts';
+import type { RaceRemoval, SessionOutcome, SessionRemoval } from './contracts';
 import {
   awardXp,
+  combineRevocations,
   purgeOrphanedSessionXp,
   rebuildCareerTotals,
+  revokeRaceViewingXp,
+  revokeSessionsXp,
   revokeSessionXp,
   revokeXpByDedupeKey,
+  revokeXpByDedupeKeys,
+  settleLedger,
+  type LedgerRebuild,
+  type XpRevocation,
 } from './xp-ledger';
-import { computeCareerMetrics } from './metrics';
-import { recomputeRaceAggregates } from './race-engine';
+import { computeCareerMetricsWithHistory } from './metrics';
+import { rebuildRaceIntervals, recomputeRaceAggregates } from './race-engine';
+import { storyBonusKey } from './progression-resync';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
 import {
-  addSeasonXp, getOrCreateCurrentPass, rebuildSeasonXpFromLedger, seasonClosureNotice,
+  addSeasonXp, getOrCreateCurrentPass, seasonClosureNotice,
 } from './season-pass-engine';
 import { evaluateChallenges } from './challenge-engine';
 import { syncAchievements, syncMilestones } from './achievement-engine';
@@ -49,6 +57,35 @@ import { recordedHoursInRange, getBudgetSnapshot } from './budget-engine';
  * logged session beats shaving milliseconds off it.
  */
 const TRANSACTION_OPTIONS = { maxWait: 15_000, timeout: 60_000 } as const;
+
+/** Why a stint was refused. */
+export type InvalidStintReason = 'future-watched-at';
+
+/**
+ * A stint the engine will not log.
+ *
+ * Thrown before anything is written, so a refused stint leaves no trace. The
+ * server action turns it into a plain sentence; nothing about it is an error
+ * the user did wrong in any way that matters.
+ */
+export class InvalidStintError extends Error {
+  readonly reason: InvalidStintReason;
+
+  constructor(reason: InvalidStintReason) {
+    super(reason === 'future-watched-at' ? 'The stint is dated in the future.' : 'The stint cannot be logged.');
+    this.name = 'InvalidStintError';
+    this.reason = reason;
+  }
+}
+
+/**
+ * The latest instant a stint may be dated: now, plus a few minutes for a clock
+ * that runs a little fast. A stint's `watchedAt` is when it was logged, and a
+ * stint dated tomorrow would date a milestone or a record in the future.
+ */
+export function latestAcceptedWatchedAt(now: Date): Date {
+  return new Date(now.getTime() + TIMELINE_SHAPE.futureWatchedAtSlackMinutes * 60_000);
+}
 
 /**
  * Resolve the stint's timeline window from either input mode.
@@ -91,6 +128,9 @@ export async function logViewingSession(
   now: Date = new Date(),
 ): Promise<SessionOutcome> {
   const watchedAt = input.watchedAt ?? now;
+  // Backdated stints stay accepted (the engine takes any past `watchedAt`);
+  // only a stint dated after now is refused, before anything is written.
+  if (watchedAt > latestAcceptedWatchedAt(now)) throw new InvalidStintError('future-watched-at');
 
   return prisma.$transaction(async (tx) => {
     const db = tx as Tx;
@@ -110,7 +150,10 @@ export async function logViewingSession(
       select: { startSec: true, endSec: true },
     });
     const existing = fromRows(existingRows);
-    const coverageBefore = coverageSeconds(existing);
+    // Coverage is measured on the set cut at the runtime, as the aggregates
+    // measure it: a race whose runtime was shortened under 0.3.x can still
+    // hold intervals past its new end, and they are not coverage.
+    const coverageBefore = coverageSeconds(clampIntervals(existing, race.runtimeSec));
 
     const window = resolveSessionWindow(input, race.runtimeSec);
 
@@ -135,7 +178,7 @@ export async function logViewingSession(
         realSeconds: window.realSeconds,
         newCoverageSeconds: addedSeconds,
         coverageBeforeSec: coverageBefore,
-        coverageAfterSec: coverageSeconds(mergedIntervals),
+        coverageAfterSec: coverageSeconds(clampIntervals(mergedIntervals, race.runtimeSec)),
         watchedAt,
         note: input.note ?? null,
       },
@@ -157,7 +200,20 @@ export async function logViewingSession(
     }
 
     // -- 3. Rebuild the race's cached aggregates ---------------------------
+    //
+    // Clamped to the runtime. A race whose runtime was shortened before 0.4.0
+    // can hold coverage past its new end, and a bonus it was paid on the
+    // strength of that coverage is no longer supported once the clamp applies.
     const aggregates = await recomputeRaceAggregates(db, race.id, now);
+
+    // A Story Complete bonus the race no longer supports goes before anything
+    // is paid, and the ledger is settled at once: every award below is then
+    // stamped on the career as it really is, and achievements and milestones
+    // are measured against it rather than against XP that is about to go.
+    const storyBonusRevocation = aggregates.storyCompletedAt === null
+      ? await revokeXpByDedupeKey(db, userId, storyBonusKey(race.id))
+      : null;
+    if (storyBonusRevocation !== null) await settleLedger(db, userId, [storyBonusRevocation]);
 
     // -- 4. XP for the stint ----------------------------------------------
     const profileBefore = await db.careerProfile.findUniqueOrThrow({ where: { userId } });
@@ -209,7 +265,7 @@ export async function logViewingSession(
         sessionId: session.id,
         // One-shot: the unique dedupeKey is what makes this structurally
         // impossible to award twice, however often the engine re-runs.
-        dedupeKey: `story-complete:${race.id}`,
+        dedupeKey: storyBonusKey(race.id),
       });
       storyBonusAwarded = award.granted;
       careerXpAwarded += award.granted;
@@ -258,7 +314,7 @@ export async function logViewingSession(
     //
     // Metrics are read through the TRANSACTION client so they include the
     // session that was just written.
-    const metrics = await computeCareerMetrics(userId, db);
+    const { metrics } = await computeCareerMetricsWithHistory(userId, db);
     const achievements = await syncAchievements(db, userId, metrics, now);
     for (const achievement of achievements) {
       if (achievement.xpAwarded > 0) {
@@ -348,6 +404,9 @@ export async function logViewingSession(
 
       coverageBeforePercent: Math.round((coverageBefore / runtime) * 1000) / 10,
       coverageAfterPercent: Math.round((aggregates.coverageSec / runtime) * 1000) / 10,
+      coverageBeforeSec: coverageBefore,
+      coverageAfterSec: aggregates.coverageSec,
+      runtimeSec: race.runtimeSec,
 
       careerXpAwarded,
       seasonXpAwarded: boostedSeasonXp,
@@ -481,36 +540,9 @@ export async function deleteViewingSession(
 
     await db.raceViewingSession.delete({ where: { id: session.id } });
 
-    const remaining = await db.raceViewingSession.findMany({
-      where: { raceId: session.raceId },
-      select: { startTimestampSec: true, endTimestampSec: true },
-      orderBy: { watchedAt: 'asc' },
-    });
-
-    const race = await db.race.findUniqueOrThrow({
-      where: { id: session.raceId },
-      select: { runtimeSec: true },
-    });
-
-    let rebuilt: { start: number; end: number }[] = [];
-    for (const row of remaining) {
-      rebuilt = addInterval(rebuilt, { start: row.startTimestampSec, end: row.endTimestampSec }, {
-        limit: race.runtimeSec,
-        gapTolerance: STORY_CONFIG.gapToleranceSeconds,
-      }).intervals;
-    }
-
-    await db.watchedInterval.deleteMany({ where: { raceId: session.raceId } });
-    if (rebuilt.length > 0) {
-      await db.watchedInterval.createMany({
-        data: rebuilt.map((interval) => ({
-          raceId: session.raceId,
-          startSec: interval.start,
-          endSec: interval.end,
-        })),
-      });
-    }
-
+    // The merged coverage is rebuilt from the stints that remain, in canonical
+    // order and clamped to the runtime — the one rebuild every path shares.
+    await rebuildRaceIntervals(db, session.raceId);
     const aggregates = await recomputeRaceAggregates(db, session.raceId, now);
 
     // The Story Complete bonus is keyed to the RACE, not to whichever stint
@@ -521,25 +553,98 @@ export async function deleteViewingSession(
     // would be silently swallowed as a duplicate.
     const storyBonus =
       aggregates.storyCompletedAt === null
-        ? await revokeXpByDedupeKey(db, userId, `story-complete:${session.raceId}`)
-        : { transactions: 0, careerXp: 0, seasonXp: 0 };
+        ? await revokeXpByDedupeKey(db, userId, storyBonusKey(session.raceId))
+        : null;
 
     // Rebuild rather than decrement. Career XP, level, prestige, title and the
     // per-transaction running totals the XP graph is drawn from all come back
     // out of the ledger, which is the only thing that was ever authoritative.
-    const ledger = await rebuildCareerTotals(db, userId);
-    await rebuildSeasonXpFromLedger(db, userId);
+    const revocations = storyBonus === null ? [revoked] : [revoked, storyBonus];
+    const ledger = await settleLedger(db, userId, revocations) ?? await unchangedLedger(db, userId);
 
     return {
       raceId: session.raceId,
-      careerXpRemoved: revoked.careerXp + storyBonus.careerXp,
-      seasonXpRemoved: revoked.seasonXp + storyBonus.seasonXp,
-      storyBonusRemoved: storyBonus.transactions > 0,
+      careerXpRemoved: revoked.careerXp + (storyBonus?.careerXp ?? 0),
+      seasonXpRemoved: revoked.seasonXp + (storyBonus?.seasonXp ?? 0),
+      storyBonusRemoved: (storyBonus?.transactions ?? 0) > 0,
       levelBefore: ledger.levelBefore,
       levelAfter: ledger.levelAfter,
       careerXpBefore: ledger.careerXpBefore,
       careerXpAfter: ledger.careerXpAfter,
       remainingSessions: aggregates.sessionCount,
+    };
+  }, TRANSACTION_OPTIONS);
+}
+
+/** The career as it stands, for a removal that took no XP back. */
+async function unchangedLedger(db: Tx, userId: string): Promise<LedgerRebuild> {
+  const profile = await db.careerProfile.findUniqueOrThrow({ where: { userId } });
+  const careerXp = Number(profile.careerXp);
+  return {
+    careerXpBefore: careerXp,
+    careerXpAfter: careerXp,
+    levelBefore: profile.level,
+    levelAfter: profile.level,
+    rowsRestamped: 0,
+  };
+}
+
+/**
+ * Remove a race from the library, and the XP it earned with it (owner
+ * decision D4).
+ *
+ * Exactly as if its stints had been deleted one by one: the viewing and
+ * re-watch XP of every stint, and the Story Complete bonus, come off the
+ * ledger, and the totals are rebuilt from what remains. Viewing XP left behind
+ * by a stint deleted under an older version is found by the race it names
+ * (`sourceRef`) and goes too.
+ *
+ * Landmarks stay: achievements, milestones, mastery nodes and trophies are
+ * untouched, and a Hall of Fame plaque keeps its place with its link to the
+ * race cleared. Nothing it helped reach is taken back.
+ *
+ * Returns null when the race is not in this account's library.
+ */
+export async function deleteRace(
+  userId: string,
+  raceId: string,
+  now: Date = new Date(),
+): Promise<RaceRemoval | null> {
+  return prisma.$transaction(async (tx) => {
+    const db = tx as Tx;
+    const race = await db.race.findFirst({ where: { id: raceId, userId }, select: { id: true, name: true } });
+    if (race === null) return null;
+
+    const sessions = await db.raceViewingSession.findMany({
+      where: { raceId: race.id, userId },
+      select: { id: true },
+    });
+
+    // Before the cascade, which would null every `sessionId` on the way out.
+    const viewing = await revokeSessionsXp(db, userId, sessions.map((session) => session.id));
+    const orphaned = await revokeRaceViewingXp(db, userId, race.id);
+    const storyBonus = await revokeXpByDedupeKeys(db, userId, [storyBonusKey(race.id)]);
+
+    // Scoped by account as well as id, so the delete is safe on its own. It
+    // cascades to the stints, their intervals and the collection cards; the
+    // Hall of Fame keeps its plaque with the race link cleared.
+    await db.race.deleteMany({ where: { id: race.id, userId } });
+
+    // The event caches drop the edition.
+    await recomputeRaceMasteries(db, userId, now);
+
+    const revocations = [viewing, orphaned, storyBonus];
+    const ledger = await settleLedger(db, userId, revocations) ?? await unchangedLedger(db, userId);
+    const removed = combineRevocations(revocations);
+
+    return {
+      raceName: race.name,
+      sessionsRemoved: sessions.length,
+      careerXpRemoved: removed.careerXp,
+      seasonXpRemoved: removed.seasonXp,
+      storyBonusRemoved: storyBonus.transactions > 0,
+      levelBefore: ledger.levelBefore,
+      levelAfter: ledger.levelAfter,
     };
   }, TRANSACTION_OPTIONS);
 }
@@ -586,35 +691,38 @@ export async function repairXpLedger(userId: string): Promise<LedgerRepair> {
 
     const orphaned = await purgeOrphanedSessionXp(db, userId);
 
-    const bonuses = await db.xPTransaction.findMany({
-      where: { userId, source: 'STORY_COMPLETE', dedupeKey: { startsWith: 'story-complete:' } },
-      select: { id: true, dedupeKey: true },
-    });
+    // Every race is read once, rather than once per bonus.
+    const [bonuses, races] = await Promise.all([
+      db.xPTransaction.findMany({
+        where: { userId, source: 'STORY_COMPLETE', dedupeKey: { startsWith: 'story-complete:' } },
+        select: { dedupeKey: true },
+      }),
+      db.race.findMany({ where: { userId }, select: { id: true, storyCompletedAt: true } }),
+    ]);
+    const complete = new Set(races.filter((race) => race.storyCompletedAt !== null).map((race) => race.id));
 
-    let staleStoryBonuses = 0;
-    for (const bonus of bonuses) {
-      const raceId = bonus.dedupeKey?.slice('story-complete:'.length);
-      if (!raceId) continue;
-      const race = await db.race.findFirst({
-        where: { id: raceId, userId },
-        select: { storyCompletedAt: true },
-      });
-      // A missing race means the bonus outlived what earned it just as surely
-      // as an incomplete one does.
-      if (race && race.storyCompletedAt !== null) continue;
-      await db.xPTransaction.delete({ where: { id: bonus.id } });
-      staleStoryBonuses += 1;
-    }
+    // A missing race means the bonus outlived what earned it just as surely
+    // as an incomplete one does.
+    const staleKeys = bonuses
+      .map((bonus) => bonus.dedupeKey)
+      .filter((key): key is string => key !== null && !complete.has(key.slice('story-complete:'.length)));
+    const stale = await revokeXpByDedupeKeys(db, userId, staleKeys);
 
+    // Settled from the earliest row either repair removed. This is also the
+    // maintenance path, where a running total that drifted is put right, so
+    // the whole ledger is replayed after it: a drift before the first removed
+    // row is corrected too, and where the settle already did the work the
+    // replay finds nothing to write.
+    const revocations: XpRevocation[] = [orphaned, stale];
+    const settled = await settleLedger(db, userId, revocations);
     const ledger = await rebuildCareerTotals(db, userId);
-    await rebuildSeasonXpFromLedger(db, userId);
 
     return {
       orphanedTransactions: orphaned.transactions,
-      staleStoryBonuses,
-      careerXpBefore: ledger.careerXpBefore,
+      staleStoryBonuses: stale.transactions,
+      careerXpBefore: settled?.careerXpBefore ?? ledger.careerXpBefore,
       careerXpAfter: ledger.careerXpAfter,
-      levelBefore: ledger.levelBefore,
+      levelBefore: settled?.levelBefore ?? ledger.levelBefore,
       levelAfter: ledger.levelAfter,
     };
   }, TRANSACTION_OPTIONS);
