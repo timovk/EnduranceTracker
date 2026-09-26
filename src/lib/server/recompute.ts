@@ -32,8 +32,13 @@
  *      a checkpoint), reached ones of an Expedition paid — and the missing
  *      summary of a completed Expedition written. A summary that exists is
  *      never rewritten.
- *   5. The account's 0.4.0 backfill is recorded as done: recompute has just
- *      done all of it.
+ *   5. The account's 0.4.0 backfill is recorded as done — recompute has just
+ *      done all of it — and every finished year that is due and not yet
+ *      frozen has its Chronicle chapter frozen. A frozen chapter is never
+ *      rewritten here.
+ *   6. Only when asked (`rebuildChronicleYears`), the named frozen years are
+ *      rebuilt from today's history: besides the button on the chapter's
+ *      page, the only way a frozen chapter changes.
  */
 
 import type { Tx } from '@/lib/db/client';
@@ -49,6 +54,7 @@ import { reconcileStoryBonus } from '@/lib/engines/progression-resync';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { repairXpLedger, type LedgerRepair } from '@/lib/engines/session-engine';
 import { settleLedger, type XpRevocation } from '@/lib/engines/xp-ledger';
+import { ensureChroniclesFrozen, rebuildChronicleYear } from '@/lib/engines/chronicle-engine';
 import { careerRecordProgression } from '@/lib/engines/expedition-engine';
 import { backfillExpeditions, EXPEDITION_CHUNK, markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 
@@ -61,6 +67,11 @@ export interface RecomputeOptions {
    * dating test are rewritten; every other row is left as it is.
    */
   rebuildMilestoneDates?: boolean;
+  /**
+   * Rebuild these frozen Chronicle chapters from today's history (`db:recompute
+   * --rebuild-chronicle <year>`). A year that is not frozen is left alone.
+   */
+  rebuildChronicleYears?: readonly number[];
 }
 
 export interface RecomputeReport {
@@ -84,6 +95,9 @@ export interface RecomputeReport {
   milestoneDatesRebuilt: number;
   /** Expedition checkpoints paid, taken back and re-sized, the XP paid, and summaries written. */
   expeditions: { checkpointsAwarded: number; xpAwarded: number; checkpointsRevoked: number; checkpointsResized: number; summariesWritten: number };
+  /** Finished years whose chapter was frozen now, and frozen years rebuilt on request. */
+  chaptersFrozen: number[];
+  chaptersRebuilt: number[];
   totals: { races: number; coverageSec: number; creditedViewingSec: number };
 }
 
@@ -192,11 +206,19 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     expeditions.summariesWritten += result.summaries;
   }
 
-  // -- 5. The upgrade --------------------------------------------------------
+  // -- 5. The upgrade, and the Chronicle -----------------------------------------
   //
   // Everything the 0.4.0 backfill would do has just been done, so the next
-  // start has nothing left to do for this account.
+  // start has nothing left to do for this account — and so the finished years
+  // it would have frozen are frozen now. One already frozen stays as it is.
   await markCareerBackfillApplied(userId);
+  const chaptersFrozen = await ensureChroniclesFrozen(userId, now);
+
+  // -- 6. Chapters rebuilt on request --------------------------------------------
+  const chaptersRebuilt: number[] = [];
+  for (const year of [...new Set(options.rebuildChronicleYears ?? [])].sort((a, b) => a - b)) {
+    if (await rebuildChronicleYear(userId, year, now)) chaptersRebuilt.push(year);
+  }
 
   const totals = await prisma.race.aggregate({
     where: { userId },
@@ -211,6 +233,8 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     ledger,
     ...synced,
     expeditions,
+    chaptersFrozen,
+    chaptersRebuilt,
     totals: {
       races: totals._count,
       coverageSec: totals._sum.coverageSec ?? 0,

@@ -152,6 +152,13 @@ export const raceIdsSchema = z.array(z.string().uuid()).min(1).max(1_000);
 export const eventSuggestionIdSchema = z.string().trim().min(1).max(300);
 
 // ---------------------------------------------------------------------------
+// The Career Chronicle (0.4.0)
+// ---------------------------------------------------------------------------
+
+/** A chapter's year, as its page sends it back: a whole calendar year. */
+export const chronicleYearSchema = z.number().int().min(1970).max(9999);
+
+// ---------------------------------------------------------------------------
 // Viewing sessions
 // ---------------------------------------------------------------------------
 

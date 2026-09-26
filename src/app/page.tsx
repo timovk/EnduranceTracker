@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { Plus } from 'lucide-react';
 import { CareerHeader } from '@/components/dashboard/career-header';
+import { WrappedReadyBanner } from '@/components/chronicle/wrapped-ready-banner';
 import { CurrentStint } from '@/components/dashboard/current-stint';
 import { StrategistPanel } from '@/components/dashboard/strategist-panel';
 import { AnnualFuelTank, WeeklyFuelTank } from '@/components/dashboard/fuel-tanks';
@@ -9,6 +10,7 @@ import {
 } from '@/components/dashboard/panels';
 import { Button } from '@/components/ui/controls';
 import { getDashboard } from '@/lib/server/dashboard';
+import { pendingWrapped } from '@/lib/engines/chronicle-engine';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
 import { backlogFraming } from '@/lib/copy/tone';
@@ -19,10 +21,14 @@ export const metadata = { title: 'Dashboard' };
 export default async function DashboardPage() {
   const userId = await requireUserId();
   await ensureCareer(userId);
-  const data = await getDashboard(userId);
+  // Last year's Endurance Wrapped, once its chapter is frozen and until it is
+  // seen or hidden. It is only ever offered: nothing opens by itself.
+  const [data, wrapped] = await Promise.all([getDashboard(userId), pendingWrapped(userId, new Date())]);
 
   return (
     <div className="mx-auto max-w-6xl space-y-4">
+      {wrapped !== null ? <WrappedReadyBanner year={wrapped.year} /> : null}
+
       {/* -- Career header ------------------------------------------------- */}
       <CareerHeader data={data.header} />
 

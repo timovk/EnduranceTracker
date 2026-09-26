@@ -5,7 +5,8 @@
  * credited time on its races, no dates on its milestones, none of the new
  * rungs, and perhaps a race whose runtime was shortened after it was watched.
  * The backfill brings it up to date in phases — P1 the races, P2 the
- * recurring events, P3 the milestones, P4 the Expeditions — each chunk in its own transaction
+ * recurring events, P3 the milestones, P4 the Expeditions, P5 the Chronicle's
+ * finished years — each chunk in its own transaction
  * together with the marker that records it, so a start that runs out of time
  * loses nothing and the next one carries on.
  *
@@ -27,6 +28,7 @@ import {
   markCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
 import { MASTERY_CONFIG } from '@/lib/config';
+import { upgradeChapterSnapshot } from '@/lib/domain/chronicle';
 import {
   addRace, createCareerUser, eventStepProblems, expeditionProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
@@ -45,9 +47,10 @@ const SOMEONE_ELSE = '00000000-0000-4000-8000-0000000004bb';
 const EVENTS = '00000000-0000-4000-8000-0000000004bc';
 const RESUMED = '00000000-0000-4000-8000-0000000004bd';
 const IN_ONE_GO = '00000000-0000-4000-8000-0000000004be';
+const CHRONICLE = '00000000-0000-4000-8000-0000000004bf';
 const USERS = [
   DATED, REPLAY_LATER, RACES, INTERRUPTED, UNINTERRUPTED, SERVED_RECENTLY, SERVED_LONG_AGO, NEVER_SERVED,
-  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS, RESUMED, IN_ONE_GO,
+  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS, RESUMED, IN_ONE_GO, CHRONICLE,
 ];
 
 /** The first start after the update. */
@@ -402,6 +405,51 @@ describe('P2: events', () => {
   });
 });
 
+describe('P5: the Chronicle', () => {
+  it('freezes every finished year that is due, oldest first and one per start, and none still in its grace period', async () => {
+    await createCareerUser(CHRONICLE, 'CareerBackfillTest Chronicle');
+    const spa = await addRace(CHRONICLE, { name: '6 Hours of Spa' });
+    const fuji = await addRace(CHRONICLE, { name: '6 Hours of Fuji' });
+    for (const [raceId, watchedAt, from, to] of [
+      [spa, new Date(2023, 4, 1, 21, 0), 0, 2 * H],
+      [spa, new Date(2024, 4, 1, 21, 0), 2 * H, 6 * H],
+      // Late on 31 December: the year it belongs to is still in its grace period.
+      [fuji, new Date(2025, 11, 31, 22, 0), 0, H],
+    ] as const) {
+      await logStint(CHRONICLE, raceId, { from, to, watchedAt, now: watchedAt });
+    }
+    await asRecordedBy032(CHRONICLE);
+
+    const now = new Date(2026, 0, 2, 12, 0);
+    const summaries: CareerBackfillSummary[] = [];
+    for (let start = 0; start < 10; start += 1) {
+      const summary = await runCareerBackfillFor(CHRONICLE, { now: new Date(now.getTime() + start * 60_000), clock: oneChunkPerStart() });
+      summaries.push(summary);
+      if (summary.completed) break;
+    }
+
+    // Two chunks of the Chronicle phase: 2023, then 2024; 2025 is not due for two more days.
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P2', 'P3', 'P4', 'P5', 'P5', null]);
+    expect(summaries.map((summary) => summary.chaptersFrozen)).toEqual([0, 0, 0, 0, 1, 1]);
+    const rows = await prisma.chronicleYear.findMany({ where: { userId: CHRONICLE }, orderBy: { year: 'asc' } });
+    expect(rows.map((row) => row.year)).toEqual([2023, 2024]);
+    for (const row of rows) expect(row.frozenAt).toEqual(expect.any(Date));
+    // 2024 was frozen after 2023, so it compares itself with the frozen chapter.
+    const [first, second] = rows.map((row) => upgradeChapterSnapshot(row.snapshot));
+    expect(second!.previousYear).toMatchObject({ year: 2023, creditedSeconds: first!.summary.creditedSeconds, careerBeganInYear: true });
+    expect(await isCareerBackfillApplied(CHRONICLE)).toBe(true);
+    expect(describeCareerBackfill(summaries[5]!, 'Chronicle')).toMatch(/; 1 chapter frozen$/);
+
+    // A forced run freezes nothing again, and never rewrites a frozen year.
+    const forced = await runCareerBackfillFor(CHRONICLE, { now: new Date(2026, 0, 5, 12, 0), clock: PLENTY_OF_TIME, force: true });
+    expect(forced).toMatchObject({ completed: true, chaptersFrozen: 1 });
+    const after = await prisma.chronicleYear.findMany({ where: { userId: CHRONICLE }, orderBy: { year: 'asc' } });
+    expect(after.map((row) => row.year)).toEqual([2023, 2024, 2025]);
+    expect(after.slice(0, 2)).toEqual(rows);
+    expect(await ledgerProblems(CHRONICLE)).toEqual([]);
+  }, 60_000);
+});
+
 describe('the start-up budget', () => {
   /** Two long races, one with a Story Complete bonus a runtime edit skipped, and 1,100 races never watched. */
   async function career(userId: string, name: string): Promise<void> {
@@ -454,20 +502,26 @@ describe('the start-up budget', () => {
     }
 
     // Three chunks of races (500 at a time), then the events, then the
-    // milestones, then one chunk of the two Expeditions (48-hour races).
-    const starts = Math.ceil(raceCount / 500) + 3;
+    // milestones, then one chunk of the two Expeditions (48-hour races), then
+    // the one finished year, 2025, frozen.
+    const starts = Math.ceil(raceCount / 500) + 4;
     expect(summaries).toHaveLength(starts);
     expect(new Set(markers).size).toBe(starts);
-    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P2', 'P3', 'P4', null]);
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P2', 'P3', 'P4', 'P5', null]);
     expect(summaries[0]?.pausedBefore?.cursor).toEqual(expect.any(String));
     expect(summaries[2]?.pausedBefore?.cursor).toBeNull();
     expect(summaries[3]?.pausedBefore?.cursor).toBeNull();
     expect(summaries[4]?.pausedBefore?.cursor).toBeNull();
-    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0, 0, 0]);
+    expect(summaries[5]?.pausedBefore?.cursor).toBeNull();
+    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0, 0, 0, 0]);
     expect(summaries.reduce((sum, summary) => sum + summary.storyBonusesAwarded, 0)).toBe(1);
     // Both 48-hour races completed: every checkpoint, and a summary each.
-    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, 0, 0, 10]);
-    expect(summaries[5]).toMatchObject({ completed: true, pausedBefore: null, summariesWritten: 2 });
+    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, 0, 0, 10, 0]);
+    expect(summaries[5]).toMatchObject({ completed: false, summariesWritten: 2, chaptersFrozen: 0 });
+    // The chapter is frozen only once the dates and summaries it holds are all written.
+    expect(summaries.map((summary) => summary.chaptersFrozen)).toEqual([0, 0, 0, 0, 0, 0, 1]);
+    expect(summaries[6]).toMatchObject({ completed: true, pausedBefore: null });
+    expect((await prisma.chronicleYear.findMany({ where: { userId: INTERRUPTED } })).map((row) => row.year)).toEqual([2025]);
     expect(await isCareerBackfillApplied(INTERRUPTED)).toBe(true);
 
     // What a paused start says in the log.
@@ -475,16 +529,21 @@ describe('the start-up budget', () => {
       `[career-backfill] Interrupted (${INTERRUPTED}): credited 500 races, 0 legacy races repaired, story bonuses +${summaries[0]!.storyBonusesAwarded}/−0; `
         + '0 event steps (+0 XP), 0 credits; '
         + '0 new milestones (+0 XP), 0 dates filled, 0 recorded only; 0 expedition checkpoints (+0 XP), 0 summaries; '
+        + '0 chapters frozen; '
         + `paused before P1 (after race ${summaries[0]!.pausedBefore!.cursor}); continues on the next start`,
     );
     expect(describeCareerBackfill(summaries[2]!, 'Interrupted')).toMatch(/; paused before P2; continues on the next start$/);
     expect(describeCareerBackfill(summaries[3]!, 'Interrupted')).toMatch(/; paused before P3; continues on the next start$/);
     expect(describeCareerBackfill(summaries[4]!, 'Interrupted')).toMatch(/; paused before P4; continues on the next start$/);
-    expect(describeCareerBackfill(summaries[5]!, 'Interrupted')).toMatch(/; 10 expedition checkpoints \(\+6,000 XP\), 2 summaries$/);
+    expect(describeCareerBackfill(summaries[5]!, 'Interrupted')).toMatch(
+      /; 10 expedition checkpoints \(\+6,000 XP\), 2 summaries; 0 chapters frozen; paused before P5; continues on the next start$/,
+    );
+    expect(describeCareerBackfill(summaries[6]!, 'Interrupted')).toMatch(/, 0 summaries; 1 chapter frozen$/);
 
     const whole = await runCareerBackfillFor(UNINTERRUPTED, { now: STARTED, clock: PLENTY_OF_TIME });
     expect(whole).toMatchObject({
       completed: true, racesCredited: 1_103, storyBonusesAwarded: 1, expeditionCheckpoints: 10, expeditionXp: 6_000, summariesWritten: 2,
+      chaptersFrozen: 1,
     });
     expect(await outcome(INTERRUPTED)).toEqual(await outcome(UNINTERRUPTED));
     expect(await ledgerProblems(INTERRUPTED)).toEqual([]);
@@ -543,8 +602,9 @@ describe('the start-up budget', () => {
     }
 
     // The races, the events and the milestones take a start each, then the
-    // Expeditions two: a full chunk, and the five after its last race.
-    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P2', 'P3', 'P4', 'P4', null]);
+    // Expeditions two: a full chunk, and the five after its last race; then
+    // the finished year is frozen.
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P2', 'P3', 'P4', 'P4', 'P5', null]);
     expect(summaries[2]?.pausedBefore?.cursor).toBeNull();
     expect(summaries[3]?.pausedBefore?.cursor).toBe(races[EXPEDITION_CHUNK - 1]!.id);
     expect(describeCareerBackfill(summaries[3]!, 'Resumed')).toMatch(
@@ -554,9 +614,9 @@ describe('the start-up budget', () => {
     const rest = races.slice(EXPEDITION_CHUNK);
     const checkpoints = (list: typeof races) => list.reduce((sum, race) => sum + race.reached.length, 0);
     const complete = (list: typeof races) => list.filter((race) => race.reached.length === 5).length;
-    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, checkpoints(first), checkpoints(rest)]);
-    expect(summaries.map((summary) => summary.summariesWritten)).toEqual([0, 0, 0, complete(first), complete(rest)]);
-    expect(summaries[4]).toMatchObject({ completed: true, pausedBefore: null });
+    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, checkpoints(first), checkpoints(rest), 0]);
+    expect(summaries.map((summary) => summary.summariesWritten)).toEqual([0, 0, 0, complete(first), complete(rest), 0]);
+    expect(summaries[5]).toMatchObject({ completed: true, pausedBefore: null, chaptersFrozen: 1 });
 
     const whole = await runCareerBackfillFor(IN_ONE_GO, { now: STARTED, clock: PLENTY_OF_TIME });
     expect(whole).toMatchObject({ completed: true, expeditionCheckpoints: 100, expeditionXp: 21_000, summariesWritten: 10 });

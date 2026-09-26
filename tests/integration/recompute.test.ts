@@ -8,11 +8,14 @@
  * career XP only) or one the clamped coverage no longer supports (released).
  * It is also the one repair that re-sizes Expedition checkpoints to the
  * current schedule, and it writes a completed Expedition's missing summary.
+ * It freezes the Chronicle's finished years that are due, and rewrites a
+ * frozen one only when asked to.
  */
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { disconnectDb, prisma } from '@/lib/db/client';
 import { storyCompleteBonus } from '@/lib/domain/progression';
+import { upgradeChapterSnapshot } from '@/lib/domain/chronicle';
 import { recomputeCareer } from '@/lib/server/recompute';
 import { isCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 import { awardXp, rebuildCareerTotals } from '@/lib/engines/xp-ledger';
@@ -35,7 +38,7 @@ afterAll(async () => {
 
 /** Everything recompute derives, without the ids and timestamps a rebuild legitimately renews. */
 async function derivedState() {
-  const [ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries] = await Promise.all([
+  const [ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries, chapters] = await Promise.all([
     prisma.xPTransaction.findMany({
       where: { userId: USER },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -87,8 +90,9 @@ async function derivedState() {
       select: { careerXp: true, level: true, prestige: true, titleKey: true },
     }),
     prisma.expeditionSummary.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } }),
+    prisma.chronicleYear.findMany({ where: { userId: USER }, orderBy: { year: 'asc' } }),
   ]);
-  return { ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries };
+  return { ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries, chapters };
 }
 
 /** The checkpoints a race holds: percent, amount and the stint named, in order. */
@@ -148,6 +152,49 @@ describe('recompute', () => {
     });
     expect(second.ledger.staleExpeditionCheckpoints).toBe(0);
     expect(await expeditionProblems(USER)).toEqual([]);
+  });
+
+  it('recompute never rewrites a frozen chapter unless asked', async () => {
+    const spa = await addRace(USER, { name: '6 Hours of Spa' });
+    const fuji = await addRace(USER, { name: '6 Hours of Fuji' });
+    await logStint(USER, spa, { from: 0, to: 2 * H, watchedAt: new Date(2024, 4, 1, 21, 0), now: NOW });
+    await logStint(USER, fuji, { from: 0, to: 3 * H, watchedAt: new Date(2025, 4, 1, 21, 0), now: NOW });
+
+    // The first recompute freezes both finished years, oldest first.
+    const first = await recomputeCareer(USER, { now: NOW });
+    expect(first.chaptersFrozen).toEqual([2024, 2025]);
+    expect(first.chaptersRebuilt).toEqual([]);
+    const frozen = await prisma.chronicleYear.findMany({ where: { userId: USER }, orderBy: { year: 'asc' } });
+    expect(frozen.map((row) => row.year)).toEqual([2024, 2025]);
+
+    // A stint backdated into 2025 changes its history, but not its chapter.
+    await logStint(USER, fuji, { from: 3 * H, to: 6 * H, watchedAt: new Date(2025, 4, 8, 21, 0), now: NOW });
+    const again = await recomputeCareer(USER, { now: new Date(NOW.getTime() + 60_000) });
+    expect(again.chaptersFrozen).toEqual([]);
+    expect(await prisma.chronicleYear.findMany({ where: { userId: USER }, orderBy: { year: 'asc' } })).toEqual(frozen);
+    expect(upgradeChapterSnapshot(frozen[1]!.snapshot).summary.storyCompletes).toBe(0);
+  });
+
+  it('--rebuild-chronicle replaces only that year', async () => {
+    const spa = await addRace(USER, { name: '6 Hours of Spa' });
+    const fuji = await addRace(USER, { name: '6 Hours of Fuji' });
+    await logStint(USER, spa, { from: 0, to: 2 * H, watchedAt: new Date(2024, 4, 1, 21, 0), now: NOW });
+    await logStint(USER, fuji, { from: 0, to: 3 * H, watchedAt: new Date(2025, 4, 1, 21, 0), now: NOW });
+    await recomputeCareer(USER, { now: NOW });
+    const frozen = await prisma.chronicleYear.findMany({ where: { userId: USER }, orderBy: { year: 'asc' } });
+    await logStint(USER, fuji, { from: 3 * H, to: 6 * H, watchedAt: new Date(2025, 4, 8, 21, 0), now: NOW });
+    await logStint(USER, spa, { from: 2 * H, to: 6 * H, watchedAt: new Date(2024, 4, 8, 21, 0), now: NOW });
+
+    const later = new Date(NOW.getTime() + 3_600_000);
+    // 2023 was never frozen (nothing happened in it), so there is nothing to rebuild.
+    const report = await recomputeCareer(USER, { now: later, rebuildChronicleYears: [2025, 2023, 2025] });
+    expect(report.chaptersRebuilt).toEqual([2025]);
+    const after = await prisma.chronicleYear.findMany({ where: { userId: USER }, orderBy: { year: 'asc' } });
+    expect(after[0]).toEqual(frozen[0]);
+    expect(after[1]).toMatchObject({ year: 2025, frozenAt: frozen[1]!.frozenAt, wrappedSeenAt: null, rebuiltAt: later });
+    expect(upgradeChapterSnapshot(after[1]!.snapshot).summary.storyCompletes).toBe(1);
+    expect(upgradeChapterSnapshot(after[0]!.snapshot).summary.storyCompletes).toBe(0);
+    expect(await ledgerProblems(USER)).toEqual([]);
   });
 
   it('recompute re-sizes checkpoints to the current schedule once', async () => {

@@ -43,6 +43,11 @@
  *                   no stint), and one whose story is complete gets its
  *                   Expedition Summary, retrospectively. Chunks of Expedition
  *                   races, in id order.
+ *   P5  chronicle   Every finished year that is due — past its grace period,
+ *                   with something in it, and not frozen yet — has its
+ *                   Chronicle chapter frozen, now that its landmarks are
+ *                   dated and its summaries written. One year per chunk,
+ *                   oldest first; the account is complete when none is left.
  *
  * Later work appends its own phases to `CAREER_BACKFILL_PHASES`; an account
  * completed by an earlier build simply runs the new ones.
@@ -64,6 +69,7 @@ import type { RecordEvent } from '@/lib/domain/records';
 import { syncMilestones } from '@/lib/engines/achievement-engine';
 import { fillLandmarkDates, syncCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { loadTimelineInputs, type TimelineInputs } from '@/lib/engines/career-timeline-engine';
+import { freezeYear, yearsToFreeze } from '@/lib/engines/chronicle-engine';
 import { careerRecordProgression, reconcileExpedition, writeExpeditionSummary } from '@/lib/engines/expedition-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from '@/lib/engines/mastery-engine';
 import { computeCareerMetricsWithHistory } from '@/lib/engines/metrics';
@@ -78,7 +84,7 @@ export const CAREER_BACKFILL_KEY = 'careerBackfill';
 export const CAREER_BACKFILL_VERSION = '0.4.0';
 
 /** The phases this build runs, in order. */
-export const CAREER_BACKFILL_PHASES = ['P1', 'P2', 'P3', 'P4'] as const;
+export const CAREER_BACKFILL_PHASES = ['P1', 'P2', 'P3', 'P4', 'P5'] as const;
 export type PhaseKey = (typeof CAREER_BACKFILL_PHASES)[number];
 
 /**
@@ -467,6 +473,8 @@ export interface CareerBackfillSummary {
   expeditionCheckpoints: number;
   expeditionXp: number;
   summariesWritten: number;
+  /** Finished years whose Chronicle chapter this run froze. */
+  chaptersFrozen: number;
   /** What 0.3.x left in the ledger: counted when the account completes, never removed here (R11). */
   leftovers: { orphanedViewingRows: number; storyBonusesOfDeletedRaces: number };
 }
@@ -477,7 +485,7 @@ function emptySummary(userId: string): CareerBackfillSummary {
     racesCredited: 0, legacyRacesRepaired: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
     eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
     milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
-    expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0,
+    expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0, chaptersFrozen: 0,
     leftovers: { orphanedViewingRows: 0, storyBonusesOfDeletedRaces: 0 },
   };
 }
@@ -634,6 +642,30 @@ export async function runCareerBackfillFor(
         if (last) break;
       }
     }
+
+    if (phase === 'P5') {
+      for (;;) {
+        // The years still to freeze are the chapters not written yet, so a
+        // start that stops here carries on with the next one.
+        const due = await yearsToFreeze(prisma, userId, now);
+        if (due.length === 0) {
+          // Nothing (left) to freeze: the phase is done, and so is the account.
+          await chunk(withPhaseDone(marker, phase, now), async () => undefined);
+          break;
+        }
+        if (!clock.shouldStartChunk(estimate)) {
+          summary.pausedBefore = { phase, cursor: null };
+          return summary;
+        }
+        const ctx = await contextFor();
+        const [year] = due;
+        const last = due.length === 1;
+        const next = last ? withPhaseDone(marker, phase, now) : { ...marker, lastRunAt: now.toISOString() };
+        const frozen = await chunk(next, (tx) => freezeYear(tx, userId, year!, now, { timeline: ctx.timeline, progression: ctx.progression }));
+        if (frozen) summary.chaptersFrozen += 1;
+        if (last) break;
+      }
+    }
   }
 
   summary.completed = isComplete(marker);
@@ -668,7 +700,8 @@ export function describeCareerBackfill(summary: CareerBackfillSummary, name?: st
     `${count(summary.milestonesCreated)} new milestones (+${count(summary.milestoneXp)} XP), ` +
     `${count(summary.datesFilled)} dates filled, ${count(summary.datesRecognised)} recorded only; ` +
     `${count(summary.expeditionCheckpoints)} expedition checkpoints (+${count(summary.expeditionXp)} XP), ` +
-    `${count(summary.summariesWritten)} ${summary.summariesWritten === 1 ? 'summary' : 'summaries'}`;
+    `${count(summary.summariesWritten)} ${summary.summariesWritten === 1 ? 'summary' : 'summaries'}; ` +
+    `${count(summary.chaptersFrozen)} ${summary.chaptersFrozen === 1 ? 'chapter' : 'chapters'} frozen`;
   if (summary.pausedBefore === null) return `[career-backfill] ${who}: ${work}`;
   const where = summary.pausedBefore.cursor === null ? '' : ` (after race ${summary.pausedBefore.cursor})`;
   return `[career-backfill] ${who}: ${work}; paused before ${summary.pausedBefore.phase}${where}; continues on the next start`;

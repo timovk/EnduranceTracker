@@ -53,9 +53,11 @@ import { getRaceDetail, listRaces } from '@/lib/server/races';
 import { getEventLegacy, getEventsIndex, resolveEventForRaceInput } from '@/lib/engines/event-legacy-engine';
 import { recomputeRaceMasteries } from '@/lib/engines/mastery-engine';
 import {
-  createEventAction, findRacesToLinkAction, linkRacesToEventAction, mergeEventsAction, renameEventAction,
-  setEventArchivedAction, setExpeditionModeAction, unlinkRaceFromEventAction,
+  createEventAction, findRacesToLinkAction, linkRacesToEventAction, markWrappedSeenAction, mergeEventsAction,
+  rebuildChronicleYearAction, renameEventAction, setEventArchivedAction, setExpeditionModeAction, unlinkRaceFromEventAction,
 } from '@/lib/server/career-actions';
+import { ensureChroniclesFrozen, getChronicleChapter, getChronicleIndex, pendingWrapped } from '@/lib/engines/chronicle-engine';
+import { logViewingSession } from '@/lib/engines/session-engine';
 import {
   getExpeditionSummary, getExpeditionSummaryForRace, getExpeditionView,
 } from '@/lib/engines/expedition-engine';
@@ -387,6 +389,42 @@ describe('an Expedition belongs to the account whose race it is', () => {
     expect(await getExpeditionSummaryForRace(sam, raceId)).toBeNull();
     expect(await buildOutcomeForSession(sam, logged.data!.sessionId)).toBeNull();
     expect(await getExpeditionSummary(alex, summary.id)).toMatchObject({ id: summary.id, raceId });
+  });
+});
+
+describe('a chapter of the Chronicle belongs to the account whose year it is', () => {
+  it('a chronicle year cannot be rebuilt or marked seen from the other account', async () => {
+    // A stint of last year, logged through the engine with its date: the
+    // forms have no way to backdate one.
+    const raceId = await createRace(alex, { name: 'Alex’s Six' });
+    const lastYear = new Date(new Date().getFullYear() - 1, 5, 14, 21, 0);
+    await logViewingSession(alex, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: 3 * H, playbackSpeed: 1, watchedAt: lastYear, note: undefined,
+    }, lastYear);
+    const year = lastYear.getFullYear();
+    // Midsummer of this year: last year is well past its grace period whenever the test runs.
+    const now = new Date(year + 1, 5, 1, 12, 0);
+    expect(await ensureChroniclesFrozen(alex, now)).toEqual([year]);
+    const frozen = await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: alex, year } } });
+
+    expect(await as(sam, () => rebuildChronicleYearAction(year))).toMatchObject({ ok: false });
+    expect(await as(sam, () => markWrappedSeenAction(year))).toEqual({ ok: true });
+    expect(await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: alex, year } } })).toEqual(frozen);
+    expect(await prisma.chronicleYear.count({ where: { userId: sam } })).toBe(0);
+
+    // Nor read: Sam has no chapters, no Wrapped to open and nothing to be told about.
+    expect(await getChronicleChapter(sam, year, now)).toBeNull();
+    expect((await getChronicleIndex(sam, now)).years).toEqual([]);
+    expect(await pendingWrapped(sam, now)).toBeNull();
+
+    // Alex's own year is Alex's to mark and rebuild.
+    expect(await pendingWrapped(alex, now)).toEqual({ year });
+    expect(await as(alex, () => markWrappedSeenAction(year))).toEqual({ ok: true });
+    expect(await as(alex, () => rebuildChronicleYearAction(year))).toMatchObject({ ok: true });
+    const after = await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: alex, year } } });
+    expect(after.wrappedSeenAt).not.toBeNull();
+    expect(after.rebuiltAt).not.toBeNull();
+    expect(after.frozenAt).toEqual(frozen.frozenAt);
   });
 });
 

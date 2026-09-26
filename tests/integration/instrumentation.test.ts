@@ -1,17 +1,17 @@
 /**
  * `src/instrumentation.ts` — the only thing that starts the one-time 0.3.1
- * season reset and the 0.4.0 career backfill.
+ * season reset, the 0.4.0 career backfill and the Chronicle's freeze pass.
  *
- * Both modules have their own tests; these make sure the server start really
+ * Each module has its own tests; these make sure the server start really
  * reaches them, only in the Node runtime, that one failing never stops the
- * other or the server, and that a second start finds nothing left to do.
+ * others or the server, and that a second start finds nothing left to do.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { prisma, disconnectDb } from '@/lib/db/client';
 import { createAccount } from '@/lib/auth/accounts';
 import { SEASON_RESET_KEY } from '@/lib/server/upgrades/season-reset';
-import { isCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
+import { isCareerBackfillApplied, markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 import { addRace, H, logStint } from '../helpers/career-db';
 
 const PREFIX = 'InstrumentationTest';
@@ -52,15 +52,33 @@ async function seedCareerFrom032(): Promise<string> {
   return user.id;
 }
 
-/** Everything the career backfill writes for an account. */
+/** A career with a finished year: a race watched on a day of 2025, as a stint of 2025 logs it. */
+async function seedCareerWithAFinishedYear(): Promise<string> {
+  const user = await prisma.user.create({
+    data: { name: `${PREFIX} ${Math.random()}`, careerProfile: { create: {} } },
+    select: { id: true },
+  });
+  const raceId = await addRace(user.id, { name: 'Six Hours of 2025' });
+  const watchedAt = new Date(2025, 5, 14, 21, 0);
+  await logStint(user.id, raceId, { from: 0, to: 3 * H, watchedAt, now: watchedAt });
+  return user.id;
+}
+
+/** Everything the career backfill and the freeze pass write for an account. */
 async function backfilled(userId: string) {
-  const [ledger, milestones, races, marker] = await Promise.all([
+  const [ledger, milestones, races, marker, chapters] = await Promise.all([
     prisma.xPTransaction.findMany({ where: { userId }, orderBy: { id: 'asc' } }),
     prisma.milestoneProgress.findMany({ where: { userId }, orderBy: { id: 'asc' } }),
     prisma.race.findMany({ where: { userId }, orderBy: { id: 'asc' } }),
     prisma.configOverride.findMany({ where: { userId }, orderBy: { key: 'asc' } }),
+    prisma.chronicleYear.findMany({ where: { userId }, orderBy: { year: 'asc' } }),
   ]);
-  return { ledger, milestones, races, marker };
+  return { ledger, milestones, races, marker, chapters };
+}
+
+async function chaptersOf(userId: string): Promise<number[]> {
+  return (await prisma.chronicleYear.findMany({ where: { userId }, orderBy: { year: 'asc' }, select: { year: true } }))
+    .map((row) => row.year);
 }
 
 async function marked(userId: string): Promise<boolean> {
@@ -78,6 +96,7 @@ afterEach(() => {
   else process.env.NEXT_RUNTIME = originalRuntime;
   vi.doUnmock('@/lib/server/upgrades/season-reset');
   vi.doUnmock('@/lib/server/upgrades/career-backfill');
+  vi.doUnmock('@/lib/server/upgrades/chronicle-freeze');
   vi.resetModules();
   vi.restoreAllMocks();
 });
@@ -163,9 +182,8 @@ describe('register()', () => {
   it('logs a failure of the career backfill and still lets the server start', async () => {
     const { userId, passId } = await seedUnmarkedQ3Account();
     vi.resetModules();
-    vi.doMock('@/lib/server/upgrades/career-backfill', () => ({
-      STARTUP_BUDGET_MS: 30_000,
-      deadlineClock: () => ({ shouldStartChunk: () => true }),
+    vi.doMock('@/lib/server/upgrades/career-backfill', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/lib/server/upgrades/career-backfill')>(),
       runCareerBackfill: () => Promise.reject(new Error('the disk went away')),
     }));
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -183,19 +201,71 @@ describe('register()', () => {
 
   it('a second start changes nothing', async () => {
     const userId = await seedCareerFrom032();
+    const withAChapter = await seedCareerWithAFinishedYear();
     const logs = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     process.env.NEXT_RUNTIME = 'nodejs';
 
     const { register } = await import('@/instrumentation');
     await register();
     const first = await backfilled(userId);
+    const firstWithAChapter = await backfilled(withAChapter);
+    expect(firstWithAChapter.chapters.map((row) => row.year)).toEqual([2025]);
     expect(logs.mock.calls.some((call) => String(call[0]).includes(userId))).toBe(true);
 
     logs.mockClear();
     await register();
     expect(await backfilled(userId)).toEqual(first);
-    // Nothing was left to do for it, so nothing was said about it.
+    expect(await backfilled(withAChapter)).toEqual(firstWithAChapter);
+    // Nothing was left to do for either, so nothing was said about them.
     expect(logs.mock.calls.some((call) => String(call[0]).includes(userId))).toBe(false);
+    expect(logs.mock.calls.some((call) => String(call[0]).includes(withAChapter))).toBe(false);
+  });
+
+  it('freezes the finished years of a complete account at start-up', async () => {
+    const userId = await seedCareerWithAFinishedYear();
+    await markCareerBackfillApplied(userId);
+    process.env.NEXT_RUNTIME = 'nodejs';
+
+    const { register } = await import('@/instrumentation');
+    await register();
+    expect(await chaptersOf(userId)).toEqual([2025]);
+  });
+
+  it('the freeze pass skips accounts whose backfill is not complete', async () => {
+    const incomplete = await seedCareerWithAFinishedYear();
+    const complete = await seedCareerWithAFinishedYear();
+    await markCareerBackfillApplied(complete);
+    // A start whose backfill got no further: the first account is still to be upgraded.
+    vi.resetModules();
+    vi.doMock('@/lib/server/upgrades/career-backfill', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/lib/server/upgrades/career-backfill')>(),
+      runCareerBackfill: () => Promise.resolve([]),
+    }));
+    process.env.NEXT_RUNTIME = 'nodejs';
+
+    const { register } = await import('@/instrumentation');
+    await register();
+    expect(await isCareerBackfillApplied(incomplete)).toBe(false);
+    expect(await chaptersOf(incomplete)).toEqual([]);
+    expect(await chaptersOf(complete)).toEqual([2025]);
+  });
+
+  it('logs a failure of the freeze pass and still lets the server start', async () => {
+    const userId = await seedCareerFrom032();
+    vi.resetModules();
+    vi.doMock('@/lib/server/upgrades/chronicle-freeze', () => ({
+      freezeAllChronicles: () => Promise.reject(new Error('the disk went away')),
+    }));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    process.env.NEXT_RUNTIME = 'nodejs';
+
+    const { register } = await import('@/instrumentation');
+    await expect(register()).resolves.toBeUndefined();
+
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(String(errors.mock.calls[0]?.[0])).toContain('[chronicle] could not freeze finished years at start-up');
+    // The backfill before it still ran.
+    expect(await isCareerBackfillApplied(userId)).toBe(true);
   });
 
   it('new accounts are pre-marked', async () => {
