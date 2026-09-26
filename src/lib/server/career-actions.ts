@@ -1,14 +1,15 @@
 'use server';
 
 /**
- * Server actions for the career's history (0.4.0): recurring events and Race
- * Expeditions.
+ * Server actions for the career's history (0.4.0): recurring events, Race
+ * Expeditions and the Career Chronicle.
  *
  * The same rules as `actions.ts`: the signed-in account is resolved before
- * anything the browser sent is looked at, every key and race id is resolved
- * inside that account by the engine, the write happens in one transaction,
- * and the replay cache is cleared once it has committed. A refusal comes back
- * as one plain sentence.
+ * anything the browser sent is looked at, every key, race id and year is
+ * resolved inside that account by the engine, the write happens in one
+ * transaction, and the replay cache is cleared once it has committed. Any
+ * finished year of the Chronicle that is due is frozen before the write. A
+ * refusal comes back as one plain sentence.
  */
 
 import { revalidatePath } from 'next/cache';
@@ -22,11 +23,13 @@ import {
 } from '@/lib/engines/event-legacy-engine';
 import { eventHref } from '@/lib/engines/mastery-engine';
 import { setExpeditionMode, type ExpeditionModeSetting } from '@/lib/engines/expedition-engine';
+import { markWrappedSeen, rebuildChronicleYear } from '@/lib/engines/chronicle-engine';
 import { expeditionModeMessage } from '@/lib/copy/tone';
 import {
-  eventKeySchema, eventNameSchema, eventSuggestionIdSchema, raceIdsSchema,
+  chronicleYearSchema, eventKeySchema, eventNameSchema, eventSuggestionIdSchema, raceIdsSchema,
 } from '@/lib/validation/schemas';
 import type { ActionResult } from './actions';
+import { freezeFinishedYears } from './upgrades/chronicle-freeze';
 
 /** Event operations re-sync mastery and milestones, so they get a stint's generous limits. */
 const EVENT_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
@@ -55,8 +58,13 @@ function refusalMessage(reason: EventRefusalReason, existing: EventRef | null): 
 /** An operation that was refused: its sentence, and the event it points to when there is one. */
 type Refusal = { ok: false; message: string; existing: EventLink | null };
 
-/** Run an event operation in its transaction; a refusal becomes a sentence, anything else is a real fault. */
-async function attempt<T>(work: (tx: Tx) => Promise<T>): Promise<{ ok: true; value: T } | Refusal> {
+/**
+ * Run an event operation in its transaction, after freezing any finished
+ * year that is due; a refusal becomes a sentence, anything else is a real
+ * fault.
+ */
+async function attempt<T>(userId: string, work: (tx: Tx) => Promise<T>): Promise<{ ok: true; value: T } | Refusal> {
+  await freezeFinishedYears(userId, new Date());
   try {
     const value = await prisma.$transaction((tx) => work(tx as Tx), EVENT_TRANSACTION);
     return { ok: true, value };
@@ -112,7 +120,7 @@ export async function createEventAction(
   if (races !== null && !races.success) return { ok: false, message: 'Those races could not be read.' };
 
   const now = new Date();
-  const result = await attempt(async (tx) => {
+  const result = await attempt(userId, async (tx) => {
     const created = await createEvent(tx, userId, name.data, now);
     if (created.ok && races !== null) {
       await linkRaceGroups(tx, userId, [{ key: created.event.key, raceIds: races.data }], now);
@@ -138,7 +146,7 @@ export async function renameEventAction(form: FormData): Promise<ActionResult<{ 
   if (!key.success) return { ok: false, message: refusalMessage('not-found', null) };
   if (!name.success) return { ok: false, message: 'Give the event a name of up to 80 characters.' };
 
-  const result = await attempt((tx) => renameEvent(tx, userId, key.data, name.data));
+  const result = await attempt(userId, (tx) => renameEvent(tx, userId, key.data, name.data));
   if (!result.ok) {
     return result.existing === null ? refusal(result) : { ok: false, message: result.message, data: { existing: result.existing } };
   }
@@ -156,7 +164,7 @@ export async function mergeEventsAction(
   const into = eventKeySchema.safeParse(intoKey);
   if (!from.success || !into.success) return { ok: false, message: refusalMessage('not-found', null) };
 
-  const result = await attempt((tx) => mergeEvents(tx, userId, from.data, into.data, new Date()));
+  const result = await attempt(userId, (tx) => mergeEvents(tx, userId, from.data, into.data, new Date()));
   if (!result.ok) return refusal(result);
   afterEventWrite(userId, [from.data, into.data]);
   const target = await prisma.raceMastery.findFirst({
@@ -182,7 +190,7 @@ export async function linkRacesToEventAction(key: string, raceIds: string[]): Pr
   if (!event.success) return { ok: false, message: refusalMessage('not-found', null) };
   if (!races.success) return { ok: false, message: 'Pick at least one race.' };
 
-  const result = await attempt((tx) => linkRaceGroups(tx, userId, [{ key: event.data, raceIds: races.data }], new Date()));
+  const result = await attempt(userId, (tx) => linkRaceGroups(tx, userId, [{ key: event.data, raceIds: races.data }], new Date()));
   if (!result.ok) return refusal(result);
   const { linked } = result.value;
   if (linked === 0) return { ok: false, message: 'Those races are no longer in the library.' };
@@ -212,7 +220,7 @@ export async function linkStrongSuggestionsAction(suggestionIds: string[]): Prom
   }
   if (groups.size === 0) return { ok: false, message: 'Those suggestions have changed since the page was drawn.' };
 
-  const result = await attempt((tx) =>
+  const result = await attempt(userId, (tx) =>
     linkRaceGroups(tx, userId, [...groups].map(([key, raceIds]) => ({ key, raceIds })), new Date()));
   if (!result.ok) return refusal(result);
   const { linked } = result.value;
@@ -229,7 +237,7 @@ export async function unlinkRaceFromEventAction(raceId: string): Promise<ActionR
   // Looked up inside the account first, so another career's race id reads as gone.
   const previous = await prisma.race.findFirst({ where: { id: raceId, userId }, select: { iconicKey: true } });
   if (previous === null) return { ok: false, message: 'That race is no longer in the library.' };
-  const result = await attempt((tx) => unlinkRace(tx, userId, raceId, new Date()));
+  const result = await attempt(userId, (tx) => unlinkRace(tx, userId, raceId, new Date()));
   if (!result.ok) return refusal(result);
   afterEventWrite(userId, previous.iconicKey === null ? [] : [previous.iconicKey]);
   revalidatePath(`/races/${raceId}`);
@@ -242,7 +250,7 @@ export async function setEventArchivedAction(key: string, archived: boolean): Pr
   const event = eventKeySchema.safeParse(key);
   if (!event.success) return { ok: false, message: refusalMessage('not-found', null) };
 
-  const result = await attempt((tx) => setEventArchived(tx, userId, event.data, archived, new Date()));
+  const result = await attempt(userId, (tx) => setEventArchived(tx, userId, event.data, archived, new Date()));
   if (!result.ok) return refusal(result);
   afterEventWrite(userId, [event.data]);
   return { ok: true, message: archived ? 'Archived. It is kept, out of the way.' : 'Back in your events.' };
@@ -302,8 +310,10 @@ export async function setExpeditionModeAction(
   if (!race.success) return { ok: false, message: 'That race is no longer in the library.' };
   if (!isExpeditionMode(mode)) return { ok: false, message: 'That is not one of the Expedition Mode settings.' };
 
+  const now = new Date();
+  await freezeFinishedYears(userId, now);
   const change = await prisma.$transaction(
-    (tx) => setExpeditionMode(tx as Tx, userId, raceId, mode, new Date()),
+    (tx) => setExpeditionMode(tx as Tx, userId, raceId, mode, now),
     EVENT_TRANSACTION,
   );
   if (change === null) return { ok: false, message: 'That race is no longer in the library.' };
@@ -326,4 +336,50 @@ export async function setExpeditionModeAction(
     }),
     data: { mode: change.mode, isExpedition: change.isExpedition, xpAwarded },
   };
+}
+
+// ---------------------------------------------------------------------------
+// The Career Chronicle
+// ---------------------------------------------------------------------------
+
+/** After a chapter changed: the Chronicle, the chapter and its Wrapped, and the dashboard's prompt. */
+function afterChronicleWrite(year: number): void {
+  for (const path of ['/chronicle', `/chronicle/${year}`, `/chronicle/${year}/wrapped`, '/']) revalidatePath(path);
+}
+
+/**
+ * Rebuild a frozen chapter from the history as it stands today (§4.5.2),
+ * after the page has asked for a confirmation. The only way a frozen year
+ * changes besides `db:recompute`; the year's Wrapped follows it.
+ */
+export async function rebuildChronicleYearAction(year: number): Promise<ActionResult> {
+  const userId = await requireUserId();
+  const parsed = chronicleYearSchema.safeParse(year);
+  if (!parsed.success) return { ok: false, message: 'That chapter could not be found.' };
+
+  const now = new Date();
+  await freezeFinishedYears(userId, now);
+  const rebuilt = await rebuildChronicleYear(userId, parsed.data, now);
+  if (!rebuilt) {
+    return { ok: false, message: `Your ${parsed.data} chapter is not frozen, so it already follows your history as it stands.` };
+  }
+  afterChronicleWrite(parsed.data);
+  return { ok: true, message: `Your ${parsed.data} chapter was rebuilt from your history as it stands today.` };
+}
+
+/**
+ * A frozen year's Wrapped was clicked through to its last card, or its prompt
+ * was hidden. Only a frozen year is marked; the Wrapped stays in the
+ * Chronicle either way.
+ */
+export async function markWrappedSeenAction(year: number): Promise<ActionResult> {
+  const userId = await requireUserId();
+  const parsed = chronicleYearSchema.safeParse(year);
+  if (!parsed.success) return { ok: false, message: 'That Wrapped could not be found.' };
+
+  const now = new Date();
+  await freezeFinishedYears(userId, now);
+  await markWrappedSeen(userId, parsed.data, now);
+  afterChronicleWrite(parsed.data);
+  return { ok: true };
 }

@@ -32,8 +32,11 @@ import {
 } from '@/lib/engines/stats-engine';
 import {
   backfillEventProgression, backfillExpeditions, backfillMilestones, backfillRaces, buildPhaseContext, EXPEDITION_CHUNK,
-  expeditionRaceIds, runCareerBackfillFor,
+  expeditionRaceIds, markCareerBackfillApplied, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
+import {
+  ensureChroniclesFrozen, freezeYear, getChronicleChapter, getChronicleIndex, yearsToFreeze,
+} from '@/lib/engines/chronicle-engine';
 import { eventStepProblems, expeditionProblems, ledgerProblems, logStint } from '../helpers/career-db';
 import type { LargeCareerDatabase, SeededCareer } from '../helpers/large-career-db';
 import { createLargeCareerDatabase } from '../helpers/large-career-db';
@@ -411,6 +414,98 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
     expect(records.records.length).toBeGreaterThan(5);
     const comparison = await compare(large);
     expect(comparison.rows.length).toBeGreaterThan(0);
+  }, SLOW);
+
+  it('builds the chapter of the year to date in under 800 ms for a real career, and 4 s cold and 1 s warm for a large one', async () => {
+    clearCareerTimelineCache();
+    const realLive = await timedAsync(() => getChronicleChapter(real.userId, real.now.getFullYear(), real.now));
+    clearCareerTimelineCache();
+    const cold = await timedAsync(() => getChronicleChapter(large.userId, large.now.getFullYear(), large.now));
+    const warm = await timedAsync(() => getChronicleChapter(large.userId, large.now.getFullYear(), large.now));
+    console.info(`/chronicle/[year], year to date — real ${realLive.ms.toFixed(0)} ms, `
+      + `large ${cold.ms.toFixed(0)} / ${warm.ms.toFixed(0)} ms (cold / warm)`);
+
+    expect(realLive.result?.state).toBe('year-to-date');
+    expect(warm.result?.state).toBe('year-to-date');
+    expect(warm.result!.chapter.summary.sessions).toBeGreaterThan(1_000);
+    expect(realLive.ms).toBeLessThan(800);
+    expect(cold.ms).toBeLessThan(4_000);
+    expect(warm.ms).toBeLessThan(1_000);
+  }, SLOW);
+
+  /** The real career's finished years are frozen at the start of the year after it; the large career's at its `now`. */
+  const realChronicleNow = () => new Date(real.now.getFullYear() + 1, 0, 5, 12, 0);
+
+  it('freezes a large career’s finished years (P5) one chunk per year, each in under 5 s, and a real career’s in one', async () => {
+    const context = await timedAsync(() => buildPhaseContext(large.userId, large.now));
+    expect(context.ms).toBeLessThan(3_000);
+    const years = await yearsToFreeze(prisma, large.userId, large.now);
+    expect(years.length).toBeGreaterThanOrEqual(9);
+
+    const chunks: number[] = [];
+    for (const year of years) {
+      const { result, ms } = await timedAsync(() => prisma.$transaction(
+        (tx) => freezeYear(tx as Tx, large.userId, year, large.now, {
+          timeline: context.result.timeline, progression: context.result.progression,
+        }),
+        CHUNK_TRANSACTION,
+      ));
+      expect(result, `${year}`).toBe(true);
+      chunks.push(ms);
+    }
+    await markCareerBackfillApplied(real.userId);
+    await markCareerBackfillApplied(large.userId);
+    clearCareerTimelineCache();
+    const realFreeze = await timedAsync(() => ensureChroniclesFrozen(real.userId, realChronicleNow()));
+    // Nothing left to freeze: what every write and page pays first.
+    const nothingDue = await timedAsync(() => ensureChroniclesFrozen(large.userId, large.now));
+    console.info(`P5 — large ${years.length} years, slowest chunk ${Math.max(...chunks).toFixed(0)} ms `
+      + `(all ${chunks.map((ms) => ms.toFixed(0)).join(', ')}); real ${realFreeze.ms.toFixed(0)} ms; `
+      + `nothing due ${nothingDue.ms.toFixed(0)} ms`);
+
+    expect(Math.max(...chunks)).toBeLessThan(5_000);
+    // The synthetic career's first stints reach back into the last days of 2016.
+    expect(realFreeze.result).toContain(real.now.getFullYear());
+    expect(realFreeze.ms).toBeLessThan(5_000);
+    expect(nothingDue.result).toEqual([]);
+    expect(nothingDue.ms).toBeLessThan(100);
+  }, SLOW);
+
+  it('builds the Chronicle index in under 300 ms for a real career and 500 ms for a large one', async () => {
+    clearCareerTimelineCache();
+    const realCold = await timedAsync(() => getChronicleIndex(real.userId, realChronicleNow()));
+    const realWarm = await timedAsync(() => getChronicleIndex(real.userId, realChronicleNow()));
+    clearCareerTimelineCache();
+    const cold = await timedAsync(() => getChronicleIndex(large.userId, large.now));
+    const warm = await timedAsync(() => getChronicleIndex(large.userId, large.now));
+    console.info(`/chronicle — real ${realCold.ms.toFixed(0)} / ${realWarm.ms.toFixed(0)} ms, `
+      + `large ${cold.ms.toFixed(0)} / ${warm.ms.toFixed(0)} ms (cold / warm)`);
+
+    expect(warm.result.years.filter((year) => year.kind === 'chapter' && year.state === 'frozen').length).toBeGreaterThanOrEqual(9);
+    expect(realCold.ms).toBeLessThan(300);
+    expect(realWarm.ms).toBeLessThan(300);
+    expect(warm.ms).toBeLessThan(500);
+    expect(cold.ms).toBeLessThan(5_000);
+  }, SLOW);
+
+  it('builds a frozen chapter in under 300 ms for a real career and 500 ms for a large one', async () => {
+    clearCareerTimelineCache();
+    const realCold = await timedAsync(() => getChronicleChapter(real.userId, real.now.getFullYear(), realChronicleNow()));
+    const realWarm = await timedAsync(() => getChronicleChapter(real.userId, real.now.getFullYear(), realChronicleNow()));
+    const year = large.now.getFullYear() - 3;
+    clearCareerTimelineCache();
+    const cold = await timedAsync(() => getChronicleChapter(large.userId, year, large.now));
+    const warm = await timedAsync(() => getChronicleChapter(large.userId, year, large.now));
+    console.info(`/chronicle/[year], frozen — real ${realCold.ms.toFixed(0)} / ${realWarm.ms.toFixed(0)} ms, `
+      + `large ${cold.ms.toFixed(0)} / ${warm.ms.toFixed(0)} ms (cold / warm)`);
+
+    expect(realWarm.result?.state).toBe('frozen');
+    expect(warm.result?.state).toBe('frozen');
+    expect(warm.result!.chapter.summary.sessions).toBeGreaterThan(1_000);
+    expect(realCold.ms).toBeLessThan(300);
+    expect(realWarm.ms).toBeLessThan(300);
+    expect(warm.ms).toBeLessThan(500);
+    expect(cold.ms).toBeLessThan(5_000);
   }, SLOW);
 
   it('deletes a stint from the last month in under 1 s for a real career and 2 s for a large one', async () => {

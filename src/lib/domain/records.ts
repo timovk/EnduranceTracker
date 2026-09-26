@@ -22,6 +22,7 @@ import type { LocalWindow } from './calendar';
 import { clipToWindow, dayKeyToLocalDate, localDayKey, localMonthKey, splitAcrossLocalDays } from './calendar';
 import type { CareerTimeline, StintEvent, TimelineRaceRow } from './career-timeline';
 import { longestConsecutiveRun } from './edition';
+import { formatElapsed } from './time';
 
 export type RecordKind =
   | 'longest-session' | 'most-in-a-day' | 'most-in-seven-days' | 'most-in-a-month'
@@ -100,6 +101,17 @@ export function recordLabel(kind: RecordKind, rollingDays: number = CAREER_STATS
     case 'most-new-coverage-in-a-day': return 'Most new race coverage in a day';
     case 'longest-edition-streak': return 'Longest run of complete editions';
   }
+}
+
+/**
+ * A record's value in words: a duration, a count, or a run of editions. The
+ * Expedition Summary and the Chronicle both say a record this way.
+ */
+export function recordValueText(record: Pick<RecordEvent, 'unit' | 'value'>): string {
+  if (record.unit === 'seconds') return formatElapsed(record.value);
+  const value = Math.round(record.value).toLocaleString('en-GB');
+  if (record.unit === 'editions') return `${value} ${record.value === 1 ? 'edition' : 'editions'}`;
+  return value;
 }
 
 const MONTH_NAMES = [

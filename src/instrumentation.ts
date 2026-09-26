@@ -16,7 +16,8 @@
  * Everything here shares one start-up budget (`STARTUP_BUDGET_MS`), measured
  * from the moment `register` starts: the desktop shell waits for the server
  * to answer, and an upgrade that runs out of time carries on at the next
- * start rather than holding this one up.
+ * start rather than holding this one up. The Chronicle's freeze pass comes
+ * last and takes what the backfill leaves.
  */
 
 export async function register(): Promise<void> {
@@ -34,14 +35,31 @@ export async function register(): Promise<void> {
       console.error('[season-reset] could not run at start-up; it will be tried again on the next start', error);
     }
 
+    // Everything below shares one start-up budget, measured from the moment
+    // `register` began: the backfill works through it chunk by chunk, and
+    // the Chronicle's freeze pass takes whatever is left.
+    const { deadlineClock, STARTUP_BUDGET_MS } = await import('@/lib/server/upgrades/career-backfill');
+    const clock = deadlineClock(startedAt + STARTUP_BUDGET_MS);
+
     // 0.4.0: the career backfill, as far as the start-up budget allows. It
     // records its progress as it goes, so an account it does not finish, or
     // fails on, carries on from where it stopped at the next start.
     try {
-      const { deadlineClock, runCareerBackfill, STARTUP_BUDGET_MS } = await import('@/lib/server/upgrades/career-backfill');
-      await runCareerBackfill({ now: new Date(), clock: deadlineClock(startedAt + STARTUP_BUDGET_MS) });
+      const { runCareerBackfill } = await import('@/lib/server/upgrades/career-backfill');
+      await runCareerBackfill({ now: new Date(), clock });
     } catch (error) {
       console.error('[career-backfill] could not run at start-up; it will be tried again on the next start', error);
+    }
+
+    // 0.4.0: the Chronicle's freeze pass, on every start. A finished year is
+    // frozen once its grace period is over, for every account whose backfill
+    // is complete; when nothing is due, which is almost always, it costs a
+    // few small reads per account.
+    try {
+      const { freezeAllChronicles } = await import('@/lib/server/upgrades/chronicle-freeze');
+      await freezeAllChronicles({ now: new Date(), shouldContinue: () => clock.shouldStartChunk(1_000) });
+    } catch (error) {
+      console.error('[chronicle] could not freeze finished years at start-up; the Chronicle will try again when opened', error);
     }
   }
 }

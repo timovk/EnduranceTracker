@@ -14,6 +14,10 @@
  * an action is handed an entity id — a race, a championship — that id is
  * checked against the caller before it is written through, so a uuid belonging
  * to another career reads as gone rather than as something to edit.
+ *
+ * An action that changes the history, or how it is counted, first freezes any
+ * finished year of the Chronicle that is due (0.4.0), so no write can reach
+ * back into a year that is over.
  */
 
 import { revalidatePath } from 'next/cache';
@@ -33,6 +37,7 @@ import { formatNumber } from '@/lib/utils';
 import { championshipSlug, ensureCareer, ensureChampionshipPresets } from './bootstrap';
 import { DISPLAY_TITLE_KEY, getCosmeticState, isChoosable, type CosmeticKind } from './cosmetics';
 import { rememberStintEntryMode } from './preferences';
+import { freezeFinishedYears } from './upgrades/chronicle-freeze';
 import { isStintEntryMode } from '@/lib/domain/race-clock';
 
 export interface ActionResult<T = undefined> {
@@ -134,6 +139,7 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
 
   const input = parsed.data;
   const now = new Date();
+  await freezeFinishedYears(userId, now);
   const { resolveEventForRaceInput } = await import('@/lib/engines/event-legacy-engine');
   const race = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
@@ -195,6 +201,7 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
 
   const input = parsed.data;
   const now = new Date();
+  await freezeFinishedYears(userId, now);
   const choosesEvent = formChoosesEvent(form);
   const { resyncAfterRaceEdit } = await import('@/lib/engines/progression-resync');
   const { resolveEventForRaceInput } = await import('@/lib/engines/event-legacy-engine');
@@ -366,6 +373,7 @@ export async function setRaceStatusAction(raceId: string, status: string): Promi
     return { ok: false, message: 'That status is not one of the options.' };
   }
 
+  await freezeFinishedYears(userId, new Date());
   // updateMany rather than update: the userId in the `where` is what makes
   // another account's race id a no-op instead of an edit.
   const { count } = await prisma.race.updateMany({
@@ -389,8 +397,10 @@ export async function deleteRaceAction(
   raceId: string,
 ): Promise<ActionResult<{ raceName: string; xpRemoved: number }>> {
   const userId = await requireUserId();
+  const now = new Date();
+  await freezeFinishedYears(userId, now);
   const { deleteRace } = await import('@/lib/engines/session-engine');
-  const removal = await deleteRace(userId, raceId, new Date());
+  const removal = await deleteRace(userId, raceId, now);
   if (removal === null) return { ok: false, message: 'That race is no longer in the library.' };
 
   clearCareerTimelineCache(userId);
@@ -428,6 +438,10 @@ export async function logSessionAction(form: FormData): Promise<ActionResult<{ s
     return { ok: false, message: 'That stint could not be read.', errors: fieldErrors(parsed.error.issues) };
   }
 
+  // A stint's time reaches back from when it is logged, so a finished year is
+  // frozen before this one is added: after its grace period, nothing can add
+  // time to it.
+  await freezeFinishedYears(userId, new Date());
   const { InvalidStintError, logViewingSession } = await import('@/lib/engines/session-engine');
   let outcome: Awaited<ReturnType<typeof logViewingSession>>;
   try {
@@ -463,6 +477,7 @@ export async function deleteSessionAction(sessionId: string): Promise<ActionResu
   });
   if (!session) return { ok: false, message: 'That session is no longer recorded.' };
 
+  await freezeFinishedYears(userId, new Date());
   const { deleteViewingSession } = await import('@/lib/engines/session-engine');
   const removal = await deleteViewingSession(userId, sessionId);
   clearCareerTimelineCache(userId);
@@ -503,6 +518,7 @@ export async function createChampionshipAction(form: FormData): Promise<ActionRe
     return { ok: false, errors: fieldErrors(parsed.error.issues), message: 'Check the championship details.' };
   }
 
+  await freezeFinishedYears(userId, new Date());
   const championship = await prisma.championship.upsert({
     where: { userId_slug: { userId, slug: championshipSlug(parsed.data.name) } },
     update: { name: parsed.data.name, shortName: parsed.data.shortName ?? null, accentColor: parsed.data.accentColor },
@@ -543,6 +559,7 @@ export async function upsertSeasonAction(form: FormData): Promise<ActionResult> 
   });
   if (!championship) return { ok: false, message: 'That championship is no longer in the library.' };
 
+  await freezeFinishedYears(userId, new Date());
   await prisma.championshipSeason.upsert({
     where: { championshipId_year: { championshipId: parsed.data.championshipId, year: parsed.data.year } },
     update: { label: parsed.data.label ?? null, plannedRaceCount: parsed.data.plannedRaceCount },
@@ -611,6 +628,10 @@ export async function updateSettingsAction(form: FormData): Promise<ActionResult
       return { ok: false, message: "That one hasn't been unlocked yet, so nothing was changed." };
     }
   }
+
+  // The week start is how a chapter counts its weeks: a finished year keeps
+  // the one it was counted with.
+  if (input.weekStart !== undefined) await freezeFinishedYears(userId, new Date());
 
   await prisma.$transaction(async (tx) => {
     if (input.weekStart !== undefined) {

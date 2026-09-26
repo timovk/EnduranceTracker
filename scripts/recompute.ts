@@ -15,6 +15,11 @@
  *                                          also date every milestone again from
  *                                          the replay (developer repair; see
  *                                          `recomputeCareer`)
+ *     npm run db:recompute -- --rebuild-chronicle 2026 [Alex]
+ *                                          also rebuild the frozen 2026 chapter
+ *                                          of the Chronicle from today's
+ *                                          history; repeat the option for more
+ *                                          than one year
  *
  * There is no signed-in session here, so the account cannot be inferred. Every
  * account is the default because a re-balance applies to all of them, and
@@ -50,22 +55,40 @@ async function resolveAccounts(target: string | undefined): Promise<Account[]> {
 interface Arguments {
   target: string | undefined;
   rebuildMilestoneDates: boolean;
+  rebuildChronicleYears: number[];
 }
 
-/** The account named on the command line, if any, and the flags. */
+/**
+ * The account named on the command line, if any, and the options.
+ * `--rebuild-chronicle` takes the year after it, so that year is never read
+ * as an account's name.
+ */
 function parseArguments(argv: readonly string[]): Arguments {
-  const flags = argv.filter((argument) => argument.startsWith('--'));
-  for (const flag of flags) {
-    if (flag !== '--rebuild-milestone-dates') throw new Error(`Unknown option "${flag}".`);
+  const parsed: Arguments = { target: undefined, rebuildMilestoneDates: false, rebuildChronicleYears: [] };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === '--rebuild-milestone-dates') {
+      parsed.rebuildMilestoneDates = true;
+    } else if (argument === '--rebuild-chronicle') {
+      const year = argv[index + 1];
+      if (year === undefined || !/^\d{4}$/.test(year)) throw new Error('--rebuild-chronicle needs a year, such as 2026.');
+      parsed.rebuildChronicleYears.push(Number.parseInt(year, 10));
+      index += 1;
+    } else if (argument.startsWith('--')) {
+      throw new Error(`Unknown option "${argument}".`);
+    } else {
+      parsed.target ??= argument;
+    }
   }
-  return {
-    target: argv.find((argument) => !argument.startsWith('--')),
-    rebuildMilestoneDates: flags.includes('--rebuild-milestone-dates'),
-  };
+  return parsed;
 }
 
 async function rebuild(account: Account, now: Date, options: Arguments): Promise<void> {
-  const report = await recomputeCareer(account.id, { now, rebuildMilestoneDates: options.rebuildMilestoneDates });
+  const report = await recomputeCareer(account.id, {
+    now,
+    rebuildMilestoneDates: options.rebuildMilestoneDates,
+    rebuildChronicleYears: options.rebuildChronicleYears,
+  });
 
   console.log(`  races rebuilt from intervals and sessions   ${report.racesRebuilt}`);
   if (report.storyBonusesAwarded > 0) {
@@ -118,6 +141,18 @@ async function rebuild(account: Account, now: Date, options: Arguments): Promise
     console.log(`    re-sized ${expeditions.checkpointsResized} checkpoint(s) to their race's current length`);
   }
   console.log(`  expedition summaries written                ${expeditions.summariesWritten}`);
+
+  console.log(`  chronicle chapters frozen                   ${report.chaptersFrozen.length}`);
+  if (report.chaptersFrozen.length > 0) {
+    console.log(`    ${report.chaptersFrozen.join(', ')}`);
+  }
+  if (options.rebuildChronicleYears.length > 0) {
+    console.log(`  chronicle chapters rebuilt                  ${report.chaptersRebuilt.length}`);
+    const notFrozen = options.rebuildChronicleYears.filter((year) => !report.chaptersRebuilt.includes(year));
+    if (notFrozen.length > 0) {
+      console.log(`    ${notFrozen.join(', ')} not frozen, so there was nothing to rebuild`);
+    }
+  }
 
   console.log('\n  Current totals');
   console.log(`    races               ${report.totals.races}`);

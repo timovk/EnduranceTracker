@@ -13,8 +13,9 @@
  */
 
 import { EXPEDITION_CONFIG, EXPEDITION_SHAPE, TIMELINE_SHAPE } from '@/lib/config';
+import type { ChronicleChapterV1, WrappedCard } from '@/lib/domain/chronicle';
 import { clampIntervals, gapsIn } from '@/lib/domain/intervals';
-import { formatDuration } from '@/lib/domain/time';
+import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
 import type { Interval, MilestonePrecision } from '@/lib/domain/types';
 
 /** Words this application does not say to its user. */
@@ -444,6 +445,178 @@ export function differencePhrase(difference: number, unit: 'seconds' | 'count' |
       if (tenths === 0) return 'the same';
       return `${tenths.toLocaleString('en-GB')} ${tenths === 1 ? 'point' : 'points'} ${up ? 'higher' : 'lower'}`;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The Career Chronicle and Endurance Wrapped (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// A chapter says what a year held, never what it did not: a figure with
+// nothing behind it is left out of the sentence rather than said as a zero,
+// and a race not watched to its end is told by how much of its story was
+// seen. Wrapped is a celebration, so every card says one warm, plain thing.
+
+/** "the 6 Hours of Fuji", but "The Race of Champions" as it is. */
+function theRace(name: string): string {
+  return /^the\s/i.test(name) ? name : `the ${name}`;
+}
+
+/** "a, b and c". */
+function listOf(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts.join('');
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+function plural(value: number, one: string, many: string): string {
+  return `${count(value)} ${value === 1 ? one : many}`;
+}
+
+/**
+ * A chapter in one line: "2026: 212 hours at the track, 14 races experienced
+ * and 9 complete race stories." A year still being written says "so far".
+ */
+export function chapterHeadline(chapter: Pick<ChronicleChapterV1, 'year' | 'complete' | 'summary'>): string {
+  const { summary } = chapter;
+  const when = chapter.complete ? `${chapter.year}` : `${chapter.year} so far`;
+  if (summary.sessions === 0 && summary.creditedSeconds < 60) {
+    return chapter.complete ? `${when}: a quiet year at the track.` : `${when}: the chapter starts with your next stint.`;
+  }
+  const parts = [`${hoursFigure(summary.creditedSeconds / 3600)} at the track`];
+  if (summary.racesExperienced > 0) parts.push(`${plural(summary.racesExperienced, 'race', 'races')} experienced`);
+  if (summary.storyCompletes > 0) parts.push(`${plural(summary.storyCompletes, 'complete race story', 'complete race stories')}`);
+  return `${when}: ${listOf(parts)}.`;
+}
+
+/**
+ * How the career began, in the chapter of its first year: "Your chronicle
+ * begins on 22 September 2026 with the 6 Hours of Fuji.", then the first
+ * complete race story and the first edition of an event, when they happened
+ * in that year. Empty for any other year.
+ */
+export function chapterBeginning(beginnings: ChronicleChapterV1['beginnings']): string[] {
+  const first = beginnings?.firstStint ?? null;
+  if (beginnings === null || first === null) return [];
+  const sentences = [`Your chronicle begins on ${longDate(new Date(first.at))} with ${theRace(first.raceName)}.`];
+  const story = beginnings.firstStoryComplete;
+  if (story !== null) {
+    sentences.push(`Your first complete race story followed on ${longDate(new Date(story.at))}: ${theRace(story.raceName)}.`);
+  }
+  const edition = beginnings.firstEventEdition;
+  if (edition !== null) {
+    sentences.push(
+      `Your first edition of ${edition.eventName} came on ${longDate(new Date(edition.at))}, with ${theRace(edition.raceName)}.`,
+    );
+  }
+  return sentences;
+}
+
+/** The opening card's sentence: the career's beginning in its first year, otherwise the year itself. */
+export function wrappedOpeningLine(card: Extract<WrappedCard, { kind: 'opening' }>): string {
+  if (card.beginning !== null) {
+    return `Your chronicle begins on ${longDate(new Date(card.beginning.at))} with ${theRace(card.beginning.raceName)}.`;
+  }
+  return card.complete
+    ? `Your ${card.year} in endurance racing, card by card.`
+    : `Your ${card.year} so far, card by card: a chapter still being written.`;
+}
+
+/** Days, end to end: whole from ten, one decimal below. */
+function daysFigure(days: number): string {
+  const shown = days >= 10 ? Math.round(days) : Math.round(days * 10) / 10;
+  return `${shown.toLocaleString('en-GB')} ${shown === 1 ? 'day' : 'days'}`;
+}
+
+function sharePercent(share: number): string {
+  const percent = Math.round(share * 100);
+  return percent < 1 ? 'under 1%' : `${percent}%`;
+}
+
+/**
+ * One plain, warm sentence per Wrapped card: "212 hours at the track — about
+ * 8.8 days, end to end." or "Your longest race was the 24 Hours of Le Mans:
+ * 62% of the story so far." Never a shortfall, never a "not".
+ */
+export function wrappedCardLine(card: WrappedCard): string {
+  switch (card.kind) {
+    case 'opening':
+      return wrappedOpeningLine(card);
+    case 'hours': {
+      const hours = hoursFigure(card.creditedSeconds / 3600);
+      if (card.equivalentDays >= 1) return `${hours} at the track — about ${daysFigure(card.equivalentDays)}, end to end.`;
+      return `${hours} at the track, across ${plural(card.activeDays, 'day', 'days')} of viewing.`;
+    }
+    case 'races':
+      if (card.racesExperienced === 0) return 'Races started, with their stories still to watch.';
+      if (card.storyCompletes === 0) return `${plural(card.racesExperienced, 'race', 'races')} experienced.`;
+      return `${plural(card.racesExperienced, 'race', 'races')} experienced, and ` +
+        `${plural(card.storyCompletes, 'complete race story', 'complete race stories')}.`;
+    case 'championship':
+      return `Your most-watched championship: ${card.name}, with ${hoursFigure(card.creditedSeconds / 3600)} — ` +
+        `${sharePercent(card.share)} of your viewing.`;
+    case 'event': {
+      const editions = card.editionsExperienced > 0
+        ? ` across ${plural(card.editionsExperienced, 'edition', 'editions')} experienced`
+        : '';
+      return `Your most-watched recurring event: ${card.name}, with ${hoursFigure(card.creditedSeconds / 3600)}${editions}.`;
+    }
+    case 'longest-race':
+      if (card.storyComplete) {
+        return `Your longest race was ${theRace(card.name)}: ${formatDuration(card.runtimeSec)}, a complete race story.`;
+      }
+      return `Your longest race was ${theRace(card.name)}: ${formatCoveragePercent(card.coverageSeconds, card.runtimeSec)} ` +
+        `of the story ${card.asOf === null ? `seen by the end of ${card.year}` : 'so far'}.`;
+    case 'longest-session':
+      return `Your longest session: ${formatDuration(card.creditedSeconds)} of ${theRace(card.raceName)}, ` +
+        `on ${longDate(new Date(card.at))}.`;
+    case 'circuit':
+      return `Your favourite circuit: ${card.name}, with ${hoursFigure(card.creditedSeconds / 3600)} — ` +
+        `${sharePercent(card.share)} of your viewing.`;
+    case 'active': {
+      const parts: string[] = [];
+      if (card.month !== null) parts.push(`${card.month.label} was your busiest month, with ${formatDuration(card.month.seconds)}`);
+      if (card.week !== null) {
+        const days = card.week.clipped ? ` (the days in ${card.year})` : '';
+        parts.push(`your biggest week was ${card.week.label}${days}, with ${formatDuration(card.week.seconds)}`);
+      }
+      const sentence = parts.join('; ');
+      return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+    }
+    case 'xp':
+      if (card.levelsGained > 0) {
+        return `${count(card.xpEarned)} XP earned, and ${plural(card.levelsGained, 'level', 'levels')} gained: ` +
+          `from level ${count(card.levelStart)} to level ${count(card.levelEnd)}.`;
+      }
+      if (card.xpEarned > 0) return `${count(card.xpEarned)} XP earned, on the way through level ${count(card.levelEnd)}.`;
+      return `Level ${count(card.levelEnd)}, carried through the year.`;
+    case 'landmarks': {
+      const parts: string[] = [];
+      if (card.achievements > 0) parts.push(plural(card.achievements, 'achievement', 'achievements'));
+      if (card.milestones > 0) parts.push(plural(card.milestones, 'milestone', 'milestones'));
+      if (card.masterySteps > 0) parts.push(plural(card.masterySteps, 'mastery step', 'mastery steps'));
+      const highlights = card.highlights.length > 0 ? `, among them ${listOf(card.highlights)}` : '';
+      return `${listOf(parts)} reached${highlights}.`.replace(/^./, (first) => first.toUpperCase());
+    }
+    case 'expeditions':
+      if (card.count === 1) {
+        return `One Expedition completed: ${theRace(card.names[0] ?? '')}, with ${hoursFigure(card.creditedSeconds / 3600)} of viewing.`;
+      }
+      return `${count(card.count)} Expeditions completed, with ${hoursFigure(card.creditedSeconds / 3600)} of viewing between them.`;
+    case 'records': {
+      const records = card.records.map((record) => `${record.label.charAt(0).toLowerCase()}${record.label.slice(1)} (${record.valueText})`);
+      return `${card.records.length === 1 ? 'A personal record' : 'Personal records'} set: ${listOf(records)}.`;
+    }
+    case 'compared': {
+      const began = card.beganOn === null
+        ? ''
+        : `Your ${card.previousYear} chapter began on ${new Date(card.beganOn).toLocaleDateString('en-GB', { day: 'numeric', month: 'long' })}. `;
+      const rows = card.rows.map((row) => `${row.label}, ${differencePhrase(row.difference, row.unit)}`);
+      return `${began}Next to ${card.previousYear}: ${rows.join('; ')}.`;
+    }
+    case 'closing':
+      return card.asOf === null
+        ? `That was ${card.year}. The full chapter has every race, record and milestone.`
+        : `That is ${card.year} so far. The full chapter has every race, record and milestone.`;
   }
 }
 

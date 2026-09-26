@@ -28,8 +28,8 @@ import { editionIdentityOf } from './edition';
 import { furthestPoint, gapsIn, resumePoint } from './intervals';
 import { estimateRemaining } from './playback';
 import { storyCompleteBonus } from './progression';
-import { RECORD_ORDER, type RecordEvent, type RecordKind } from './records';
-import { formatCoveragePercent, formatElapsed } from './time';
+import { RECORD_ORDER, recordValueText, type RecordEvent, type RecordKind } from './records';
+import { formatCoveragePercent } from './time';
 import { RARITY_ORDER, type Interval, type Rarity } from './types';
 
 /**
@@ -330,14 +330,6 @@ export function eventStandingAt(
     if (history.storyCompletedAt !== null && history.storyCompletedAt <= at) complete.add(identity);
   }
   return { editionsExperienced: experienced.size, editionsStoryComplete: complete.size };
-}
-
-/** A record's value in words: a duration, a count, or a run of editions. */
-function recordValueText(record: RecordEvent): string {
-  if (record.unit === 'seconds') return formatElapsed(record.value);
-  const value = Math.round(record.value).toLocaleString('en-GB');
-  if (record.unit === 'editions') return `${value} ${record.value === 1 ? 'edition' : 'editions'}`;
-  return value;
 }
 
 /**

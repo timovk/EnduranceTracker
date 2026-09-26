@@ -15,14 +15,84 @@ import {
   weeksRemainingInYear, wholeWeeksRemainingInYear, yearPeriod, yearProgress,
 } from '@/lib/domain/periods';
 import {
-  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, describeFragments, differencePhrase, eventLegacyHeadline,
-  expeditionBudgetNote, expeditionModeMessage, EXPIRED_CHALLENGE_NOTE,
+  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, chapterBeginning, chapterHeadline, describeFragments,
+  differencePhrase, eventLegacyHeadline, expeditionBudgetNote, expeditionModeMessage, EXPIRED_CHALLENGE_NOTE,
   FORBIDDEN_TONE_WORDS, milestoneLabel, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
   seasonClosedStintNote, seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
   seasonPassClosedShortNote, stillAheadNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
-  yearToDateFact,
+  wrappedCardLine, wrappedOpeningLine, yearToDateFact,
 } from '@/lib/copy/tone';
+import type { ChronicleChapterV1, WrappedCard } from '@/lib/domain/chronicle';
 import { CAREER_MILESTONES, CAREER_MILESTONES_BY_ID, MILESTONES } from '@/lib/config';
+
+/** A chapter's summary for the headline, with every figure at a chosen size. */
+function chapterSummary(overrides: Partial<ChronicleChapterV1['summary']>): ChronicleChapterV1['summary'] {
+  return {
+    creditedSeconds: 0, newCoverageSeconds: 0, rewatchSeconds: 0, sessions: 0, activeDays: 0, racesExperienced: 0,
+    racesStarted: 0, storyCompletes: 0, championshipsWatched: 0, eventsWatched: 0, completionPercent: null,
+    xpEarned: 0, levelStart: 1, levelEnd: 1, levelsGained: 0, achievementsUnlocked: 0, milestonesReached: 0,
+    masteryStepsUnlocked: 0, masteryXp: 0, expeditionsCompleted: 0, ...overrides,
+  };
+}
+
+/** One card of every kind, at small, zero and large values, as Wrapped can show them. */
+function everyWrappedCard(): WrappedCard[] {
+  const cards: WrappedCard[] = [];
+  for (const asOf of [null, '2026-09-26T08:00:00.000Z']) {
+    for (const complete of [true, false]) {
+      cards.push({ asOf, kind: 'opening', year: 2026, careerYear: 1, complete, beginning: { at: '2026-09-22T20:00:00.000Z', raceName: '6 Hours of Fuji' } });
+      cards.push({ asOf, kind: 'opening', year: 2027, careerYear: 2, complete, beginning: null });
+    }
+    for (const creditedSeconds of [30, 3_600, 5_400, 36 * 3_600, 212 * 3_600]) {
+      cards.push({ asOf, kind: 'hours', creditedSeconds, activeDays: 1, equivalentDays: creditedSeconds / 86_400 });
+    }
+    for (const [racesExperienced, storyCompletes] of [[0, 0], [1, 0], [1, 1], [14, 9]] as const) {
+      cards.push({ asOf, kind: 'races', racesExperienced, storyCompletes });
+    }
+    for (const share of [0.004, 0.25, 1]) {
+      cards.push({ asOf, kind: 'championship', name: 'WEC', accent: '#0a7abf', creditedSeconds: 3_600 * 40 * share, share });
+      cards.push({ asOf, kind: 'circuit', name: 'Spa-Francorchamps', creditedSeconds: 3_600 * 40 * share, share });
+    }
+    for (const editionsExperienced of [0, 1, 4]) {
+      cards.push({ asOf, kind: 'event', name: '24 Hours of Le Mans', key: 'le-mans', creditedSeconds: 3_600 * 30, editionsExperienced });
+    }
+    for (const [storyComplete, coverageSeconds] of [[true, 86_400], [false, 0], [false, 60], [false, 53_568]] as const) {
+      cards.push({ asOf, kind: 'longest-race', name: '24 Hours of Le Mans', runtimeSec: 86_400, storyComplete, coverageSeconds, year: 2026 });
+    }
+    cards.push({ asOf, kind: 'longest-session', raceName: 'The Race of Champions', creditedSeconds: 45, at: '2026-06-14T20:00:00.000Z' });
+    cards.push({ asOf, kind: 'longest-session', raceName: '6 Hours of Spa', creditedSeconds: 6 * 3_600, at: '2026-05-01T20:00:00.000Z' });
+    cards.push({ asOf, kind: 'active', year: 2026, month: { label: 'June', seconds: 90 }, week: null });
+    cards.push({ asOf, kind: 'active', year: 2026, month: null, week: { label: 'Mon 28 – Thu 31 Dec', seconds: 7_200, clipped: true } });
+    cards.push({ asOf, kind: 'active', year: 2026, month: { label: 'March', seconds: 90_000 }, week: { label: 'Mon 2 – Sun 8 Mar', seconds: 36_000, clipped: false } });
+    for (const [xpEarned, levelsGained] of [[0, 0], [120, 0], [296_030, 28], [5_000, 1]] as const) {
+      cards.push({ asOf, kind: 'xp', xpEarned, levelStart: 1, levelEnd: 1 + levelsGained, levelsGained });
+    }
+    for (const [achievements, milestones, masterySteps, highlights] of [
+      [1, 0, 0, []], [0, 1, 0, ['250 hours']], [13, 5, 7, ['First 24-hour race completed', 'Around the Clock', '250 hours']],
+    ] as const) {
+      cards.push({ asOf, kind: 'landmarks', achievements, milestones, masterySteps, highlights: [...highlights] });
+    }
+    cards.push({ asOf, kind: 'expeditions', count: 1, names: ['24 Hours of Le Mans'], creditedSeconds: 24 * 3_600 });
+    cards.push({ asOf, kind: 'expeditions', count: 3, names: ['A', 'B', 'C'], creditedSeconds: 60 * 3_600 });
+    cards.push({ asOf, kind: 'records', records: [{ label: 'Longest session', valueText: '4h 24m' }] });
+    cards.push({ asOf, kind: 'records', records: [{ label: 'Longest session', valueText: '4h 24m' }, { label: 'Most in a day', valueText: '6h 00m' }, { label: 'Most Story Completes in a year', valueText: '5' }] });
+    for (const beganOn of [null, '2025-07-23T16:41:05.896Z']) {
+      for (const sign of [-1, 0, 1]) {
+        cards.push({
+          asOf, kind: 'compared', year: 2026, previousYear: 2025, beganOn,
+          rows: [
+            { label: 'hours watched', unit: 'seconds', a: 3_600, b: 3_600 + sign * 7_200, difference: sign * 7_200, percentChange: null },
+            { label: 'races experienced', unit: 'count', a: 1, b: 1 + sign, difference: sign, percentChange: null },
+            { label: 'complete race stories', unit: 'count', a: 0, b: 0, difference: 0, percentChange: null },
+            { label: 'XP earned', unit: 'xp', a: 1_000, b: 1_000 + sign * 900, difference: sign * 900, percentChange: sign * 90 },
+          ],
+        });
+      }
+    }
+    cards.push({ asOf, kind: 'closing', year: 2026 });
+  }
+  return cards;
+}
 
 describe('viewing weeks', () => {
   it('starts on Monday by default', () => {
@@ -233,6 +303,26 @@ function everyUserFacingString(): string[] {
     for (const difference of [0, 0.04, 1, -1, 12.5, -59, 3_600, -15_000, 1_234_567]) {
       strings.push(differencePhrase(difference, unit));
     }
+  }
+  for (const complete of [true, false]) {
+    for (const summary of [
+      chapterSummary({}), chapterSummary({ creditedSeconds: 30 }), chapterSummary({ creditedSeconds: 1_800, sessions: 1 }),
+      chapterSummary({ creditedSeconds: 3_600, sessions: 1, racesExperienced: 1 }),
+      chapterSummary({ creditedSeconds: 212 * 3_600, sessions: 90, racesExperienced: 14, storyCompletes: 9 }),
+      chapterSummary({ creditedSeconds: 5_400, sessions: 2, storyCompletes: 1 }),
+    ]) {
+      strings.push(chapterHeadline({ year: 2026, complete, summary }));
+    }
+  }
+  const beginning = {
+    firstStint: { at: '2026-09-22T20:00:00.000Z', raceId: 'r', raceName: '6 Hours of Fuji' },
+    firstStoryComplete: { at: '2026-09-23T20:00:00.000Z', raceId: 'r', raceName: 'The Race of Champions' },
+    firstEventEdition: { at: '2026-09-22T20:00:00.000Z', eventKey: 'fuji', eventName: 'Fuji 6 Hours', raceName: '6 Hours of Fuji' },
+  };
+  strings.push(...chapterBeginning(beginning), ...chapterBeginning({ ...beginning, firstStoryComplete: null, firstEventEdition: null }));
+  for (const card of everyWrappedCard()) {
+    strings.push(wrappedCardLine(card));
+    if (card.kind === 'opening') strings.push(wrappedOpeningLine(card));
   }
   return strings;
 }
@@ -452,6 +542,48 @@ describe('tone', () => {
         expect(differencePhrase(difference, unit)).not.toMatch(/worse|better|decline|behind|drop|down|up|lost|gain/i);
       }
     }
+  });
+
+  it('sums up a chapter in one line from what the year held, never from what it did not', () => {
+    const summary = chapterSummary({ creditedSeconds: 212 * 3_600, sessions: 90, racesExperienced: 14, storyCompletes: 9 });
+    expect(chapterHeadline({ year: 2026, complete: true, summary }))
+      .toBe('2026: 212 hours at the track, 14 races experienced and 9 complete race stories.');
+    expect(chapterHeadline({ year: 2027, complete: false, summary: chapterSummary({ creditedSeconds: 5_400, sessions: 2, racesExperienced: 1 }) }))
+      .toBe('2027 so far: 1.5 hours at the track and 1 race experienced.');
+    // A figure with nothing behind it is left out, not said as a zero.
+    expect(chapterHeadline({ year: 2027, complete: false, summary: chapterSummary({ creditedSeconds: 1_800, sessions: 1 }) }))
+      .toBe('2027 so far: 0.5 hours at the track.');
+    expect(chapterHeadline({ year: 2027, complete: false, summary: chapterSummary({}) }))
+      .toBe('2027 so far: the chapter starts with your next stint.');
+    expect(chapterHeadline({ year: 2029, complete: true, summary: chapterSummary({}) })).toBe('2029: a quiet year at the track.');
+  });
+
+  it('says one warm, plain sentence per Wrapped card, and never a shortfall', () => {
+    const lines = everyWrappedCard().map((card) => wrappedCardLine(card));
+    for (const line of lines) {
+      expect(line).toMatch(/^[A-Z0-9].*[.]$/);
+      expect(line).not.toMatch(/not completed|missed|incomplete|unfinished|only |fell short|behind|failed/i);
+    }
+    const card = (overrides: Partial<Extract<WrappedCard, { kind: 'hours' }>>): WrappedCard => ({
+      asOf: null, kind: 'hours', creditedSeconds: 212 * 3_600, activeDays: 41, equivalentDays: 212 / 24, ...overrides,
+    });
+    expect(wrappedCardLine(card({}))).toBe('212 hours at the track — about 8.8 days, end to end.');
+    expect(wrappedCardLine(card({ creditedSeconds: 5_400, activeDays: 2, equivalentDays: 5_400 / 86_400 })))
+      .toBe('1.5 hours at the track, across 2 days of viewing.');
+    expect(wrappedCardLine({ asOf: null, kind: 'longest-race', name: '24 Hours of Le Mans', runtimeSec: 86_400, storyComplete: false, coverageSeconds: 53_568, year: 2026 }))
+      .toBe('Your longest race was the 24 Hours of Le Mans: 62% of the story seen by the end of 2026.');
+    expect(wrappedCardLine({ asOf: '2026-09-26T08:00:00.000Z', kind: 'longest-race', name: '24 Hours of Le Mans', runtimeSec: 86_400, storyComplete: false, coverageSeconds: 53_568, year: 2026 }))
+      .toBe('Your longest race was the 24 Hours of Le Mans: 62% of the story so far.');
+    expect(wrappedCardLine({ asOf: null, kind: 'longest-race', name: 'The Race of Champions', runtimeSec: 7_200, storyComplete: true, coverageSeconds: 7_200, year: 2026 }))
+      .toBe('Your longest race was The Race of Champions: 2h 00m, a complete race story.');
+    expect(wrappedCardLine({ asOf: null, kind: 'races', racesExperienced: 0, storyCompletes: 0 }))
+      .toBe('Races started, with their stories still to watch.');
+    expect(wrappedCardLine({ asOf: null, kind: 'xp', xpEarned: 0, levelStart: 4, levelEnd: 4, levelsGained: 0 }))
+      .toBe('Level 4, carried through the year.');
+    expect(wrappedCardLine({ asOf: null, kind: 'championship', name: 'WEC', accent: null, creditedSeconds: 1_800, share: 0.004 }))
+      .toBe('Your most-watched championship: WEC, with 0.5 hours — under 1% of your viewing.');
+    expect(wrappedCardLine({ asOf: null, kind: 'closing', year: 2026 }))
+      .toBe('That was 2026. The full chapter has every race, record and milestone.');
   });
 
   it('makes even a short stint feel worthwhile', () => {

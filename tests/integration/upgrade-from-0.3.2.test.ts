@@ -22,6 +22,8 @@ import {
   runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
 import { expeditionSummarySnapshotSchema } from '@/lib/domain/expedition';
+import { upgradeChapterSnapshot } from '@/lib/domain/chronicle';
+import { getChronicleChapter, getChronicleIndex } from '@/lib/engines/chronicle-engine';
 import { eventStepProblems, expeditionProblems, ledgerProblems } from '../helpers/career-db';
 import type { FixtureCopy } from '../helpers/fixture-db';
 import { FIXTURE_GENERATED_AT, FIXTURE_USER_ID, pointPrismaAtFixture } from '../helpers/fixture-db';
@@ -163,7 +165,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
 
   /** Everything the backfill writes, for comparing one run with the next. */
   async function written() {
-    const [ledger, milestones, steps, races, credits, summaries] = await Promise.all([
+    const [ledger, milestones, steps, races, credits, summaries, chapters] = await Promise.all([
       prisma.xPTransaction.findMany({
         where: { userId: FIXTURE_USER_ID },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -178,8 +180,9 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
       prisma.race.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' }, select: { id: true, creditedViewingSec: true } }),
       prisma.eventStepCredit.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
       prisma.expeditionSummary.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
+      prisma.chronicleYear.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { year: 'asc' } }),
     ]);
-    return { ledger, milestones, steps, races, credits, summaries };
+    return { ledger, milestones, steps, races, credits, summaries, chapters };
   }
 
   let before: ReturnType<typeof untouchable>;
@@ -379,6 +382,34 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     }
   });
 
+  it('freezes the 2025 chapter, with its dates and its Expedition, and leaves 2026 to be written', async () => {
+    const rows = await prisma.chronicleYear.findMany({ where: { userId: FIXTURE_USER_ID } });
+    expect(rows.map((row) => row.year)).toEqual([2025]);
+    const [row] = rows;
+    expect(row).toMatchObject({ frozenAt: STARTED, rebuiltAt: null, wrappedSeenAt: null, schemaVersion: 1 });
+    const chapter = upgradeChapterSnapshot(row!.snapshot);
+    expect(chapter).toMatchObject({ year: 2025, complete: true, generatedAt: STARTED.toISOString() });
+    // The demo career's first year: one 24-hour race, watched to the end over a week of July.
+    expect(chapter.summary).toMatchObject({ racesStarted: 1, racesExperienced: 1, storyCompletes: 1, expeditionsCompleted: 1 });
+    expect(chapter.beginnings?.firstStint?.raceName).toBe('24 Hours of Fort Aurelia');
+    // Frozen after the upgrade dated them: every landmark it lists has its historical date.
+    expect(chapter.milestones.career.length).toBeGreaterThan(0);
+    for (const milestone of chapter.milestones.career) expect(milestone.at.startsWith('2025-'), milestone.id).toBe(true);
+    const [expedition] = chapter.expeditions;
+    const summary = await prisma.expeditionSummary.findFirstOrThrow({ where: { userId: FIXTURE_USER_ID, id: expedition!.summaryId } });
+    expect(summary.completedAt.getFullYear()).toBe(2025);
+
+    // 2026 is the year in progress: shown live, never frozen yet.
+    const index = await getChronicleIndex(FIXTURE_USER_ID, STARTED);
+    expect(index.years.map((year) => [year.year, year.kind === 'chapter' ? year.state : year.kind])).toEqual([
+      [2026, 'year-to-date'], [2025, 'frozen'],
+    ]);
+    expect(index.pendingWrapped).toEqual({ year: 2025 });
+    const live = await getChronicleChapter(FIXTURE_USER_ID, 2026, STARTED);
+    expect(live).toMatchObject({ state: 'year-to-date', careerYear: 2, frozen: null });
+    expect(live!.chapter.previousYear).toMatchObject({ year: 2025, careerBeganInYear: true, storyCompletes: 1 });
+  });
+
   it('keeps the ledger whole: every dedupe key once, and every running total right', async () => {
     const keys = await prisma.xPTransaction.groupBy({
       by: ['dedupeKey'],
@@ -398,7 +429,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
       completed: true, racesCredited: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
       eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
       milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
-      expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0,
+      expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0, chaptersFrozen: 0,
     });
     const again = await written();
     expect(again.ledger).toEqual(settled.ledger);
@@ -407,5 +438,6 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(again.races).toEqual(settled.races);
     expect(again.credits).toEqual(settled.credits);
     expect(again.summaries).toEqual(settled.summaries);
+    expect(again.chapters).toEqual(settled.chapters);
   });
 });
