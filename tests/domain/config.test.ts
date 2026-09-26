@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { milestoneLabel } from '@/components/races/stint-summary';
+import { milestoneLabel } from '@/lib/copy/tone';
 import { MILESTONES } from '@/lib/config/milestones';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

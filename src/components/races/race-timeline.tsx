@@ -7,15 +7,31 @@
  * the ACTUAL watched intervals, gaps and all. A race where you skipped an hour
  * in the middle looks visibly different from one you watched straight through,
  * which is exactly the distinction the Story Complete system is built on.
+ *
+ * The Expedition timeline (0.4.0) builds on it: the same bar with the resume
+ * point and the furthest point marked, every stint on a lane of its own under
+ * it, a sentence that names every stretch still to watch, and the list of
+ * them. Reaching the end is never drawn as having watched it all: the furthest
+ * point says in words that it is not the same as watched.
  */
 
 import * as React from 'react';
+import { EXPEDITION_SHAPE } from '@/lib/config';
+import { describeFragments } from '@/lib/copy/tone';
+import { stintLanes } from '@/lib/domain/stint-lanes';
 import { formatCoveragePercent, formatTimestamp, formatDuration } from '@/lib/domain/time';
 import type { Interval } from '@/lib/domain/types';
-import { cn } from '@/lib/utils';
+import { cn, formatDate } from '@/lib/utils';
+
+/** A point on the timeline worth naming: where to resume, and how far the race has been reached. */
+export interface TimelineMarker {
+  atSec: number;
+  label: string;
+  kind: 'resume' | 'furthest';
+}
 
 export function RaceTimeline({
-  intervals, runtimeSec, height = 'h-3', showHours = true, showGaps = true, className, accent,
+  intervals, runtimeSec, height = 'h-3', showHours = true, showGaps = true, className, accent, markers = [],
 }: {
   intervals: Interval[];
   runtimeSec: number;
@@ -24,6 +40,8 @@ export function RaceTimeline({
   showGaps?: boolean;
   className?: string;
   accent?: string | null;
+  /** Drawn on the bar, and named in a line under it so they can be read without a pointer. */
+  markers?: TimelineMarker[];
 }) {
   const [hover, setHover] = React.useState<number | null>(null);
   const color = accent ?? 'var(--accent)';
@@ -84,6 +102,18 @@ export function RaceTimeline({
           />
         ))}
 
+        {markers.map((marker) => (
+          <div
+            key={`${marker.kind}-${marker.atSec}`}
+            title={`${marker.label} ${formatTimestamp(marker.atSec)}`}
+            className={cn(
+              'pointer-events-none absolute inset-y-0 w-0.5',
+              marker.kind === 'resume' ? 'bg-ink' : 'border-l-2 border-dotted border-ink/80 bg-transparent',
+            )}
+            style={{ left: `calc(${(Math.min(marker.atSec, safeRuntime) / safeRuntime) * 100}% - 1px)` }}
+          />
+        ))}
+
         {hover !== null ? (
           <div
             className="pointer-events-none absolute inset-y-0 w-px bg-ink/70"
@@ -101,6 +131,109 @@ export function RaceTimeline({
         )}
         <span className="timing">{formatTimestamp(safeRuntime)}</span>
       </div>
+
+      {markers.length > 0 ? (
+        <ul className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[0.6875rem] text-ink-dim">
+          {markers.map((marker) => (
+            <li key={`${marker.kind}-${marker.atSec}`} className="inline-flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className={cn(
+                  'inline-block h-2.5 w-0.5',
+                  marker.kind === 'resume' ? 'bg-ink' : 'border-l-2 border-dotted border-ink/80',
+                )}
+              />
+              {marker.label} <span className="timing text-ink-muted">{formatTimestamp(marker.atSec)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+/** One stint as the expedition timeline draws it. */
+export interface TimelineStint {
+  sessionId: string;
+  startTimestampSec: number;
+  endTimestampSec: number;
+  watchedAt: Date;
+  playbackSpeed: number;
+  creditedSeconds: number;
+}
+
+/**
+ * The Expedition timeline: the coverage bar with the resume and furthest
+ * points marked, each stint as a thin bar at the part of the race it played —
+ * on a lane of its own where it overlaps another, so a re-watch sits under
+ * the first viewing — paler for older stints and full for the latest, a
+ * sentence naming every stretch still to watch, and the list of them.
+ */
+export function ExpeditionTimeline({
+  runtimeSec, intervals, stints, resumeAtSec, furthestSec, accent,
+}: {
+  runtimeSec: number;
+  intervals: Interval[];
+  /** Every stint, in canonical order. */
+  stints: TimelineStint[];
+  resumeAtSec: number;
+  furthestSec: number;
+  accent?: string | null;
+}) {
+  const color = accent ?? 'var(--accent)';
+  const safeRuntime = Math.max(1, runtimeSec);
+  const { lanes, hidden } = stintLanes(stints, EXPEDITION_SHAPE.stintLaneLimit);
+  const order = new Map(stints.map((stint, index) => [stint.sessionId, index]));
+  const latest = Math.max(1, stints.length - 1);
+
+  const markers: TimelineMarker[] = [];
+  if (resumeAtSec < runtimeSec) markers.push({ atSec: resumeAtSec, label: 'Resume at', kind: 'resume' });
+  if (furthestSec > 0) markers.push({ atSec: furthestSec, label: 'Furthest point reached — not the same as watched:', kind: 'furthest' });
+
+  return (
+    <div className="space-y-3">
+      <RaceTimeline intervals={intervals} runtimeSec={runtimeSec} accent={accent} height="h-4" markers={markers} />
+
+      {lanes.length > 0 ? (
+        <div>
+          <div className="label mb-1.5">Stints, oldest palest</div>
+          <div className="space-y-1" role="list" aria-label="Stints on the race timeline">
+            {lanes.map((lane, laneIndex) => (
+              <div key={laneIndex} className="relative h-1.5 w-full rounded-sm bg-panel-2">
+                {lane.map((stint) => {
+                  const age = (order.get(stint.sessionId) ?? 0) / latest;
+                  const width = ((stint.endTimestampSec - stint.startTimestampSec) / safeRuntime) * 100;
+                  const title = `${formatDate(stint.watchedAt, 'long')}: ${formatTimestamp(stint.startTimestampSec)} → ` +
+                    `${formatTimestamp(stint.endTimestampSec)} at ${stint.playbackSpeed}×, ${formatDuration(stint.creditedSeconds)}`;
+                  return (
+                    <div
+                      key={stint.sessionId}
+                      role="listitem"
+                      title={title}
+                      aria-label={title}
+                      className="absolute inset-y-0 rounded-sm"
+                      style={{
+                        left: `${(Math.min(stint.startTimestampSec, safeRuntime) / safeRuntime) * 100}%`,
+                        width: `${Math.max(0.4, width)}%`,
+                        background: color,
+                        opacity: stints.length === 1 ? 1 : 0.3 + 0.7 * age,
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          {hidden > 0 ? (
+            <p className="mt-1 text-[0.6875rem] text-ink-faint">
+              +{hidden} more {hidden === 1 ? 'stint' : 'stints'} over parts already drawn; every stint is in the table below.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      <p className="text-xs leading-relaxed text-ink-muted">{describeFragments(intervals, runtimeSec)}</p>
+      <GapList intervals={intervals} runtimeSec={runtimeSec} />
     </div>
   );
 }
@@ -147,7 +280,8 @@ export function GapList({
   );
 }
 
-function gapsBetween(intervals: Interval[], runtimeSec: number): Interval[] {
+/** The unwatched stretches of a race, in timeline order. */
+export function gapsBetween(intervals: Interval[], runtimeSec: number): Interval[] {
   const sorted = [...intervals].sort((a, b) => a.start - b.start);
   const gaps: Interval[] = [];
   let cursor = 0;
@@ -159,7 +293,8 @@ function gapsBetween(intervals: Interval[], runtimeSec: number): Interval[] {
   return gaps;
 }
 
-function describeCoverage(intervals: Interval[], runtimeSec: number): string {
+/** The bar's caption: "62.4% watched", floored so a race with a gap never reads 100%. */
+export function describeCoverage(intervals: Interval[], runtimeSec: number): string {
   const covered = intervals.reduce((sum, iv) => sum + (iv.end - iv.start), 0);
   // Floored, so a race with a gap never reads "100% watched".
   return `${formatCoveragePercent(covered, runtimeSec)} watched`;

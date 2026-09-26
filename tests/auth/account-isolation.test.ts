@@ -54,8 +54,12 @@ import { getEventLegacy, getEventsIndex, resolveEventForRaceInput } from '@/lib/
 import { recomputeRaceMasteries } from '@/lib/engines/mastery-engine';
 import {
   createEventAction, findRacesToLinkAction, linkRacesToEventAction, mergeEventsAction, renameEventAction,
-  setEventArchivedAction, unlinkRaceFromEventAction,
+  setEventArchivedAction, setExpeditionModeAction, unlinkRaceFromEventAction,
 } from '@/lib/server/career-actions';
+import {
+  getExpeditionSummary, getExpeditionSummaryForRace, getExpeditionView,
+} from '@/lib/engines/expedition-engine';
+import { buildOutcomeForSession } from '@/lib/server/session-summary';
 import type { Tx } from '@/lib/db/client';
 import {
   createChampionshipAction,
@@ -353,6 +357,36 @@ describe('an event belongs to the account that follows it', () => {
     expect(race.iconicKey).toBe('planted');
     expect(race.raceMasteryId).not.toBe(alexRow.id);
     expect(await prisma.race.count({ where: { raceMasteryId: alexRow.id, userId: sam } })).toBe(0);
+  });
+});
+
+describe('an Expedition belongs to the account whose race it is', () => {
+  it('Expedition Mode cannot be switched on the other account’s race', async () => {
+    const raceId = await createRace(alex, { name: 'Alex’s 24', raceType: 'H24', scheduledDuration: '24:00:00' });
+    expect((await as(alex, () => logSessionAction(stintForm(raceId, { endTimestamp: '13:00:00' })))).ok).toBe(true);
+    const held = await prisma.xPTransaction.count({ where: { userId: alex, source: 'EXPEDITION' } });
+    expect(held).toBe(3);
+
+    for (const mode of ['off', 'on', 'auto']) {
+      expect(await as(sam, () => setExpeditionModeAction(raceId, mode)))
+        .toEqual({ ok: false, message: 'That race is no longer in the library.' });
+    }
+    expect((await prisma.race.findUniqueOrThrow({ where: { id: raceId } })).expeditionMode).toBeNull();
+    expect(await prisma.xPTransaction.count({ where: { userId: alex, source: 'EXPEDITION' } })).toBe(held);
+    expect(await prisma.xPTransaction.count({ where: { userId: sam, source: 'EXPEDITION' } })).toBe(0);
+    expect(await getExpeditionView(sam, raceId, new Date())).toBeNull();
+  });
+
+  it('an expedition summary of the other account cannot be opened', async () => {
+    const raceId = await createRace(alex, { name: 'Alex’s Ten', raceType: 'H10', scheduledDuration: '10:00:00' });
+    const logged = await as(alex, () => logSessionAction(stintForm(raceId, { endTimestamp: '10:00:00' })));
+    expect(logged.ok, logged.message).toBe(true);
+    const summary = await prisma.expeditionSummary.findFirstOrThrow({ where: { userId: alex } });
+
+    expect(await getExpeditionSummary(sam, summary.id)).toBeNull();
+    expect(await getExpeditionSummaryForRace(sam, raceId)).toBeNull();
+    expect(await buildOutcomeForSession(sam, logged.data!.sessionId)).toBeNull();
+    expect(await getExpeditionSummary(alex, summary.id)).toMatchObject({ id: summary.id, raceId });
   });
 });
 

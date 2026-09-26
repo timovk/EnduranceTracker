@@ -39,7 +39,8 @@ export const ACHIEVEMENTS: readonly AchievementDef[] = [
   { key: 'the_long_game', name: 'The Long Game', description: 'Story Complete a race of at least eight hours.', category: 'endurance', rarity: 'UNCOMMON', metric: 'stories8h', threshold: 1, xpReward: 2_500, iconKey: 'hourglass' },
   { key: 'half_a_day', name: 'Half a Day', description: 'Story Complete a 12-hour race.', category: 'endurance', rarity: 'RARE', metric: 'stories12h', threshold: 1, xpReward: 4_000, iconKey: 'clock' },
   { key: 'twice_around_the_clock', name: 'Twice Around the Clock', description: 'Story Complete a 24-hour race.', category: 'endurance', rarity: 'EPIC', metric: 'stories24h', threshold: 1, xpReward: 10_000, iconKey: 'clock' },
-  { key: 'expedition', name: 'Expedition', description: 'Story Complete three 24-hour races.', category: 'endurance', rarity: 'LEGENDARY', metric: 'stories24h', threshold: 3, xpReward: 30_000, iconKey: 'mountain' },
+  // The key stays, so its dedupe key is unchanged; the name gives "Expedition" to Race Expeditions (0.4.0).
+  { key: 'expedition', name: 'Around the Clock, Three Times', description: 'Story Complete three 24-hour races.', category: 'endurance', rarity: 'LEGENDARY', metric: 'stories24h', threshold: 3, xpReward: 30_000, iconKey: 'mountain' },
   { key: 'night_shift', name: 'Night Shift', description: 'Story Complete five races of 10 hours or more.', category: 'endurance', rarity: 'EPIC', metric: 'stories10h', threshold: 5, xpReward: 15_000, iconKey: 'moon' },
 
   // -- Dedication -----------------------------------------------------------

@@ -45,6 +45,8 @@ export interface RaceCardData {
   priority: RacePriority;
   excitement: number;
   isMajorEvent: boolean;
+  /** Followed as a Race Expedition (0.4.0): ten hours or more, or switched on by hand. */
+  isExpedition: boolean;
   storyComplete: boolean;
   intervals: Interval[];
 }
@@ -172,6 +174,7 @@ export function RaceCard({
           ) : (
             <Badge tone="outline">{STATUS_LABEL[race.status]}</Badge>
           )}
+          {race.isExpedition ? <Badge tone="outline">Expedition</Badge> : null}
           {race.sessionCount > 0 ? (
             <span
               className={cn(

@@ -1,7 +1,8 @@
 'use server';
 
 /**
- * Server actions for the career's history (0.4.0): recurring events.
+ * Server actions for the career's history (0.4.0): recurring events and Race
+ * Expeditions.
  *
  * The same rules as `actions.ts`: the signed-in account is resolved before
  * anything the browser sent is looked at, every key and race id is resolved
@@ -20,6 +21,8 @@ import {
   type EventRef, type EventRefusalReason, type LinkableRace,
 } from '@/lib/engines/event-legacy-engine';
 import { eventHref } from '@/lib/engines/mastery-engine';
+import { setExpeditionMode, type ExpeditionModeSetting } from '@/lib/engines/expedition-engine';
+import { expeditionModeMessage } from '@/lib/copy/tone';
 import {
   eventKeySchema, eventNameSchema, eventSuggestionIdSchema, raceIdsSchema,
 } from '@/lib/validation/schemas';
@@ -271,4 +274,56 @@ export async function findRacesToLinkAction(key: string, query: string): Promise
   const event = eventKeySchema.safeParse(key);
   if (!event.success) return [];
   return findRacesToLink(userId, event.data, query.slice(0, 120));
+}
+
+// ---------------------------------------------------------------------------
+// Race Expeditions
+// ---------------------------------------------------------------------------
+
+const EXPEDITION_MODES: readonly ExpeditionModeSetting[] = ['auto', 'on', 'off'];
+
+function isExpeditionMode(value: string): value is ExpeditionModeSetting {
+  return (EXPEDITION_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Follow a race as an Expedition, stop following it, or let its length decide
+ * again (§4.3.4). One transaction: the setting, the checkpoints (switching off
+ * takes none back; switching on pays those already behind the race), and the
+ * summary of a race whose story is already complete. Any race can be switched
+ * on; its checkpoints pay XP from six hours of runtime.
+ */
+export async function setExpeditionModeAction(
+  raceId: string,
+  mode: string,
+): Promise<ActionResult<{ mode: ExpeditionModeSetting; isExpedition: boolean; xpAwarded: number }>> {
+  const userId = await requireUserId();
+  const race = raceIdsSchema.safeParse([raceId]);
+  if (!race.success) return { ok: false, message: 'That race is no longer in the library.' };
+  if (!isExpeditionMode(mode)) return { ok: false, message: 'That is not one of the Expedition Mode settings.' };
+
+  const change = await prisma.$transaction(
+    (tx) => setExpeditionMode(tx as Tx, userId, raceId, mode, new Date()),
+    EVENT_TRANSACTION,
+  );
+  if (change === null) return { ok: false, message: 'That race is no longer in the library.' };
+
+  clearCareerTimelineCache(userId);
+  for (const path of [`/races/${raceId}`, `/races/${raceId}/expedition`, '/races', '/', '/career', '/chronicle', '/stats']) {
+    revalidatePath(path);
+  }
+  const xpAwarded = change.awarded.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
+  return {
+    ok: true,
+    message: expeditionModeMessage({
+      mode: change.mode,
+      isExpedition: change.isExpedition,
+      paysXp: change.paysXp,
+      checkpointsBehind: change.awarded.length,
+      xpAwarded,
+      summaryWritten: change.summaryWritten,
+      hasSummary: change.hasSummary,
+    }),
+    data: { mode: change.mode, isExpedition: change.isExpedition, xpAwarded },
+  };
 }

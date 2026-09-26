@@ -6,6 +6,8 @@
  * right what 0.3.x could leave behind: coverage stored past a shortened
  * runtime, and a Story Complete bonus a runtime edit skipped (paid once,
  * career XP only) or one the clamped coverage no longer supports (released).
+ * It is also the one repair that re-sizes Expedition checkpoints to the
+ * current schedule, and it writes a completed Expedition's missing summary.
  */
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -13,8 +15,10 @@ import { disconnectDb, prisma } from '@/lib/db/client';
 import { storyCompleteBonus } from '@/lib/domain/progression';
 import { recomputeCareer } from '@/lib/server/recompute';
 import { isCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
+import { awardXp, rebuildCareerTotals } from '@/lib/engines/xp-ledger';
+import type { Tx } from '@/lib/db/client';
 import {
-  addRace, createCareerUser, eventStepProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
+  addRace, createCareerUser, eventStepProblems, expeditionProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
 
 const USER = '00000000-0000-4000-8000-0000000002e1';
@@ -31,7 +35,7 @@ afterAll(async () => {
 
 /** Everything recompute derives, without the ids and timestamps a rebuild legitimately renews. */
 async function derivedState() {
-  const [ledger, races, intervals, masteryProgress, achievements, milestones, events, profile] = await Promise.all([
+  const [ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries] = await Promise.all([
     prisma.xPTransaction.findMany({
       where: { userId: USER },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -82,8 +86,20 @@ async function derivedState() {
       where: { userId: USER },
       select: { careerXp: true, level: true, prestige: true, titleKey: true },
     }),
+    prisma.expeditionSummary.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } }),
   ]);
-  return { ledger, races, intervals, masteryProgress, achievements, milestones, events, profile };
+  return { ledger, races, intervals, masteryProgress, achievements, milestones, events, profile, summaries };
+}
+
+/** The checkpoints a race holds: percent, amount and the stint named, in order. */
+async function checkpoints(raceId: string) {
+  const rows = await prisma.xPTransaction.findMany({
+    where: { userId: USER, source: 'EXPEDITION', sourceRef: raceId },
+    select: { dedupeKey: true, amount: true, sessionId: true },
+  });
+  return rows
+    .map((row) => ({ percent: Number(row.dedupeKey!.split(':')[2]), amount: row.amount, sessionId: row.sessionId }))
+    .sort((a, b) => a.percent - b.percent);
 }
 
 describe('recompute', () => {
@@ -128,7 +144,65 @@ describe('recompute', () => {
       datesFilled: 0,
       datesRecognised: 0,
       milestoneDatesRebuilt: 0,
+      expeditions: { checkpointsAwarded: 0, xpAwarded: 0, checkpointsRevoked: 0, checkpointsResized: 0, summariesWritten: 0 },
     });
+    expect(second.ledger.staleExpeditionCheckpoints).toBe(0);
+    expect(await expeditionProblems(USER)).toEqual([]);
+  });
+
+  it('recompute re-sizes checkpoints to the current schedule once', async () => {
+    const race = await addRace(USER, { name: '24 Hours of Recompute', hours: 24 });
+    const watched = await logStint(USER, race, { from: 0, to: 7 * H, watchedAt: new Date(2026, 3, 1, 20, 0), now: NOW });
+    expect(await checkpoints(race)).toEqual([
+      { percent: 10, amount: 300, sessionId: watched.sessionId }, { percent: 25, amount: 450, sessionId: watched.sessionId },
+    ]);
+    // As an earlier schedule paid them.
+    for (const [percent, amount] of [[10, 250], [25, 400]] as const) {
+      await prisma.xPTransaction.updateMany({ where: { userId: USER, dedupeKey: `expedition:${race}:${percent}` }, data: { amount } });
+    }
+    await prisma.$transaction((tx) => rebuildCareerTotals(tx as Tx, USER));
+
+    const report = await recomputeCareer(USER, { now: NOW });
+    expect(report.expeditions).toMatchObject({ checkpointsResized: 2, checkpointsRevoked: 0, checkpointsAwarded: 0 });
+    // The same keys and the same stint, at today's amounts.
+    expect(await checkpoints(race)).toEqual([
+      { percent: 10, amount: 300, sessionId: watched.sessionId }, { percent: 25, amount: 450, sessionId: watched.sessionId },
+    ]);
+    expect(await ledgerProblems(USER)).toEqual([]);
+
+    const settled = await derivedState();
+    const again = await recomputeCareer(USER, { now: NOW });
+    expect(again.expeditions.checkpointsResized).toBe(0);
+    expect(await derivedState()).toEqual(settled);
+  });
+
+  it('takes back checkpoints no race supports, and writes a completed Expedition’s missing summary', async () => {
+    const race = await addRace(USER, { name: '10 Hours of Recompute', hours: 10 });
+    await logStint(USER, race, { from: 0, to: 3 * H, watchedAt: new Date(2026, 3, 1, 20, 0), now: NOW });
+    const completing = await logStint(USER, race, { from: 3 * H, to: 10 * H, watchedAt: new Date(2026, 3, 2, 20, 0), now: NOW });
+    await prisma.expeditionSummary.deleteMany({ where: { userId: USER } });
+    const partial = await addRace(USER, { name: '24 Hours of Too Much', hours: 24 });
+    await logStint(USER, partial, { from: 0, to: 3 * H, watchedAt: new Date(2026, 3, 3, 20, 0), now: NOW });
+    // A checkpoint its coverage does not reach, and one of a race that is gone.
+    await prisma.$transaction(async (tx) => {
+      await awardXp(tx as Tx, USER, {
+        source: 'EXPEDITION', amount: 750, description: 'Expedition — too far', sourceRef: partial, dedupeKey: `expedition:${partial}:90`,
+      });
+      await awardXp(tx as Tx, USER, {
+        source: 'EXPEDITION', amount: 300, description: 'Expedition — gone', sourceRef: 'gone-race', dedupeKey: 'expedition:gone-race:10',
+      });
+    });
+
+    const report = await recomputeCareer(USER, { now: NOW });
+    expect(report.ledger.staleExpeditionCheckpoints).toBe(1);
+    expect(report.expeditions).toMatchObject({ checkpointsRevoked: 1, summariesWritten: 1 });
+    expect((await checkpoints(partial)).map((row) => row.percent)).toEqual([10]);
+    expect(await prisma.xPTransaction.count({ where: { userId: USER, sourceRef: 'gone-race' } })).toBe(0);
+    const [summary] = await prisma.expeditionSummary.findMany({ where: { userId: USER } });
+    expect(summary).toMatchObject({ raceId: race, retrospective: true, completedAt: new Date(2026, 3, 2, 20, 0), createdAt: NOW });
+    expect((summary!.snapshot as { completingSessionId: string }).completingSessionId).toBe(completing.sessionId);
+    expect(await expeditionProblems(USER)).toEqual([]);
+    expect(await ledgerProblems(USER)).toEqual([]);
   });
 
   it('recompute rebuilds intervals and pays a Story Complete bonus a runtime edit skipped', async () => {

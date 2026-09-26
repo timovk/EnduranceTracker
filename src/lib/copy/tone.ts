@@ -12,9 +12,10 @@
  * `tests/domain/tone.test.ts` asserts no forbidden word ever appears here.
  */
 
-import { TIMELINE_SHAPE } from '@/lib/config';
+import { EXPEDITION_CONFIG, EXPEDITION_SHAPE, TIMELINE_SHAPE } from '@/lib/config';
+import { clampIntervals, gapsIn } from '@/lib/domain/intervals';
 import { formatDuration } from '@/lib/domain/time';
-import type { MilestonePrecision } from '@/lib/domain/types';
+import type { Interval, MilestonePrecision } from '@/lib/domain/types';
 
 /** Words this application does not say to its user. */
 export const FORBIDDEN_TONE_WORDS = [
@@ -278,6 +279,161 @@ export function eventLegacyHeadline(stats: {
 
 function count(value: number): string {
   return value.toLocaleString('en-GB');
+}
+
+// ---------------------------------------------------------------------------
+// Race Expeditions (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// An Expedition says what has been watched and what is still ahead, in that
+// order. Reaching the end of a race is never read as having seen all of it:
+// the stretches still to watch are always named. The viewing plan is a guide,
+// so a long race next to it is information, never a warning.
+
+/**
+ * The shape of the coverage in one sentence or two: "Watched in 3 stretches:
+ * 18h 12m of 24h 00m. 2 stretches still to watch, 5h 48m in total." The
+ * stretches are counted inside the runtime, so a race whose end has been
+ * reached still names every gap before it.
+ */
+export function describeFragments(intervals: readonly Interval[], runtimeSec: number): string {
+  const runtime = Math.max(0, Math.round(runtimeSec));
+  const watched = clampIntervals(intervals, runtime);
+  const covered = watched.reduce((sum, interval) => sum + interval.end - interval.start, 0);
+  if (watched.length === 0) return `Nothing watched yet: ${formatDuration(runtime)} still to watch.`;
+
+  const gaps = gapsIn(watched, runtime);
+  const still = gaps.reduce((sum, gap) => sum + gap.end - gap.start, 0);
+  const first = `Watched in ${count(watched.length)} ${watched.length === 1 ? 'stretch' : 'stretches'}: ` +
+    `${formatDuration(covered)} of ${formatDuration(runtime)}.`;
+  if (gaps.length === 0) return `${first} Every second of it is watched.`;
+  return gaps.length === 1
+    ? `${first} 1 stretch still to watch, ${formatDuration(still, { seconds: still < 60 })}.`
+    : `${first} ${count(gaps.length)} stretches still to watch, ${formatDuration(still, { seconds: still < 60 })} in total.`;
+}
+
+/** Hours as a figure: whole from ten, one decimal below it. */
+function hoursFigure(hours: number): string {
+  const shown = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
+  return `${shown.toLocaleString('en-GB')} ${shown === 1 ? 'hour' : 'hours'}`;
+}
+
+/**
+ * What the rest of a race asks of the viewing plan, in neutral words: the real
+ * time left at the race's own speed, its share of the hours left in the year's
+ * plan, this week's hours, and roughly how many weeks that is at the pace the
+ * plan recommends. A race longer than what is left of the plan is said to be
+ * so, and that it is entirely fine; the plan is a guide.
+ */
+export function expeditionBudgetNote(input: {
+  realRemainingSec: number;
+  speed: number;
+  year: number;
+  yearRemainingHours: number;
+  weekRemainingHours: number;
+  recommendedPaceHours: number;
+}): string {
+  const remaining = Math.max(0, input.realRemainingSec);
+  if (remaining === 0) return `Nothing of this race is still to watch, so it asks nothing more of your ${input.year} plan.`;
+
+  const hours = remaining / 3600;
+  const speed = `${Math.round(input.speed * 100) / 100}×`;
+  const sentences = [`The rest of this race is about ${formatDuration(remaining)} of real time at ${speed}`];
+  if (input.yearRemainingHours > 0) {
+    const share = (hours / input.yearRemainingHours) * 100;
+    sentences[0] += share > 100
+      ? `, more than the ${hoursFigure(input.yearRemainingHours)} left in your ${input.year} plan, which is entirely fine.`
+      : `, ${share < 1 ? 'under 1%' : `about ${Math.round(share)}%`} of the ${hoursFigure(input.yearRemainingHours)} left in your ${input.year} plan.`;
+  } else {
+    sentences[0] += `. Your ${input.year} plan has no hours left in it, which is entirely fine: the plan is a guide.`;
+  }
+
+  sentences.push(input.weekRemainingHours > 0
+    ? `This week’s plan has ${hoursFigure(input.weekRemainingHours)} left.`
+    : 'This week’s planned hours are all watched.');
+
+  if (input.recommendedPaceHours > 0) {
+    const weeks = hours / input.recommendedPaceHours;
+    const span = weeks < 1 ? 'less than a week' : `roughly ${count(Math.round(weeks))} ${Math.round(weeks) === 1 ? 'week' : 'weeks'}`;
+    sentences.push(`At the plan’s pace of ${hoursFigure(input.recommendedPaceHours)} a week, that is ${span} of viewing.`);
+  }
+  return sentences.join(' ');
+}
+
+/** "10%, 25%, 50%, 75% and 90%", from configuration. */
+function checkpointList(): string {
+  const percents = EXPEDITION_CONFIG.checkpoints.map((checkpoint) => `${checkpoint.percent}%`);
+  return percents.length === 1 ? percents[0] ?? '' : `${percents.slice(0, -1).join(', ')} and ${percents[percents.length - 1]}`;
+}
+
+/**
+ * What switching Expedition Mode did, in the application's voice. Switching
+ * off takes nothing back, and says so; switching on names the checkpoints that
+ * were already behind the race and what they paid.
+ */
+export function expeditionModeMessage(input: {
+  mode: 'auto' | 'on' | 'off';
+  /** Whether the race is an Expedition now. */
+  isExpedition: boolean;
+  /** Whether its checkpoints pay XP (a runtime of six hours or more). */
+  paysXp: boolean;
+  /** Checkpoints paid by this switch, and their XP. */
+  checkpointsBehind: number;
+  xpAwarded: number;
+  /** An Expedition Summary was written by this switch. */
+  summaryWritten: boolean;
+  /** The race has an Expedition Summary, from before or from now. */
+  hasSummary: boolean;
+}): string {
+  const sentences: string[] = [];
+  if (input.mode === 'off') {
+    sentences.push('Expedition Mode is off. Checkpoints you already reached keep their XP.');
+    if (input.hasSummary) sentences.push('Its Expedition Summary stays.');
+    return sentences.join(' ');
+  }
+
+  sentences.push(input.mode === 'on'
+    ? 'Expedition Mode is on.'
+    : `Expedition Mode follows the race’s length again (automatic from ${EXPEDITION_SHAPE.autoThresholdHours} hours).`);
+  if (!input.isExpedition) return sentences.join(' ');
+
+  if (input.checkpointsBehind > 0) {
+    sentences.push(
+      `${count(input.checkpointsBehind)} ${input.checkpointsBehind === 1 ? 'checkpoint was' : 'checkpoints were'} ` +
+        `already behind you: +${count(input.xpAwarded)} XP.`,
+    );
+  } else if (!input.paysXp) {
+    sentences.push(`Checkpoints on races of ${EXPEDITION_SHAPE.checkpointXpMinimumHours} hours or more also earn XP.`);
+  } else if (input.mode === 'on') {
+    sentences.push(`Its checkpoints are at ${checkpointList()} of the story.`);
+  }
+  if (input.summaryWritten) sentences.push('The story is already complete, so its Expedition Summary is ready.');
+  return sentences.join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// Lifetime ladders
+// ---------------------------------------------------------------------------
+
+/**
+ * "5 real viewing hours", but "1 real viewing hour".
+ *
+ * Milestone labels are written plural because that is how they read on the
+ * board; the very first rung of a ladder is the one case where that grates.
+ * Only the final word is touched, and only the two English plural endings that
+ * actually occur in these labels — this is not a general-purpose inflector and
+ * is not trying to be.
+ */
+export function milestoneLabel(threshold: number, label: string): string {
+  const lower = label.toLowerCase();
+  if (threshold !== 1) return `${count(threshold)} ${lower}`;
+
+  const words = lower.split(' ');
+  const last = words[words.length - 1] ?? '';
+  if (last.endsWith('ies')) words[words.length - 1] = `${last.slice(0, -3)}y`;
+  else if (last.endsWith('s') && !last.endsWith('ss')) words[words.length - 1] = last.slice(0, -1);
+
+  return `${count(threshold)} ${words.join(' ')}`;
 }
 
 /** Recommendation framing. Suggestions, never instructions. */

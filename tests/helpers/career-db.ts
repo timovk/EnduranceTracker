@@ -13,11 +13,16 @@
  *
  * `ledgerProblems` checks invariant I2 (career XP is the sum of the ledger,
  * and every row's running total is right) and says what is wrong in words;
- * `eventStepProblems` checks I6 (no race helped pay an event step twice).
+ * `eventStepProblems` checks I6 (no race helped pay an event step twice), and
+ * `expeditionProblems` I3 (a race holds only the checkpoints its coverage
+ * reaches, each once).
  */
 
 import { prisma } from '@/lib/db/client';
+import { replayRace } from '@/lib/domain/career-timeline';
 import { editionIdentityOf, editionYear, longestConsecutiveRun } from '@/lib/domain/edition';
+import { checkpointOfKey, coverageReaches } from '@/lib/domain/expedition';
+import { loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
 import { levelFromXp } from '@/lib/domain/progression';
 import type { SessionOutcome } from '@/lib/engines/contracts';
 import { circuitSlug } from '@/lib/engines/race-engine';
@@ -201,6 +206,59 @@ export async function eventStepProblems(userId: string): Promise<string[]> {
     }
     if (reach < node.threshold) {
       problems.push(`${dedupeKey} was paid, but the races credited to ${eventKey} for it reach only ${reach} of ${node.threshold}`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * What is wrong with an account's Expedition checkpoints, if anything
+ * (invariant I3): every EXPEDITION row belongs to a race still in the
+ * library, names one of its checkpoints, and the percentage in its key is
+ * reached by the race's replayed coverage under its current runtime (whether
+ * or not the configuration still lists it); and no race holds a checkpoint
+ * twice. An empty list means I3 holds.
+ */
+export async function expeditionProblems(userId: string): Promise<string[]> {
+  const [rows, inputs] = await Promise.all([
+    prisma.xPTransaction.findMany({
+      where: { userId, source: 'EXPEDITION' },
+      select: { dedupeKey: true, sourceRef: true, seasonAmount: true },
+    }),
+    loadTimelineInputs(prisma, userId),
+  ]);
+  const races = new Map(inputs.races.map((race) => [race.id, race]));
+  const sessionsByRace = new Map<string, typeof inputs.sessions>();
+  for (const session of inputs.sessions) {
+    const list = sessionsByRace.get(session.raceId);
+    if (list) list.push(session);
+    else sessionsByRace.set(session.raceId, [session]);
+  }
+  const coverage = new Map<string, number>();
+  const coverageOf = (raceId: string) => {
+    if (!coverage.has(raceId)) coverage.set(raceId, replayRace(races.get(raceId)!, sessionsByRace.get(raceId) ?? []).coverageSeconds);
+    return coverage.get(raceId)!;
+  };
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const raceId = row.sourceRef ?? '';
+    const race = races.get(raceId);
+    const percent = checkpointOfKey(raceId, row.dedupeKey);
+    if (race === undefined) {
+      problems.push(`${row.dedupeKey} is held for a race that is not in the library`);
+      continue;
+    }
+    if (percent === null) {
+      problems.push(`${row.dedupeKey} does not name a checkpoint of ${race.name}`);
+      continue;
+    }
+    if (seen.has(`${raceId}:${percent}`)) problems.push(`${race.name} holds its ${percent}% checkpoint twice`);
+    seen.add(`${raceId}:${percent}`);
+    if (row.seasonAmount !== 0) problems.push(`${row.dedupeKey} carries season XP`);
+    const covered = coverageOf(raceId);
+    if (!coverageReaches(covered, race.runtimeSec, percent)) {
+      problems.push(`${race.name} holds its ${percent}% checkpoint with ${covered} of ${race.runtimeSec} seconds covered`);
     }
   }
   return problems;

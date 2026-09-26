@@ -180,6 +180,17 @@ export function splitAcrossLocalDays(startsAt: Date, endsAt: Date): TimeSlice[] 
 }
 
 /**
+ * How many local calendar days a span touches, its first and last day both
+ * counted: 1 when it starts and ends on the same day. Counted on the days'
+ * dates rather than in milliseconds, so a 23- or 25-hour day is one day.
+ */
+export function localDaysSpanned(from: Date, to: Date): number {
+  const first = Date.UTC(from.getFullYear(), from.getMonth(), from.getDate());
+  const last = Date.UTC(to.getFullYear(), to.getMonth(), to.getDate());
+  return Math.max(1, Math.round((last - first) / 86_400_000) + 1);
+}
+
+/**
  * The part of a span inside a window, and what share of the span it is.
  *
  * A zero-length span is inside a window when its instant is (`start` included,

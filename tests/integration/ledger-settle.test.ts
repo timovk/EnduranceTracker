@@ -10,7 +10,7 @@
  * taken back.
  */
 
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { levelFromXp } from '@/lib/domain/progression';
 import { resyncAfterRaceEdit } from '@/lib/engines/progression-resync';
@@ -18,7 +18,7 @@ import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/rac
 import { deleteRace, deleteViewingSession, repairXpLedger } from '@/lib/engines/session-engine';
 import { buildOutcomeForSession } from '@/lib/server/session-summary';
 import {
-  rebuildCareerTotals, revokeSessionsXp, revokeXpByDedupeKeys, settleLedger,
+  awardXp, rebuildCareerTotals, revokeSessionsXp, revokeXpByDedupeKeys, settleLedger,
 } from '@/lib/engines/xp-ledger';
 import {
   addRace, createCareerUser, H, insertLegacyShortenedRace, ledgerProblems, logStint,
@@ -80,6 +80,63 @@ async function stamps(): Promise<Map<string, { careerXpAfter: number; levelAfter
   });
   return new Map(rows.map((row) => [row.id, { careerXpAfter: Number(row.careerXpAfter), levelAfter: row.levelAfter }]));
 }
+
+describe('stamping an award', () => {
+  /** Grant each amount in turn, in one transaction, described by its place in the list. */
+  async function grant(amounts: readonly number[], name: string): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+      for (const [index, amount] of amounts.entries()) {
+        await awardXp(tx as Tx, USER, { source: 'CHALLENGE', amount, description: `${name} ${index}` });
+      }
+    });
+  }
+
+  function inLedgerOrder() {
+    return prisma.xPTransaction.findMany({
+      where: { userId: USER },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: { description: true, createdAt: true, careerXpAfter: true },
+    });
+  }
+
+  it('keeps awards written inside one millisecond in the order they were written', async () => {
+    const instant = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(instant);
+    try {
+      await grant([50, 60, 70, 80, 90], 'Burst');
+    } finally {
+      clock.mockRestore();
+    }
+
+    const rows = await inLedgerOrder();
+    expect(rows.map((row) => row.description)).toEqual(['Burst 0', 'Burst 1', 'Burst 2', 'Burst 3', 'Burst 4']);
+    expect(rows.map((row) => row.createdAt.getTime() - instant)).toEqual([0, 1, 2, 3, 4]);
+    expect(await ledgerProblems(USER)).toEqual([]);
+  });
+
+  it('is not held back by a row stamped ahead of the clock, and keeps every total right', async () => {
+    await grant([100, 200], 'Earlier');
+    // One row written while the computer's clock was a day ahead.
+    const ahead = await prisma.xPTransaction.findFirstOrThrow({ where: { userId: USER, description: 'Earlier 1' } });
+    await prisma.xPTransaction.update({ where: { id: ahead.id }, data: { createdAt: new Date(Date.now() + 24 * 3_600_000) } });
+
+    const from = Date.now();
+    await grant([300, 400], 'Later');
+    const to = Date.now();
+
+    // The later awards are stamped on the clock, before the row ahead of it,
+    // whose running total now includes them.
+    const rows = await inLedgerOrder();
+    expect(rows.map((row) => row.description)).toEqual(['Earlier 0', 'Later 0', 'Later 1', 'Earlier 1']);
+    for (const row of rows.slice(1, 3)) {
+      expect(row.createdAt.getTime()).toBeGreaterThanOrEqual(from);
+      // A millisecond after the one before it at most, in a burst.
+      expect(row.createdAt.getTime()).toBeLessThanOrEqual(to + 1);
+    }
+    expect(rows.map((row) => Number(row.careerXpAfter))).toEqual([100, 400, 800, 1_000]);
+    expect(await ledgerProblems(USER)).toEqual([]);
+  });
+});
 
 describe('rebuilding the running totals', () => {
   it('re-stamps in batches exactly as a row-by-row replay would', async () => {

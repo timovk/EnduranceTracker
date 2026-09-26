@@ -286,7 +286,23 @@ function raceSavedMessage(saved: { runtimeSec: number; runtimeChanged: boolean; 
         `so its Story Complete bonus of ${formatNumber(resync.storyBonus.awarded)} XP was added.`,
     );
   }
-  const unlocked = resync.xpAwarded - resync.storyBonus.awarded;
+  const { checkpoints } = resync;
+  if (checkpoints.revoked > 0) {
+    sentences.push(
+      `Expedition checkpoints worth ${formatNumber(checkpoints.revoked)} XP came off because the coverage no longer ` +
+        (saved.runtimeChanged ? `reaches them at ${formatTimestamp(saved.runtimeSec)}.` : 'reaches them.'),
+    );
+  }
+  if (checkpoints.resized.fromXp > 0 || checkpoints.resized.toXp > 0) {
+    sentences.push(
+      `Its Expedition checkpoints now pay what a race of ${formatTimestamp(saved.runtimeSec)} pays: ` +
+        `${formatNumber(checkpoints.resized.toXp)} XP where they held ${formatNumber(checkpoints.resized.fromXp)}.`,
+    );
+  }
+  if (checkpoints.awarded > 0) {
+    sentences.push(`Its coverage now reaches more Expedition checkpoints: +${formatNumber(checkpoints.awarded)} XP.`);
+  }
+  const unlocked = resync.xpAwarded - resync.storyBonus.awarded - checkpoints.awarded - checkpoints.resized.toXp;
   if (unlocked > 0) sentences.push(`The change also earned ${formatNumber(unlocked)} XP.`);
   return sentences.join(' ');
 }

@@ -19,6 +19,7 @@ import { Input, Segmented, Button } from '@/components/ui/controls';
 import { EmptyState, Panel, PanelBody, PanelHeader, Stat, TimingBar } from '@/components/ui/primitives';
 import { formatNumber } from '@/lib/utils';
 import { EventSuggestions } from './event-suggestions';
+import { accentVars } from '@/components/ui/accent';
 
 /** Cards drawn before "Show more". */
 const PAGE_SIZE = 30;
@@ -141,7 +142,7 @@ function EventCardView({ event }: { event: EventCard }) {
   return (
     <li>
       <Link href={event.href} className="block h-full">
-        <Panel accent={event.accentColor} className="h-full transition-colors hover:border-hairline-strong">
+        <Panel style={accentVars(event.accentColor)} className="h-full transition-colors hover:border-hairline-strong">
           <PanelHeader
             title={event.name}
             icon={<Repeat size={12} className="text-[var(--accent)]" />}

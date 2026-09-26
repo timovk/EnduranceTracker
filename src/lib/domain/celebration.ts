@@ -66,8 +66,9 @@ export interface CelebrationView<M extends CelebratedMilestone> {
  *   - A milestone that celebrates at all is highlighted. The very objects of
  *     the outcome are returned, so the summary can tell them from the ones it
  *     lists as rows.
- *   - The heading is "Story Complete" when the stint finished a story — that
- *     is the stint's own moment — and otherwise the loudest highlighted
+ *   - The heading is "Expedition complete" when the stint completed an
+ *     Expedition's story, "Story Complete" when it finished any other story —
+ *     that is the stint's own moment — and otherwise the loudest highlighted
  *     milestone's title, or the ordinary heading chosen by stint length.
  */
 export function celebrationView<M extends CelebratedMilestone>(outcome: {
@@ -75,6 +76,7 @@ export function celebrationView<M extends CelebratedMilestone>(outcome: {
   careerMilestones: readonly M[];
   storyCompleted: boolean;
   heading: string;
+  expedition?: { completed: boolean } | null;
 }): CelebrationView<M> {
   const highlighted = outcome.careerMilestones
     .map((milestone, index) => ({ milestone, index }))
@@ -84,9 +86,11 @@ export function celebrationView<M extends CelebratedMilestone>(outcome: {
     .map(({ milestone }) => milestone);
 
   const level = louderLevel(outcome.celebrate, levelForMilestone(highestMilestoneCelebration(highlighted)));
-  const headline = outcome.storyCompleted
-    ? 'Story Complete'
-    : highlighted[0]?.title ?? outcome.heading;
+  const headline = outcome.expedition?.completed
+    ? 'Expedition complete'
+    : outcome.storyCompleted
+      ? 'Story Complete'
+      : highlighted[0]?.title ?? outcome.heading;
 
   return { level, highlighted, headline };
 }

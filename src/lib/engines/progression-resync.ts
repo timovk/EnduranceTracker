@@ -8,9 +8,9 @@
  * call instead.
  *
  * The rule it follows is the one the whole economy follows: XP follows the
- * data, landmarks stay earned. Balances (the Story Complete bonus) follow an
- * edit at once, because an edit can always be undone and a balance can follow
- * it back. Landmarks — achievements, milestones, mastery nodes — are never
+ * data, landmarks stay earned. Balances (the Story Complete bonus, Expedition
+ * checkpoints) follow an edit at once, because an edit can always be undone
+ * and a balance can follow it back. Landmarks — achievements, milestones, mastery nodes — are never
  * taken back, so they are reached only on an edit that cannot be a typo about
  * to be corrected.
  */
@@ -23,6 +23,7 @@ import { syncAchievements, syncMilestones } from './achievement-engine';
 import { fillLandmarkDates, syncCareerMilestones } from './career-milestone-engine';
 import { loadRaceTimelineInputs } from './career-timeline-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from './mastery-engine';
+import { reconcileExpedition } from './expedition-engine';
 import { computeCareerMetricsWithHistory } from './metrics';
 import { awardXp, revokeXpByDedupeKey, settleLedger, type XpRevocation } from './xp-ledger';
 
@@ -101,12 +102,18 @@ export async function reconcileStoryBonus(
 }
 
 export interface RaceEditResync {
-  /** Career XP the edit paid: a Story Complete bonus, and what it unlocked. */
+  /** Career XP the edit paid: a Story Complete bonus, checkpoints, and what it unlocked. */
   xpAwarded: number;
   /** Career XP that came off because the edit no longer supports it. */
   xpRevoked: number;
   /** The Story Complete bonus's part in both. */
   storyBonus: { awarded: number; revoked: number };
+  /**
+   * The Expedition checkpoints' part: XP paid for checkpoints now reached,
+   * XP taken back from checkpoints no longer reached, and the checkpoints
+   * re-sized to a changed runtime (their XP before and after).
+   */
+  checkpoints: { awarded: number; revoked: number; resized: { fromXp: number; toXp: number } };
 }
 
 /**
@@ -114,9 +121,14 @@ export interface RaceEditResync {
  * transaction, after its intervals and aggregates were rebuilt.
  *
  *   1. The Story Complete bonus follows the edit (`reconcileStoryBonus`),
- *      and the ledger is settled at once for whatever came off
- *      (`settleLedger`), so anything paid below is stamped on the career as
- *      it now is and measured against it.
+ *      and so do the Expedition checkpoints (`reconcileExpedition`): after a
+ *      runtime change the held ones are re-sized to the new length's
+ *      schedule, and those its coverage no longer reaches come off. The
+ *      ledger is settled at once for whatever came off (`settleLedger`), so
+ *      anything paid below is stamped on the career as it now is and
+ *      measured against it. No Expedition Summary is ever written here: a
+ *      runtime typo that briefly completes a race must not leave a permanent
+ *      one behind, and the next stint writes the real one.
  *   2. The event caches follow it: trees for a new event, and every event's
  *      editions and hours (`ensureMasteryTrees`, `recomputeRaceMasteries`).
  *   3. Only when the runtime did NOT change: mastery nodes, achievements,
@@ -138,8 +150,15 @@ export async function resyncAfterRaceEdit(
   options: { runtimeChanged: boolean },
 ): Promise<RaceEditResync> {
   const story = await reconcileStoryBonus(tx, userId, raceId);
-  await settleLedger(tx, userId, [story.revocation]);
-  let xpAwarded = story.awarded;
+  const expedition = await reconcileExpedition(tx, userId, raceId, { resize: options.runtimeChanged });
+  await settleLedger(tx, userId, [story.revocation, expedition.revocation]);
+  const checkpointsAwarded = expedition.awarded.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
+  const checkpointsRevoked = expedition.revoked.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
+  const resized = {
+    fromXp: expedition.resized.reduce((sum, checkpoint) => sum + checkpoint.fromXp, 0),
+    toXp: expedition.resized.reduce((sum, checkpoint) => sum + checkpoint.toXp, 0),
+  };
+  let xpAwarded = story.awarded + checkpointsAwarded + resized.toXp;
 
   await ensureMasteryTrees(tx, userId, now);
   await recomputeRaceMasteries(tx, userId, now);
@@ -157,7 +176,8 @@ export async function resyncAfterRaceEdit(
 
   return {
     xpAwarded,
-    xpRevoked: story.revocation.careerXp,
+    xpRevoked: story.revocation.careerXp + expedition.revocation.careerXp,
     storyBonus: { awarded: story.awarded, revoked: story.revocation.careerXp },
+    checkpoints: { awarded: checkpointsAwarded, revoked: checkpointsRevoked, resized },
   };
 }

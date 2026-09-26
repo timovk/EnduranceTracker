@@ -5,7 +5,7 @@
  * credited time on its races, no dates on its milestones, none of the new
  * rungs, and perhaps a race whose runtime was shortened after it was watched.
  * The backfill brings it up to date in phases — P1 the races, P2 the
- * recurring events, P3 the milestones — each chunk in its own transaction
+ * recurring events, P3 the milestones, P4 the Expeditions — each chunk in its own transaction
  * together with the marker that records it, so a start that runs out of time
  * loses nothing and the next one carries on.
  *
@@ -23,12 +23,12 @@ import { recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { revokeXpByDedupeKeys, settleLedger } from '@/lib/engines/xp-ledger';
 import {
   type BackfillClock, backfillRaces, buildPhaseContext, CAREER_BACKFILL_KEY, CAREER_BACKFILL_PHASES,
-  type CareerBackfillSummary, deadlineClock, describeCareerBackfill, describeLeftovers, isCareerBackfillApplied,
+  type CareerBackfillSummary, deadlineClock, describeCareerBackfill, describeLeftovers, EXPEDITION_CHUNK, isCareerBackfillApplied,
   markCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
 import { MASTERY_CONFIG } from '@/lib/config';
 import {
-  addRace, createCareerUser, eventStepProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
+  addRace, createCareerUser, eventStepProblems, expeditionProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
 
 const DATED = '00000000-0000-4000-8000-0000000004b1';
@@ -43,9 +43,11 @@ const EARLIER_BUILD = '00000000-0000-4000-8000-0000000004b9';
 const LEFTOVERS = '00000000-0000-4000-8000-0000000004ba';
 const SOMEONE_ELSE = '00000000-0000-4000-8000-0000000004bb';
 const EVENTS = '00000000-0000-4000-8000-0000000004bc';
+const RESUMED = '00000000-0000-4000-8000-0000000004bd';
+const IN_ONE_GO = '00000000-0000-4000-8000-0000000004be';
 const USERS = [
   DATED, REPLAY_LATER, RACES, INTERRUPTED, UNINTERRUPTED, SERVED_RECENTLY, SERVED_LONG_AGO, NEVER_SERVED,
-  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS,
+  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS, RESUMED, IN_ONE_GO,
 ];
 
 /** The first start after the update. */
@@ -85,8 +87,9 @@ async function watchLongRaces(userId: string, count: number, from: Date): Promis
 
 /**
  * Put an account back the way 0.3.2 left it: none of the new milestone rungs
- * (nor the XP they paid), no dates on any milestone or event step, no
- * credited time on any race, and no backfill marker.
+ * (nor the XP they paid), no Expedition checkpoints or summaries, no dates on
+ * any milestone or event step, no credited time on any race, and no backfill
+ * marker.
  */
 async function asRecordedBy032(userId: string): Promise<void> {
   const rows = await prisma.milestoneProgress.findMany({ where: { userId }, select: { id: true, metric: true, threshold: true } });
@@ -94,10 +97,15 @@ async function asRecordedBy032(userId: string): Promise<void> {
     const match = careerMilestoneOfRow(row.metric, row.threshold);
     return match !== null && match.def.owner === 'career' ? [{ id: row.id, key: careerMilestoneDedupeKey(match.def, match.year) }] : [];
   });
+  const checkpoints = await prisma.xPTransaction.findMany({ where: { userId, source: 'EXPEDITION' }, select: { dedupeKey: true } });
   await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
-    const revocation = await revokeXpByDedupeKeys(db, userId, careerRows.map((row) => row.key));
+    const revocation = await revokeXpByDedupeKeys(db, userId, [
+      ...careerRows.map((row) => row.key),
+      ...checkpoints.flatMap((row) => (row.dedupeKey === null ? [] : [row.dedupeKey])),
+    ]);
     await settleLedger(db, userId, [revocation]);
+    await db.expeditionSummary.deleteMany({ where: { userId } });
     await db.milestoneProgress.deleteMany({ where: { id: { in: careerRows.map((row) => row.id) } } });
     await db.milestoneProgress.updateMany({
       where: { userId },
@@ -445,34 +453,129 @@ describe('the start-up budget', () => {
       if (summary.completed) break;
     }
 
-    // Three chunks of races (500 at a time), then the events, then the milestones.
-    const starts = Math.ceil(raceCount / 500) + 2;
+    // Three chunks of races (500 at a time), then the events, then the
+    // milestones, then one chunk of the two Expeditions (48-hour races).
+    const starts = Math.ceil(raceCount / 500) + 3;
     expect(summaries).toHaveLength(starts);
     expect(new Set(markers).size).toBe(starts);
-    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P2', 'P3', null]);
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P2', 'P3', 'P4', null]);
     expect(summaries[0]?.pausedBefore?.cursor).toEqual(expect.any(String));
     expect(summaries[2]?.pausedBefore?.cursor).toBeNull();
     expect(summaries[3]?.pausedBefore?.cursor).toBeNull();
-    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0, 0]);
+    expect(summaries[4]?.pausedBefore?.cursor).toBeNull();
+    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0, 0, 0]);
     expect(summaries.reduce((sum, summary) => sum + summary.storyBonusesAwarded, 0)).toBe(1);
-    expect(summaries[4]).toMatchObject({ completed: true, pausedBefore: null });
+    // Both 48-hour races completed: every checkpoint, and a summary each.
+    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, 0, 0, 10]);
+    expect(summaries[5]).toMatchObject({ completed: true, pausedBefore: null, summariesWritten: 2 });
     expect(await isCareerBackfillApplied(INTERRUPTED)).toBe(true);
 
     // What a paused start says in the log.
     expect(describeCareerBackfill(summaries[0]!, 'Interrupted')).toBe(
       `[career-backfill] Interrupted (${INTERRUPTED}): credited 500 races, 0 legacy races repaired, story bonuses +${summaries[0]!.storyBonusesAwarded}/−0; `
         + '0 event steps (+0 XP), 0 credits; '
-        + `0 new milestones (+0 XP), 0 dates filled, 0 recorded only; paused before P1 (after race ${summaries[0]!.pausedBefore!.cursor}); `
-        + 'continues on the next start',
+        + '0 new milestones (+0 XP), 0 dates filled, 0 recorded only; 0 expedition checkpoints (+0 XP), 0 summaries; '
+        + `paused before P1 (after race ${summaries[0]!.pausedBefore!.cursor}); continues on the next start`,
     );
     expect(describeCareerBackfill(summaries[2]!, 'Interrupted')).toMatch(/; paused before P2; continues on the next start$/);
     expect(describeCareerBackfill(summaries[3]!, 'Interrupted')).toMatch(/; paused before P3; continues on the next start$/);
+    expect(describeCareerBackfill(summaries[4]!, 'Interrupted')).toMatch(/; paused before P4; continues on the next start$/);
+    expect(describeCareerBackfill(summaries[5]!, 'Interrupted')).toMatch(/; 10 expedition checkpoints \(\+6,000 XP\), 2 summaries$/);
 
     const whole = await runCareerBackfillFor(UNINTERRUPTED, { now: STARTED, clock: PLENTY_OF_TIME });
-    expect(whole).toMatchObject({ completed: true, racesCredited: 1_103, storyBonusesAwarded: 1 });
+    expect(whole).toMatchObject({
+      completed: true, racesCredited: 1_103, storyBonusesAwarded: 1, expeditionCheckpoints: 10, expeditionXp: 6_000, summariesWritten: 2,
+    });
     expect(await outcome(INTERRUPTED)).toEqual(await outcome(UNINTERRUPTED));
     expect(await ledgerProblems(INTERRUPTED)).toEqual([]);
     expect(await ledgerProblems(UNINTERRUPTED)).toEqual([]);
+  }, 120_000);
+
+  it('carries the Expeditions on after the last race a paused start reached, and ends as one uninterrupted run does', async () => {
+    // More Expeditions than one chunk holds: ten-hour races, a third of them
+    // watched whole and the rest to 30% or 60%.
+    const hours = [10, 3, 6];
+    const reachedAt: Record<number, number[]> = { 10: [10, 25, 50, 75, 90], 3: [10, 25], 6: [10, 25, 50] };
+    async function expeditions(userId: string, name: string): Promise<void> {
+      await createCareerUser(userId, name);
+      for (let index = 0; index < EXPEDITION_CHUNK + 5; index += 1) {
+        const at = new Date(2025, 5, 1 + index, 20, 0);
+        const raceId = await addRace(userId, { name: `Expedition ${String(index + 1).padStart(2, '0')}`, hours: 10 });
+        await logStint(userId, raceId, { from: 0, to: hours[index % 3]! * H, watchedAt: at, now: at });
+      }
+      await asRecordedBy032(userId);
+    }
+    /** Each race's name, id and the checkpoints its coverage reaches, in the order P4 works through them. */
+    async function racesOf(userId: string) {
+      const races = await prisma.race.findMany({ where: { userId }, orderBy: { id: 'asc' }, select: { id: true, name: true } });
+      return races.map((race) => ({ ...race, reached: reachedAt[hours[(Number(race.name.slice(-2)) - 1) % 3]!]! }));
+    }
+    /** The checkpoints each race holds, by race name. */
+    async function heldByName(userId: string): Promise<Record<string, number[]>> {
+      const [races, rows] = await Promise.all([
+        prisma.race.findMany({ where: { userId }, select: { id: true, name: true } }),
+        prisma.xPTransaction.findMany({ where: { userId, source: 'EXPEDITION' }, select: { sourceRef: true, dedupeKey: true } }),
+      ]);
+      const held: Record<string, number[]> = Object.fromEntries(races.map((race) => [race.name, []]));
+      const names = new Map(races.map((race) => [race.id, race.name]));
+      for (const row of rows) held[names.get(row.sourceRef ?? '')!]!.push(Number(row.dedupeKey!.split(':')[2]));
+      for (const percents of Object.values(held)) percents.sort((a, b) => a - b);
+      return held;
+    }
+
+    await expeditions(RESUMED, 'CareerBackfillTest Resumed');
+    await expeditions(IN_ONE_GO, 'CareerBackfillTest In One Go');
+    const races = await racesOf(RESUMED);
+
+    const summaries: CareerBackfillSummary[] = [];
+    for (let start = 0; start < 10; start += 1) {
+      const now = new Date(STARTED.getTime() + start * 60_000);
+      const summary = await runCareerBackfillFor(RESUMED, { now, clock: oneChunkPerStart() });
+      summaries.push(summary);
+      const cursor = summary.pausedBefore?.phase === 'P4' ? summary.pausedBefore.cursor : null;
+      if (cursor !== null) {
+        // Paused inside the phase: the races up to the cursor hold every
+        // checkpoint they reached, and the rest none yet.
+        const held = await heldByName(RESUMED);
+        for (const race of races) expect(held[race.name], race.name).toEqual(race.id <= cursor ? race.reached : []);
+      }
+      if (summary.completed) break;
+    }
+
+    // The races, the events and the milestones take a start each, then the
+    // Expeditions two: a full chunk, and the five after its last race.
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P2', 'P3', 'P4', 'P4', null]);
+    expect(summaries[2]?.pausedBefore?.cursor).toBeNull();
+    expect(summaries[3]?.pausedBefore?.cursor).toBe(races[EXPEDITION_CHUNK - 1]!.id);
+    expect(describeCareerBackfill(summaries[3]!, 'Resumed')).toMatch(
+      new RegExp(`; paused before P4 \\(after race ${races[EXPEDITION_CHUNK - 1]!.id}\\); continues on the next start$`),
+    );
+    const first = races.slice(0, EXPEDITION_CHUNK);
+    const rest = races.slice(EXPEDITION_CHUNK);
+    const checkpoints = (list: typeof races) => list.reduce((sum, race) => sum + race.reached.length, 0);
+    const complete = (list: typeof races) => list.filter((race) => race.reached.length === 5).length;
+    expect(summaries.map((summary) => summary.expeditionCheckpoints)).toEqual([0, 0, 0, checkpoints(first), checkpoints(rest)]);
+    expect(summaries.map((summary) => summary.summariesWritten)).toEqual([0, 0, 0, complete(first), complete(rest)]);
+    expect(summaries[4]).toMatchObject({ completed: true, pausedBefore: null });
+
+    const whole = await runCareerBackfillFor(IN_ONE_GO, { now: STARTED, clock: PLENTY_OF_TIME });
+    expect(whole).toMatchObject({ completed: true, expeditionCheckpoints: 100, expeditionXp: 21_000, summariesWritten: 10 });
+    const sum = (pick: (summary: CareerBackfillSummary) => number) => summaries.reduce((total, summary) => total + pick(summary), 0);
+    expect({
+      checkpoints: sum((summary) => summary.expeditionCheckpoints),
+      xp: sum((summary) => summary.expeditionXp),
+      summaries: sum((summary) => summary.summariesWritten),
+    }).toEqual({ checkpoints: 100, xp: 21_000, summaries: 10 });
+
+    // Every Expedition holds every checkpoint it reached, exactly as in one run.
+    expect(await heldByName(RESUMED)).toEqual(Object.fromEntries(races.map((race) => [race.name, race.reached])));
+    expect(await heldByName(RESUMED)).toEqual(await heldByName(IN_ONE_GO));
+    expect(await outcome(RESUMED)).toEqual(await outcome(IN_ONE_GO));
+    expect(await prisma.expeditionSummary.count({ where: { userId: RESUMED } })).toBe(10);
+    for (const userId of [RESUMED, IN_ONE_GO]) {
+      expect(await ledgerProblems(userId)).toEqual([]);
+      expect(await expeditionProblems(userId)).toEqual([]);
+    }
   }, 120_000);
 
   it('asks the clock before every chunk, and never starts one that would run past the deadline', () => {

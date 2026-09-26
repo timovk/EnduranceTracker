@@ -25,6 +25,7 @@ import { Badge, EmptyState, Panel, PanelBody, PanelHeader, Stat, TimingBar } fro
 import { setEventArchivedAction, unlinkRaceFromEventAction } from '@/lib/server/career-actions';
 import { cn, formatDate, formatNumber } from '@/lib/utils';
 import { AddRacesDialog, MergeEventDialog, RenameEventDialog } from './event-dialogs';
+import { accentVars } from '@/components/ui/accent';
 
 const GROUP_TITLES: Record<StepGroup, string> = {
   experienced: 'Editions experienced',
@@ -63,7 +64,7 @@ export function EventLegacyView({
   }
 
   return (
-    <div className="space-y-4" style={{ ['--accent' as string]: event.accentColor } as React.CSSProperties}>
+    <div className="space-y-4" style={accentVars(event.accentColor)}>
       {/* ---- Header ------------------------------------------------------ */}
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
@@ -287,7 +288,11 @@ function EditionHistoryRow({
               Story Complete · {formatDate(row.storyCompletedAt)}
             </Badge>
           ) : null}
-          {row.isExpedition ? <Badge tone="outline"><Compass size={10} /> Expedition</Badge> : null}
+          {row.isExpedition ? (
+            <Link href={`/races/${row.raceId}/expedition`} title="Open the expedition">
+              <Badge tone="outline" className="hover:text-ink-muted"><Compass size={10} /> Expedition</Badge>
+            </Link>
+          ) : null}
         </div>
         <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[0.6875rem] text-ink-dim">
           {row.championshipName ? <span>{row.championshipName}</span> : null}

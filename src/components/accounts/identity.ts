@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { THEMES } from '@/lib/config';
+import { accentVars } from '@/components/ui/accent';
 
 export interface AccountAvatar {
   key: string;
@@ -87,17 +88,15 @@ export function accentKeyOf(key: string | null | undefined): string {
 }
 
 /**
- * The pair of custom properties an accented subtree needs.
+ * The pair of custom properties an accented subtree needs, for an account's
+ * accent key.
  *
  * `Panel`'s `accent` prop sets `--accent` alone, but every tinted fill in the
  * interface — the avatar tile, an accent `Badge`, the primary button — reads
  * `--accent-soft`. The two have to move together, or a midnight account draws
- * a blue border around a gold fill.
+ * a blue border around a gold fill; `accentVars` is the one place that pairs
+ * them.
  */
 export function accentStyle(key: string | null | undefined): CSSProperties {
-  const { accent } = resolveAccent(key);
-  return {
-    ['--accent' as string]: accent,
-    ['--accent-soft' as string]: `color-mix(in oklab, ${accent} 16%, transparent)`,
-  } as CSSProperties;
+  return accentVars(resolveAccent(key).accent);
 }

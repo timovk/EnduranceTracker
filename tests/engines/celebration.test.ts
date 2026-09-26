@@ -40,6 +40,7 @@ const ORDINARY = {
   rareUnlock: false,
   levelsGained: 0,
   careerMilestoneCelebration: 'none' as const,
+  expeditionCompleted: false,
 };
 
 describe('choosing how loudly to celebrate', () => {
@@ -55,6 +56,13 @@ describe('choosing how loudly to celebrate', () => {
   it('makes a stint with a spectacular milestone SPECTACULAR', () => {
     expect(chooseCelebration({ ...ORDINARY, careerMilestoneCelebration: 'spectacular' })).toBe('SPECTACULAR');
     expect(chooseCelebration({ ...ORDINARY, levelsGained: 1, careerMilestoneCelebration: 'spectacular' })).toBe('SPECTACULAR');
+  });
+
+  it('celebrates a completed Expedition spectacularly, whatever the race’s length', () => {
+    expect(chooseCelebration({ ...ORDINARY, storyCompleted: true, expeditionCompleted: true })).toBe('SPECTACULAR');
+    expect(chooseCelebration({ ...ORDINARY, runtimeSec: 2 * H, storyCompleted: true, expeditionCompleted: true })).toBe('SPECTACULAR');
+    // The same completion of a race that is not an Expedition stays NOTABLE below the long-haul length.
+    expect(chooseCelebration({ ...ORDINARY, runtimeSec: 2 * H, storyCompleted: true })).toBe('NOTABLE');
   });
 
   it('never lowers what the stint earned without the milestones', () => {

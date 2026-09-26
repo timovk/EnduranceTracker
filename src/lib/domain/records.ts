@@ -17,6 +17,7 @@
  * Pure and deterministic.
  */
 
+import { CAREER_STATS_SHAPE, EXPEDITION_SHAPE } from '@/lib/config';
 import type { LocalWindow } from './calendar';
 import { clipToWindow, dayKeyToLocalDate, localDayKey, localMonthKey, splitAcrossLocalDays } from './calendar';
 import type { CareerTimeline, StintEvent, TimelineRaceRow } from './career-timeline';
@@ -64,6 +65,19 @@ export interface RecordOptions {
   include?: (race: TimelineRaceRow) => boolean;
   /** Only stints logged inside it count, and only their time inside it: "your best in 2027". */
   within?: LocalWindow;
+}
+
+/**
+ * The options career records are kept by: a long race is one of ten hours or
+ * more by runtime (the Expedition threshold, whatever the race's mode), and
+ * the rolling record spans `CAREER_STATS_SHAPE.recordRollingDays`.
+ */
+export function careerRecordOptions(weekStartsOn: number): RecordOptions {
+  return {
+    weekStartsOn,
+    longRaceThresholdSec: EXPEDITION_SHAPE.autoThresholdHours * 3600,
+    rollingDays: CAREER_STATS_SHAPE.recordRollingDays,
+  };
 }
 
 const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'] as const;

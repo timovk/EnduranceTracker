@@ -4,10 +4,12 @@
  * Whatever is furthest along and most recently touched, with a resume point
  * that lands on the first *unwatched* gap rather than on the furthest
  * timestamp reached — so skipping a section quietly points you back at it.
+ * A race followed as an Expedition (0.4.0) adds one line: how far, and the
+ * checkpoint ahead.
  */
 
 import Link from 'next/link';
-import { Play } from 'lucide-react';
+import { Mountain, Play } from 'lucide-react';
 import { formatDuration, formatTimestamp } from '@/lib/domain/time';
 import type { Interval } from '@/lib/domain/types';
 import { Panel, PanelHeader, PanelBody, EmptyState } from '@/components/ui/primitives';
@@ -26,6 +28,8 @@ export interface CurrentStintData {
   completionPercent: number;
   realRemainingSec: number;
   playbackSpeed: number;
+  /** When the race is an Expedition: its coverage, and the next checkpoint (null once all are reached). */
+  expedition: { completionText: string; nextCheckpointPercent: number | null } | null;
 }
 
 export function CurrentStint({ stint }: { stint: CurrentStintData | null }) {
@@ -78,6 +82,22 @@ export function CurrentStint({ stint }: { stint: CurrentStintData | null }) {
         </div>
 
         <RaceTimeline intervals={stint.intervals} runtimeSec={stint.runtimeSec} accent={accent} />
+
+        {stint.expedition ? (
+          <Link
+            href={`/races/${stint.raceId}/expedition`}
+            className="flex items-center gap-1.5 text-xs text-ink-dim hover:text-ink-muted"
+          >
+            <Mountain size={12} className="shrink-0 text-[var(--accent)]" />
+            <span>
+              Expedition · <span className="timing text-ink-muted">{stint.expedition.completionText}</span>
+              {' · '}
+              {stint.expedition.nextCheckpointPercent === null
+                ? 'next: Story Complete'
+                : `next checkpoint ${stint.expedition.nextCheckpointPercent}%`}
+            </span>
+          </Link>
+        ) : null}
       </PanelBody>
     </Panel>
   );

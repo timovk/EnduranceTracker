@@ -601,8 +601,8 @@ function buildHeadline(
   if (kind === 'BEST_FIT') {
     if (estimate.isLongHaul) {
       return stintFits
-        ? `${RECOMMENDATION_PREFIXES.bestFit}: the ${candidate.name} is an expedition of about ${remaining}, and a first stint of roughly ${stint} sits inside your ${window}.`
-        : `${RECOMMENDATION_PREFIXES.bestFit}: the ${candidate.name} is an expedition of about ${remaining}, divided into stints of roughly ${stint} — it begins whenever you have the time.`;
+        ? `${RECOMMENDATION_PREFIXES.bestFit}: the ${candidate.name} is a long race of about ${remaining}, and a first stint of roughly ${stint} sits inside your ${window}.`
+        : `${RECOMMENDATION_PREFIXES.bestFit}: the ${candidate.name} is a long race of about ${remaining}, divided into stints of roughly ${stint} — it begins whenever you have the time.`;
     }
     if (estimate.started) {
       return estimate.canFinishInWindow

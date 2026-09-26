@@ -51,6 +51,51 @@ export interface XpAwardResult {
 }
 
 /**
+ * How far ahead of the clock the account's latest row may be and still be
+ * followed a millisecond later (`ledgerStamp`). A burst of awards stays far
+ * inside it; a row further ahead was stamped by a clock that was set ahead.
+ */
+const LEDGER_BURST_SLACK_MS = 1_000;
+
+/**
+ * When a new ledger row is stamped, and whether the running totals must be
+ * re-stamped from it.
+ *
+ * The ledger's order is `(createdAt, id)`, and the running total an award
+ * stamps is the total after every row written before it. Two awards written
+ * inside the same millisecond would share a `createdAt` and be ordered by
+ * their random ids instead of by when they were written, so the totals would
+ * disagree with the ledger's own order (I2). Each row is therefore stamped on
+ * the real clock, as it always was, but strictly after the account's latest
+ * row when that row is at most a moment ahead: a millisecond later, in a burst
+ * of awards.
+ *
+ * A row stamped well ahead of the clock (the computer's clock was once set
+ * ahead) is not followed: it would pin every later award, and the month and
+ * year its XP is counted in, to its own date. The new row goes on the clock,
+ * after any burst before it, and so before that row; the caller then
+ * re-stamps the running totals from the new row.
+ */
+async function ledgerStamp(tx: Tx, userId: string): Promise<{ createdAt: Date; restamp: boolean }> {
+  const now = Date.now();
+  const latest = await tx.xPTransaction.findFirst({
+    where: { userId },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: { createdAt: true },
+  });
+  if (latest === null) return { createdAt: new Date(now), restamp: false };
+  if (latest.createdAt.getTime() - now < LEDGER_BURST_SLACK_MS) {
+    return { createdAt: new Date(Math.max(now, latest.createdAt.getTime() + 1)), restamp: false };
+  }
+  const recent = await tx.xPTransaction.findFirst({
+    where: { userId, createdAt: { lt: new Date(now + LEDGER_BURST_SLACK_MS) } },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: { createdAt: true },
+  });
+  return { createdAt: new Date(Math.max(now, (recent?.createdAt.getTime() ?? 0) + 1)), restamp: true };
+}
+
+/**
  * Grant XP inside an existing transaction.
  *
  * Returns `duplicate: true` and grants nothing when `dedupeKey` has been used
@@ -89,6 +134,8 @@ export async function awardXp(tx: Tx, userId: string, award: XpAward): Promise<X
   const before = Number(profile.careerXp);
   const after = before + amount;
 
+  const stamp = await ledgerStamp(tx, userId);
+
   const stateBefore = levelFromXp(before);
   const stateAfter = levelFromXp(after);
   const prestigeBefore = prestigeForLevel(stateBefore.level);
@@ -96,7 +143,7 @@ export async function awardXp(tx: Tx, userId: string, award: XpAward): Promise<X
   const titleAfter = titleForLevel(stateAfter.level);
   const titleBefore = titleForLevel(stateBefore.level);
 
-  await tx.xPTransaction.create({
+  const row = await tx.xPTransaction.create({
     data: {
       userId,
       source: award.source,
@@ -109,7 +156,9 @@ export async function awardXp(tx: Tx, userId: string, award: XpAward): Promise<X
       careerXpAfter: BigInt(after),
       levelAfter: stateAfter.level,
       dedupeKey: award.dedupeKey ?? null,
+      createdAt: stamp.createdAt,
     },
+    select: { id: true },
   });
 
   await tx.careerProfile.update({
@@ -121,6 +170,11 @@ export async function awardXp(tx: Tx, userId: string, award: XpAward): Promise<X
       titleKey: titleAfter.title,
     },
   });
+
+  // Written before a row stamped ahead of the clock, whose running total did
+  // not include this award: re-stamp from here (the rows before it are only
+  // summed, and the few after it re-read).
+  if (stamp.restamp) await rebuildCareerTotals(tx, userId, { from: { createdAt: stamp.createdAt, id: row.id } });
 
   return {
     granted: amount,

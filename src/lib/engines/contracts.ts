@@ -271,6 +271,10 @@ export interface SessionRemoval {
   seasonXpRemoved: number;
   /** True when the race stopped being Story Complete, so its bonus went too. */
   storyBonusRemoved: boolean;
+  /** Expedition checkpoint XP that came off because the coverage left no longer reaches it (0.4.0). */
+  expeditionXpRemoved: number;
+  /** The checkpoints it took back, by percent. */
+  checkpointsRemoved: number[];
   levelBefore: number;
   levelAfter: number;
   careerXpBefore: number;
@@ -288,11 +292,13 @@ export interface SessionRemoval {
 export interface RaceRemoval {
   raceName: string;
   sessionsRemoved: number;
-  /** Career XP taken back: viewing, re-watch and the Story Complete bonus. Never negative. */
+  /** Career XP taken back: viewing, re-watch, the Story Complete bonus and expedition checkpoints. Never negative. */
   careerXpRemoved: number;
   seasonXpRemoved: number;
   /** True when the race held its Story Complete bonus, which went with it. */
   storyBonusRemoved: boolean;
+  /** The part of `careerXpRemoved` its Expedition checkpoints held. */
+  expeditionXpRemoved: number;
   levelBefore: number;
   levelAfter: number;
 }
@@ -312,6 +318,24 @@ export interface SeasonClosureNotice {
   label: string;
   /** Local midnight at which the pass opens, as `Date.toISOString()`. */
   reopensAt: string;
+}
+
+/**
+ * What a stint did for its race's Expedition (0.4.0), when the race is one.
+ * The moment an Expedition begins is shown as well as its checkpoints, so a
+ * 24-hour race says something before its first checkpoint, 2.4 hours in.
+ */
+export interface ExpeditionOutcome {
+  /** The race's coverage after the stint, by `formatCoveragePercent`. */
+  coveragePercentText: string;
+  /** The race is an Expedition and this was its first stint. */
+  began: boolean;
+  /** The checkpoints this stint took the race past, and the XP each paid with it. */
+  checkpointsReached: { percent: number; xpAwarded: number }[];
+  nextCheckpoint: { percent: number; xp: number } | null;
+  /** This stint completed the story, and the Expedition Summary is its record. */
+  completed: boolean;
+  summaryId: string | null;
 }
 
 export interface SessionOutcome {
@@ -378,6 +402,9 @@ export interface SessionOutcome {
 
   /** Championship mastery percentage after the session, if applicable. */
   championshipMastery: { name: string; percent: number } | null;
+
+  /** The race's Expedition, when it is one or the stint reached one of its checkpoints; null otherwise. */
+  expedition: ExpeditionOutcome | null;
 
   /** Heading for the summary screen, chosen by session length. */
   heading: string;

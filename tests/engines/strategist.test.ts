@@ -407,6 +407,15 @@ describe('recommendations never sound mandatory', () => {
     expect(rec.headline).toMatch(/\d/);
     expect(rec.completionPercent).toBeGreaterThan(70);
   });
+
+  it('calls a long race a long race: an Expedition is something a race is followed as (0.4.0)', () => {
+    for (const windowSeconds of [60 * 60, 600 * 60]) {
+      const recs = buildRecommendations([candidate({ name: '24 Hours of Spa', runtimeSec: 24 * H })], context({ windowSeconds }));
+      const bestFit = recs.find((rec) => rec.kind === 'BEST_FIT');
+      expect(bestFit?.headline).toContain('the 24 Hours of Spa is a long race of about');
+      for (const rec of recs) expect(rec.headline.toLowerCase()).not.toContain('expedition');
+    }
+  });
 });
 
 describe('getRecommendations', () => {

@@ -17,6 +17,7 @@ import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getMasteryForChampionship } from '@/lib/engines/mastery-engine';
 import { isCareerMilestoneRung, listStintCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { reconstructStintUnlocks } from '@/lib/engines/stint-unlocks';
+import { stintExpeditionOutcome } from '@/lib/engines/expedition-engine';
 import { TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
 import { seasonClosureNotice } from '@/lib/engines/season-pass-engine';
 
@@ -49,13 +50,16 @@ export async function buildOutcomeForSession(
 
   // What unlocked with this stint: stamped close to its instant, and not
   // claimed by the stints logged just before or after it (`stint-unlocks`).
-  const [profile, momentum, streak, budget, unlocks, careerMilestones] = await Promise.all([
+  const [profile, momentum, streak, budget, unlocks, careerMilestones, expedition] = await Promise.all([
     prisma.careerProfile.findUniqueOrThrow({ where: { userId } }),
     getMomentum(userId).catch(() => null),
     getStreak(userId).catch(() => null),
     getBudgetSnapshot(userId).catch(() => null),
     reconstructStintUnlocks(prisma, userId, session),
     listStintCareerMilestones(prisma, userId, session.id),
+    // The race's Expedition as this stint left it: its own checkpoint rows,
+    // the race's replay, and the summary if this stint completed the story.
+    stintExpeditionOutcome(prisma, userId, session),
   ]);
 
   const careerXpAwarded = session.xpTransactions.reduce((sum, t) => sum + t.amount, 0);
@@ -122,6 +126,8 @@ export async function buildOutcomeForSession(
       ? { name: championshipMastery.name, percent: championshipMastery.completionPercent }
       : null,
 
+    expedition,
+
     heading: stintHeading(session.realSeconds / 60),
     celebrate: chooseCelebration({
       storyCompleted: storyBonus > 0,
@@ -132,6 +138,7 @@ export async function buildOutcomeForSession(
       rareUnlock: unlocks.achievements.some((a) => a.rarity === 'LEGENDARY' || a.rarity === 'MYTHIC'),
       levelsGained: 0,
       careerMilestoneCelebration: highestMilestoneCelebration(careerMilestones),
+      expeditionCompleted: expedition?.completed ?? false,
     }),
   };
 }

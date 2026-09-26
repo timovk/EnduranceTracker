@@ -46,6 +46,9 @@ import {
 import {
   highestMilestoneCelebration, levelForMilestone, louderLevel, type MilestoneCelebration,
 } from '@/lib/domain/celebration';
+import {
+  expeditionOutcomeOf, heldExpeditionKeys, reconcileExpedition, writeExpeditionSummary, type ExpeditionSummaryWrite,
+} from './expedition-engine';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
 import {
@@ -284,6 +287,17 @@ export async function logViewingSession(
       }
     }
 
+    // -- 5a. The Expedition's checkpoints (0.4.0) --------------------------
+    //
+    // From the race's replay, which now includes this stint. On this path the
+    // coverage only grows and the runtime cannot change, so it only pays, and
+    // every checkpoint it pays names this stint (§4.3.2).
+    const expedition = await reconcileExpedition(db, userId, race.id, { crossingSessionId: session.id });
+    for (const checkpoint of expedition.awarded) {
+      xpBreakdown.push({ label: `Expedition — ${checkpoint.percent}% of the story`, amount: checkpoint.xp });
+      careerXpAwarded += checkpoint.xp;
+    }
+
     // -- 6. Momentum and streaks ------------------------------------------
     const momentum = await applyMomentumForSession(db, userId, window.realSeconds, now);
     const streak = await updateStreak(db, userId, watchedAt);
@@ -408,14 +422,52 @@ export async function logViewingSession(
       now,
     );
 
-    // -- 12. Assemble the stint summary ------------------------------------
     const championshipMastery = race.championshipId
       ? await getMasteryForChampionship(userId, race.championshipId).catch(() => null)
       : null;
+    const careerMilestones = await listStintCareerMilestones(db, userId, session.id);
+    const ladderMilestones = milestones.filter((milestone) => !isCareerMilestoneRung(milestone));
 
+    // -- 11a. The Expedition Summary (0.4.0) ---------------------------------
+    //
+    // Whenever an Expedition's story is complete and it has no summary yet —
+    // not only on the completing stint, so a summary never hangs on a one-off
+    // moment. Written live, with this stint's unlocks and its championship's
+    // mastery as they are now, only when this stint completed the story;
+    // otherwise it is retrospective and its unlocks are rebuilt.
+    let summary: ExpeditionSummaryWrite | null = null;
+    if (expedition.isExpedition && expedition.storyCompleted && expedition.history !== null) {
+      const live = aggregates.becameStoryComplete && expedition.history.completingSessionId === session.id;
+      summary = await writeExpeditionSummary(db, userId, race.id, now, {
+        retrospective: !live,
+        history: expedition.history,
+        inputs: history,
+        unlocks: live ? { achievements, milestones: ladderMilestones, careerMilestones, mastery } : undefined,
+        championshipMastery: championshipMastery
+          ? { name: championshipMastery.name, percent: championshipMastery.completionPercent }
+          : null,
+      });
+    }
+
+    // Anything taken back above is settled after the last award (R13). The
+    // Story Complete revocation was settled at once; the checkpoints cannot be
+    // revoked on this path, but the rule has no exceptions.
+    await settleLedger(db, userId, [expedition.revocation]);
+
+    const expeditionOutcome = expedition.history === null
+      ? null
+      : expeditionOutcomeOf({
+        history: expedition.history,
+        sessionId: session.id,
+        paid: new Map(expedition.awarded
+          .filter((checkpoint) => checkpoint.sessionId === session.id)
+          .map((checkpoint) => [checkpoint.percent, checkpoint.xp])),
+        summary: summary === null ? null : { id: summary.id, completingSessionId: summary.snapshot.completingSessionId },
+      });
+
+    // -- 12. Assemble the stint summary ------------------------------------
     const runtime = Math.max(1, race.runtimeSec);
     const realMinutes = window.realSeconds / 60;
-    const careerMilestones = await listStintCareerMilestones(db, userId, session.id);
 
     return {
       sessionId: session.id,
@@ -449,7 +501,7 @@ export async function logViewingSession(
 
       achievements,
       // A rung that is also a Career Milestone is shown with those instead.
-      milestones: milestones.filter((milestone) => !isCareerMilestoneRung(milestone)),
+      milestones: ladderMilestones,
       careerMilestones,
       mastery,
       challenges,
@@ -468,6 +520,8 @@ export async function logViewingSession(
         ? { name: championshipMastery.name, percent: championshipMastery.completionPercent }
         : null,
 
+      expedition: expeditionOutcome,
+
       heading: stintHeading(realMinutes),
       celebrate: chooseCelebration({
         storyCompleted: aggregates.becameStoryComplete,
@@ -478,6 +532,7 @@ export async function logViewingSession(
         rareUnlock: achievements.some((a) => a.rarity === 'LEGENDARY' || a.rarity === 'MYTHIC'),
         levelsGained: profileAfter.level - levelBefore,
         careerMilestoneCelebration: highestMilestoneCelebration(careerMilestones),
+        expeditionCompleted: expeditionOutcome?.completed ?? false,
       }),
     } satisfies SessionOutcome;
   }, TRANSACTION_OPTIONS).then(async (outcome) => {
@@ -505,6 +560,10 @@ export async function logViewingSession(
  * NOTABLE, a `spectacular` one SPECTACULAR. Most milestones celebrate
  * `none` and are simply listed. What the summary then draws is
  * `celebrationView` (`domain/celebration`).
+ *
+ * `expeditionCompleted` — the stint completed an Expedition's story and its
+ * summary was written (0.4.0) — is SPECTACULAR whatever the race's length:
+ * following a race as an Expedition is exactly asking for that moment.
  */
 export function chooseCelebration(facts: {
   storyCompleted: boolean;
@@ -515,6 +574,7 @@ export function chooseCelebration(facts: {
   rareUnlock: boolean;
   levelsGained: number;
   careerMilestoneCelebration: MilestoneCelebration;
+  expeditionCompleted: boolean;
 }): 'QUIET' | 'NOTABLE' | 'SPECTACULAR' {
   const isLongHaul = facts.runtimeSec >= TWENTY_FOUR_HOUR_CONFIG.longHaulThresholdSec;
   const fromMilestones = levelForMilestone(facts.careerMilestoneCelebration);
@@ -522,6 +582,7 @@ export function chooseCelebration(facts: {
     facts.prestigeGained > 0 ||
     facts.seasonCompleted ||
     facts.masteryTreeCompleted ||
+    facts.expeditionCompleted ||
     (facts.storyCompleted && isLongHaul)
   ) {
     return 'SPECTACULAR';
@@ -601,17 +662,27 @@ export async function deleteViewingSession(
         ? await revokeXpByDedupeKey(db, userId, storyBonusKey(session.raceId))
         : null;
 
+    // The Expedition's checkpoints follow the coverage the same way: those the
+    // remaining stints no longer reach come off, and free their keys. Nothing
+    // new can be reached by removing a stint, so nothing is paid here — not
+    // even a checkpoint an unfinished upgrade has yet to pay, which the
+    // removal's figures would not account for.
+    const expedition = await reconcileExpedition(db, userId, session.raceId, { award: false });
+
     // Rebuild rather than decrement. Career XP, level, prestige, title and the
     // per-transaction running totals the XP graph is drawn from all come back
     // out of the ledger, which is the only thing that was ever authoritative.
-    const revocations = storyBonus === null ? [revoked] : [revoked, storyBonus];
+    const revocations = storyBonus === null ? [revoked, expedition.revocation] : [revoked, storyBonus, expedition.revocation];
     const ledger = await settleLedger(db, userId, revocations) ?? await unchangedLedger(db, userId);
+    const expeditionXpRemoved = expedition.revoked.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
 
     return {
       raceId: session.raceId,
-      careerXpRemoved: revoked.careerXp + (storyBonus?.careerXp ?? 0),
+      careerXpRemoved: revoked.careerXp + (storyBonus?.careerXp ?? 0) + expeditionXpRemoved,
       seasonXpRemoved: revoked.seasonXp + (storyBonus?.seasonXp ?? 0),
       storyBonusRemoved: (storyBonus?.transactions ?? 0) > 0,
+      expeditionXpRemoved,
+      checkpointsRemoved: expedition.revoked.map((checkpoint) => checkpoint.percent),
       levelBefore: ledger.levelBefore,
       levelAfter: ledger.levelAfter,
       careerXpBefore: ledger.careerXpBefore,
@@ -639,8 +710,9 @@ async function unchangedLedger(db: Tx, userId: string): Promise<LedgerRebuild> {
  * decision D4).
  *
  * Exactly as if its stints had been deleted one by one: the viewing and
- * re-watch XP of every stint, and the Story Complete bonus, come off the
- * ledger, and the totals are rebuilt from what remains. Viewing XP left behind
+ * re-watch XP of every stint, the Story Complete bonus and its Expedition
+ * checkpoints come off the ledger, and the totals are rebuilt from what
+ * remains. Viewing XP left behind
  * by a stint deleted under an older version is found by the race it names
  * (`sourceRef`) and goes too.
  *
@@ -676,6 +748,8 @@ export async function deleteRace(
     const viewing = await revokeSessionsXp(db, userId, sessions.map((session) => session.id));
     const orphaned = await revokeRaceViewingXp(db, userId, race.id);
     const storyBonus = await revokeXpByDedupeKeys(db, userId, [storyBonusKey(race.id)]);
+    // Every checkpoint the race holds, by its exact key.
+    const expedition = await revokeXpByDedupeKeys(db, userId, await heldExpeditionKeys(db, userId, race.id));
 
     // The event steps the race helped reach are credited to it first, and its
     // credits keep its edition's fingerprint once it is gone (a tombstone), so
@@ -696,13 +770,14 @@ export async function deleteRace(
 
     // Scoped by account as well as id, so the delete is safe on its own. It
     // cascades to the stints, their intervals and the collection cards; the
-    // Hall of Fame keeps its plaque with the race link cleared.
+    // Hall of Fame keeps its plaque, and an Expedition Summary its snapshot,
+    // with the race link cleared.
     await db.race.deleteMany({ where: { id: race.id, userId } });
 
     // The event caches drop the edition.
     await recomputeRaceMasteries(db, userId, now);
 
-    const revocations = [viewing, orphaned, storyBonus];
+    const revocations = [viewing, orphaned, storyBonus, expedition];
     const ledger = await settleLedger(db, userId, revocations) ?? await unchangedLedger(db, userId);
     const removed = combineRevocations(revocations);
 
@@ -712,6 +787,7 @@ export async function deleteRace(
       careerXpRemoved: removed.careerXp,
       seasonXpRemoved: removed.seasonXp,
       storyBonusRemoved: storyBonus.transactions > 0,
+      expeditionXpRemoved: expedition.careerXp,
       levelBefore: ledger.levelBefore,
       levelAfter: ledger.levelAfter,
     };
@@ -730,6 +806,8 @@ export interface LedgerRepair {
   orphanedTransactions: number;
   /** Story Complete bonuses held by races that are no longer complete. */
   staleStoryBonuses: number;
+  /** Expedition checkpoints held for races that no longer exist. */
+  staleExpeditionCheckpoints: number;
   careerXpBefore: number;
   careerXpAfter: number;
   levelBefore: number;
@@ -739,8 +817,8 @@ export interface LedgerRepair {
 /**
  * Put a career's XP back in step with its data.
  *
- * Two things can leave a ledger overstated, and both predate the rule that XP
- * follows the data:
+ * Three things can leave a ledger overstated, and the first two predate the
+ * rule that XP follows the data:
  *
  *   1. Viewing XP left behind by a stint that was deleted. Those rows still
  *      count towards the career total even though the stint they describe is
@@ -749,6 +827,11 @@ export interface LedgerRepair {
  *   2. A Story Complete bonus still held by a race that is no longer complete.
  *      Worse than the XP, its unique dedupeKey blocks the bonus from ever being
  *      earned again.
+ *   3. An Expedition checkpoint held for a race that no longer exists
+ *      (0.4.0). Deleting a race takes its checkpoints with it, so this is a
+ *      repair for a ledger something else left behind. Checkpoints a race
+ *      still in the library no longer supports are the Expedition
+ *      reconcile's to take back, not this repair's.
  *
  * Both are repaired by deletion, never by a negative adjustment, and the totals
  * are then rebuilt from what remains. Running it on a healthy career changes
@@ -761,14 +844,16 @@ export async function repairXpLedger(userId: string): Promise<LedgerRepair> {
     const orphaned = await purgeOrphanedSessionXp(db, userId);
 
     // Every race is read once, rather than once per bonus.
-    const [bonuses, races] = await Promise.all([
+    const [bonuses, checkpoints, races] = await Promise.all([
       db.xPTransaction.findMany({
         where: { userId, source: 'STORY_COMPLETE', dedupeKey: { startsWith: 'story-complete:' } },
         select: { dedupeKey: true },
       }),
+      db.xPTransaction.findMany({ where: { userId, source: 'EXPEDITION' }, select: { dedupeKey: true, sourceRef: true } }),
       db.race.findMany({ where: { userId }, select: { id: true, storyCompletedAt: true } }),
     ]);
     const complete = new Set(races.filter((race) => race.storyCompletedAt !== null).map((race) => race.id));
+    const present = new Set(races.map((race) => race.id));
 
     // A missing race means the bonus outlived what earned it just as surely
     // as an incomplete one does.
@@ -777,18 +862,23 @@ export async function repairXpLedger(userId: string): Promise<LedgerRepair> {
       .filter((key): key is string => key !== null && !complete.has(key.slice('story-complete:'.length)));
     const stale = await revokeXpByDedupeKeys(db, userId, staleKeys);
 
+    const orphanedCheckpoints = await revokeXpByDedupeKeys(db, userId, checkpoints
+      .filter((row) => row.sourceRef === null || !present.has(row.sourceRef))
+      .flatMap((row) => (row.dedupeKey === null ? [] : [row.dedupeKey])));
+
     // Settled from the earliest row either repair removed. This is also the
     // maintenance path, where a running total that drifted is put right, so
     // the whole ledger is replayed after it: a drift before the first removed
     // row is corrected too, and where the settle already did the work the
     // replay finds nothing to write.
-    const revocations: XpRevocation[] = [orphaned, stale];
+    const revocations: XpRevocation[] = [orphaned, stale, orphanedCheckpoints];
     const settled = await settleLedger(db, userId, revocations);
     const ledger = await rebuildCareerTotals(db, userId);
 
     return {
       orphanedTransactions: orphaned.transactions,
       staleStoryBonuses: stale.transactions,
+      staleExpeditionCheckpoints: orphanedCheckpoints.transactions,
       careerXpBefore: settled?.careerXpBefore ?? ledger.careerXpBefore,
       careerXpAfter: ledger.careerXpAfter,
       levelBefore: settled?.levelBefore ?? ledger.levelBefore,

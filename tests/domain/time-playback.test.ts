@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  formatCoveragePercent, formatDuration, formatHoursMinutes, formatTimestamp, hoursToSeconds,
+  formatCoveragePercent, formatDuration, formatElapsed, formatHoursMinutes, formatTimestamp, hoursToSeconds,
   parseTimestamp, TimeParseError, toHours, tryParseTimestamp,
 } from '@/lib/domain/time';
 import { isStoryComplete } from '@/lib/domain/intervals';
@@ -73,6 +73,10 @@ describe('formatting', () => {
   });
 
   it('formats durations as prose', () => {
+    expect(formatElapsed(30 * H)).toBe('30h 00m');
+    expect(formatElapsed(48 * H)).toBe('2 days');
+    expect(formatElapsed(122 * H + 24 * 60)).toBe('5 days 2h');
+    expect(formatElapsed(1_523 * H)).toBe('63 days 11h');
     expect(formatDuration(6 * H)).toBe('6h 00m');
     expect(formatDuration(4871)).toBe('1h 21m');
     expect(formatDuration(2820)).toBe('47m');

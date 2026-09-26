@@ -11,14 +11,20 @@
  * A race that is an edition of a recurring event says so, and links to the
  * event's page; one that looks like an edition of an event it is not in yet
  * offers the link in one line, and never links it without a click.
+ *
+ * A race followed as an Expedition (0.4.0) has a panel of its own, with its
+ * checkpoints and the way to its Expedition page; any other race offers the
+ * switch in one quiet line. A completed Expedition's summary is shown here
+ * for good.
  */
 
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
-  CalendarDays, ExternalLink, Flag, MapPin, Pencil, Play, Repeat, Star, Trash2, Zap,
+  ArrowRight, CalendarDays, ExternalLink, Flag, MapPin, Mountain, Pencil, Play, Repeat, Star, Trash2, Zap,
 } from 'lucide-react';
+import { EXPEDITION_SHAPE } from '@/lib/config';
 import type { RaceDetail } from '@/lib/server/races';
 import type { SessionOutcome } from '@/lib/engines/contracts';
 import { formatDuration, formatTimestamp } from '@/lib/domain/time';
@@ -30,6 +36,10 @@ import { TwentyFourHourClock } from './twenty-four-hour-clock';
 import { LogSessionForm } from './log-session-form';
 import type { StintEntryMode } from '@/lib/domain/race-clock';
 import { StintSummary } from './stint-summary';
+import { accentVars } from '@/components/ui/accent';
+import { CoverageMeter } from '@/components/expeditions/coverage-meter';
+import { ExpeditionModeControl } from '@/components/expeditions/expedition-mode-control';
+import { ExpeditionSummaryCard } from '@/components/expeditions/expedition-summary-card';
 import { deleteRaceAction, deleteSessionAction, logSessionAction } from '@/lib/server/actions';
 import { dismissEventSuggestionAction, linkRacesToEventAction } from '@/lib/server/career-actions';
 import { formatDate, formatNumber } from '@/lib/utils';
@@ -53,6 +63,7 @@ export function RaceDetailView({
 
   const accent = race.championship?.accentColor ?? 'var(--accent)';
   const isLongHaul = race.runtimeSec >= longHaulThresholdSec;
+  const { expedition } = race;
 
   function answerSuggestion(link: boolean) {
     if (eventSuggestion === null) return;
@@ -83,7 +94,8 @@ export function RaceDetailView({
   return (
     <div
       className="space-y-4"
-      style={{ ['--accent' as string]: accent } as React.CSSProperties}
+      // Only a real colour: without a championship the theme's accent is inherited as it is.
+      style={race.championship ? accentVars(race.championship.accentColor) : undefined}
     >
       {/* ---- Header ------------------------------------------------------ */}
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -125,6 +137,20 @@ export function RaceDetailView({
               </Badge>
             ) : null}
           </div>
+
+          {!expedition.isExpedition ? (
+            <div className="mt-2.5 flex items-center gap-2 text-xs text-ink-dim">
+              <Mountain size={12} className="shrink-0" />
+              <ExpeditionModeControl
+                raceId={race.id}
+                mode={expedition.mode}
+                isExpedition={false}
+                label={`Follow this race as an Expedition${expedition.checkpointsPayXp
+                  ? ''
+                  : ` (checkpoints earn XP from ${EXPEDITION_SHAPE.checkpointXpMinimumHours} hours)`}`}
+              />
+            </div>
+          ) : null}
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -248,6 +274,47 @@ export function RaceDetailView({
         </PanelBody>
       </Panel>
 
+      {/* ---- Expedition --------------------------------------------------- */}
+      {expedition.isExpedition ? (
+        <Panel>
+          <PanelHeader
+            title="Expedition"
+            icon={<Mountain size={13} className="text-[var(--accent)]" />}
+            action={
+              <Link href={`/races/${race.id}/expedition`}>
+                <Button variant="primary" size="sm">Open the expedition <ArrowRight size={12} /></Button>
+              </Link>
+            }
+          />
+          <PanelBody className="space-y-3">
+            <CoverageMeter
+              coverageSec={expedition.coverageSec}
+              runtimeSec={race.runtimeSec}
+              ticks={expedition.ticks}
+              accent={race.championship?.accentColor ?? null}
+            />
+            <p className="text-xs text-ink-muted">
+              <span className="timing text-ink">{expedition.completionText}</span> of the story watched ·{' '}
+              {expedition.nextCheckpoint
+                ? `next checkpoint ${expedition.nextCheckpoint.percent}%` +
+                  (expedition.checkpointsPayXp ? ` (+${formatNumber(expedition.nextCheckpoint.xp)} XP)` : '')
+                : race.storyComplete
+                  ? 'every checkpoint reached, and the story is complete'
+                  : 'every checkpoint reached; Story Complete is the last'}
+            </p>
+            <ExpeditionModeControl raceId={race.id} mode={expedition.mode} isExpedition />
+          </PanelBody>
+        </Panel>
+      ) : null}
+
+      {expedition.summary ? (
+        <ExpeditionSummaryCard
+          snapshot={expedition.summary.snapshot}
+          retrospective={expedition.summary.retrospective}
+          accent={race.championship?.accentColor ?? null}
+        />
+      ) : null}
+
       {/* ---- Session history --------------------------------------------- */}
       <Panel>
         <PanelHeader title={`Viewing history · ${race.sessionCount} session${race.sessionCount === 1 ? '' : 's'}`} />
@@ -324,7 +391,7 @@ export function RaceDetailView({
           action={async () => {
             if (!confirm(
               `Remove ${race.name} from the library? Its viewing history goes with it, and so does the XP it ` +
-                'earned — viewing and Story Complete. Achievements and milestones you reached stay.',
+                'earned — viewing, Story Complete and expedition checkpoints. Achievements and milestones you reached stay.',
             )) return;
             const result = await deleteRaceAction(race.id);
             if (!result.ok || !result.data) {
@@ -362,7 +429,7 @@ export function RaceDetailView({
 }
 
 /** Snap an averaged speed to the nearest offered option, for the form default. */
-function roundSpeed(speed: number): number {
+export function roundSpeed(speed: number): number {
   const options = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
   return options.reduce((best, option) =>
     Math.abs(option - speed) < Math.abs(best - speed) ? option : best, 1);

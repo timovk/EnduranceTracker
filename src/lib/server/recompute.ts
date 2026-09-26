@@ -26,7 +26,13 @@
  *      from the replay, where the replay's instant passes the same test a
  *      first dating does: the one deliberate exception to "a landmark's date
  *      is written once", for developer repair.
- *   4. The account's 0.4.0 backfill is recorded as done: recompute has just
+ *   4. Expeditions, in chunks: every race's checkpoints reconciled with its
+ *      replay — those the coverage no longer reaches taken back, held ones
+ *      re-sized to the race's current runtime (the one repair that re-sizes
+ *      a checkpoint), reached ones of an Expedition paid — and the missing
+ *      summary of a completed Expedition written. A summary that exists is
+ *      never rewritten.
+ *   5. The account's 0.4.0 backfill is recorded as done: recompute has just
  *      done all of it.
  */
 
@@ -43,7 +49,8 @@ import { reconcileStoryBonus } from '@/lib/engines/progression-resync';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { repairXpLedger, type LedgerRepair } from '@/lib/engines/session-engine';
 import { settleLedger, type XpRevocation } from '@/lib/engines/xp-ledger';
-import { markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
+import { careerRecordProgression } from '@/lib/engines/expedition-engine';
+import { backfillExpeditions, EXPEDITION_CHUNK, markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 
 export interface RecomputeOptions {
   /** The instant recorded as "now" by anything the rebuild completes. Defaults to the clock. */
@@ -75,6 +82,8 @@ export interface RecomputeReport {
   datesRecognised: number;
   /** Landmarks dated again on request; 0 unless `rebuildMilestoneDates` was set. */
   milestoneDatesRebuilt: number;
+  /** Expedition checkpoints paid, taken back and re-sized, the XP paid, and summaries written. */
+  expeditions: { checkpointsAwarded: number; xpAwarded: number; checkpointsRevoked: number; checkpointsResized: number; summariesWritten: number };
   totals: { races: number; coverageSec: number; creditedViewingSec: number };
 }
 
@@ -156,7 +165,34 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     };
   }, SYNC_TRANSACTION);
 
-  // -- 4. The upgrade --------------------------------------------------------
+  // -- 4. Expeditions ---------------------------------------------------------
+  //
+  // Every race, not only today's Expeditions: a race switched off keeps its
+  // checkpoints, and they are re-sized and checked against its coverage like
+  // any other. Replayed again, because step 3 may have moved races between
+  // events and a summary names the event its race is in.
+  const expeditionInputs = await loadTimelineInputs(prisma, userId);
+  const expeditionTimeline = buildCareerTimeline(expeditionInputs.sessions, expeditionInputs.races);
+  const context = {
+    userId, now, timeline: expeditionTimeline, history: expeditionInputs,
+    progression: await careerRecordProgression(prisma, userId, expeditionTimeline),
+  };
+  const expeditions = { checkpointsAwarded: 0, xpAwarded: 0, checkpointsRevoked: 0, checkpointsResized: 0, summariesWritten: 0 };
+  const allRaces = expeditionInputs.races.map((race) => race.id).sort();
+  for (let index = 0; index < allRaces.length; index += EXPEDITION_CHUNK) {
+    const chunk = allRaces.slice(index, index + EXPEDITION_CHUNK);
+    const result = await prisma.$transaction(
+      (tx) => backfillExpeditions(tx as Tx, context, chunk, { resize: true }),
+      CHUNK_TRANSACTION,
+    );
+    expeditions.checkpointsAwarded += result.checkpoints;
+    expeditions.xpAwarded += result.xp;
+    expeditions.checkpointsRevoked += result.revoked;
+    expeditions.checkpointsResized += result.resized;
+    expeditions.summariesWritten += result.summaries;
+  }
+
+  // -- 5. The upgrade --------------------------------------------------------
   //
   // Everything the 0.4.0 backfill would do has just been done, so the next
   // start has nothing left to do for this account.
@@ -174,6 +210,7 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     storyBonusesRevoked,
     ledger,
     ...synced,
+    expeditions,
     totals: {
       races: totals._count,
       coverageSec: totals._sum.coverageSec ?? 0,

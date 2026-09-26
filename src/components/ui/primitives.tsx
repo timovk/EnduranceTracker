@@ -95,7 +95,7 @@ export function Stat({
  * is the whole point of tracking intervals.
  */
 export function TimingBar({
-  value, max = 100, segments, className, height = 'h-2', color, track = 'bg-panel-3', label,
+  value, max = 100, segments, className, height = 'h-2', color, track = 'bg-panel-3', label, valueText, children,
 }: {
   value?: number;
   max?: number;
@@ -105,6 +105,10 @@ export function TimingBar({
   color?: string;
   track?: string;
   label?: string;
+  /** Read out instead of the rounded value, where rounding would say more than is true ("99.9%", not "100"). */
+  valueText?: string;
+  /** Drawn over the bar, such as tick marks. */
+  children?: React.ReactNode;
 }) {
   const accent = color ?? 'var(--accent)';
   return (
@@ -114,6 +118,7 @@ export function TimingBar({
       aria-valuenow={segments ? undefined : Math.round(value ?? 0)}
       aria-valuemin={0}
       aria-valuemax={max}
+      aria-valuetext={valueText}
       aria-label={label}
     >
       {segments
@@ -134,6 +139,7 @@ export function TimingBar({
             style={{ width: `${Math.min(100, Math.max(0, ((value ?? 0) / max) * 100))}%`, background: accent }}
           />
         )}
+      {children}
     </div>
   );
 }

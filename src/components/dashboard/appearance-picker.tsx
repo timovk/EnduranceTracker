@@ -41,6 +41,7 @@ const SAMPLE_RACE: RaceCardData = {
   priority: 'NORMAL',
   excitement: 3,
   isMajorEvent: false,
+  isExpedition: false,
   storyComplete: false,
   intervals: [{ start: 0, end: 2 * 3600 }, { start: 2 * 3600, end: 3.5 * 3600 }],
 };

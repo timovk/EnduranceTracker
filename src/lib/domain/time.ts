@@ -92,6 +92,19 @@ export function formatDuration(totalSeconds: number, options: { seconds?: boolea
   return `${seconds}s`;
 }
 
+/**
+ * A span of calendar time, such as an Expedition from its first stint to its
+ * last: "30h 00m" under two days, then "5 days 2h". Hundreds of hours read as
+ * a number rather than as a length of time.
+ */
+export function formatElapsed(totalSeconds: number): string {
+  const safe = Math.max(0, Math.round(totalSeconds));
+  if (safe < 48 * 3600) return formatDuration(safe);
+  const days = Math.floor(safe / 86_400);
+  const hours = Math.floor((safe % 86_400) / 3600);
+  return hours > 0 ? `${days} days ${hours}h` : `${days} days`;
+}
+
 /** Compact form for dense panels: `6:00`, `1:21`, `0:47`. */
 export function formatHoursMinutes(totalSeconds: number): string {
   const safe = Math.max(0, Math.round(totalSeconds));

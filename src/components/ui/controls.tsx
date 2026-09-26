@@ -135,15 +135,16 @@ export function Segmented<T extends string | number>({
 }
 
 export function Toggle({
-  checked, onChange, label, className,
-}: { checked: boolean; onChange: (v: boolean) => void; label?: string; className?: string }) {
+  checked, onChange, label, className, disabled,
+}: { checked: boolean; onChange: (v: boolean) => void; label?: string; className?: string; disabled?: boolean }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={cn('inline-flex items-center gap-2.5 text-sm text-ink-muted', className)}
+      className={cn('inline-flex items-center gap-2.5 text-sm text-ink-muted disabled:cursor-not-allowed disabled:opacity-60', className)}
     >
       <span
         className={cn(

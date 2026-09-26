@@ -9,13 +9,22 @@
 import type { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/db/client';
 import { STORY_CONFIG } from '@/lib/config';
-import { creditedSeconds } from '@/lib/domain/career-timeline';
+import { creditedSeconds, replayRace } from '@/lib/domain/career-timeline';
 import { editionIdentity, editionYear } from '@/lib/domain/edition';
+import {
+  checkpointsPayXp, checkpointTicks, isExpedition, nextCheckpoint,
+} from '@/lib/domain/expedition';
+import { formatCoveragePercent } from '@/lib/domain/time';
 import { coverageSeconds, fromRows, gapsIn, resumePoint } from '@/lib/domain/intervals';
 import { estimateRemaining } from '@/lib/domain/playback';
 import type { Interval, RacePriority, RaceStatus, RaceType } from '@/lib/domain/types';
 import { eventDisplayName, eventHref } from '@/lib/engines/mastery-engine';
+import { loadRaceTimelineInputs } from '@/lib/engines/career-timeline-engine';
+import {
+  expeditionModeOf, getExpeditionSummaryForRace, type ExpeditionModeSetting, type ExpeditionSummaryView,
+} from '@/lib/engines/expedition-engine';
 import type { RaceCardData } from '@/components/races/race-card';
+import type { CurrentStintData } from '@/components/dashboard/current-stint';
 
 export interface RaceFilter {
   status?: RaceStatus[];
@@ -35,7 +44,7 @@ const RACE_SELECT = {
   runtimeSec: true, scheduledDurationSec: true, actualDurationSec: true,
   coverageSec: true, realViewingSec: true, timelineWatchedSec: true,
   sessionCount: true, furthestTimestampSec: true, avgPlaybackSpeed: true,
-  status: true, priority: true, excitement: true, isMajorEvent: true, iconicKey: true,
+  status: true, priority: true, excitement: true, isMajorEvent: true, iconicKey: true, expeditionMode: true,
   raceType: true, notes: true, replayUrl: true, posterUrl: true,
   startedAt: true, completedAt: true, lastWatchedAt: true, storyCompletedAt: true,
   championship: { select: { id: true, name: true, shortName: true, accentColor: true } },
@@ -51,7 +60,7 @@ const RACE_DETAIL_SELECT = {
   sessions: {
     select: {
       id: true, startTimestampSec: true, endTimestampSec: true, playbackSpeed: true,
-      timelineSeconds: true, realSeconds: true, newCoverageSeconds: true,
+      timelineSeconds: true, realSeconds: true,
       coverageBeforeSec: true, coverageAfterSec: true, careerXpAwarded: true,
       watchedAt: true, note: true,
     },
@@ -123,6 +132,7 @@ function toCardData(race: RaceRow): RaceCardData {
     priority: race.priority as RacePriority,
     excitement: race.excitement,
     isMajorEvent: race.isMajorEvent,
+    isExpedition: isExpedition(race),
     storyComplete: race.storyCompletedAt !== null,
     intervals: race.intervals.map((i) => ({ start: i.startSec, end: i.endSec })),
   };
@@ -181,6 +191,22 @@ export interface RaceDetail {
   lastWatchedAt: Date | null;
   storyCompletedAt: Date | null;
 
+  /**
+   * The race as an Expedition (0.4.0), from its replay: the mode it is set
+   * to, whether it is one, and where its coverage stands against the
+   * checkpoints. Every race has it, because any race can be followed as one.
+   */
+  expedition: {
+    mode: ExpeditionModeSetting;
+    isExpedition: boolean;
+    checkpointsPayXp: boolean;
+    coverageSec: number;
+    completionText: string;
+    ticks: { percent: number; reached: boolean }[];
+    nextCheckpoint: { percent: number; xp: number } | null;
+    summary: ExpeditionSummaryView | null;
+  };
+
   sessions: {
     id: string;
     startTimestampSec: number;
@@ -193,6 +219,11 @@ export interface RaceDetail {
      * row shows as "Real viewing", so the rows add up to the race's figure.
      */
     creditedSeconds: number;
+    /**
+     * Timeline this stint saw for the first time, from the race's replay
+     * (0.4.0): right after an earlier stint is deleted, where the snapshot
+     * taken when it was logged would not be.
+     */
     newCoverageSeconds: number;
     coverageBeforeSec: number;
     coverageAfterSec: number;
@@ -203,12 +234,21 @@ export interface RaceDetail {
 }
 
 export async function getRaceDetail(userId: string, raceId: string): Promise<RaceDetail | null> {
-  const race = await prisma.race.findFirst({
-    where: { id: raceId, userId },
-    select: RACE_DETAIL_SELECT,
-  });
+  const [race, inputs, summary] = await Promise.all([
+    prisma.race.findFirst({
+      where: { id: raceId, userId },
+      select: RACE_DETAIL_SELECT,
+    }),
+    loadRaceTimelineInputs(prisma, userId, raceId),
+    getExpeditionSummaryForRace(userId, raceId),
+  ]);
 
-  if (!race) return null;
+  if (!race || !inputs) return null;
+
+  // The race's own replay: what each stint added, and the coverage the
+  // Expedition's checkpoints are measured on.
+  const history = replayRace(inputs.race, inputs.sessions);
+  const added = new Map(history.stints.map((stint) => [stint.sessionId, stint.addedCoverageSeconds]));
 
   const intervals = fromRows(race.intervals);
   const coverage = Math.min(coverageSeconds(intervals), race.runtimeSec);
@@ -269,12 +309,27 @@ export async function getRaceDetail(userId: string, raceId: string): Promise<Rac
     lastWatchedAt: race.lastWatchedAt,
     storyCompletedAt: race.storyCompletedAt,
 
-    sessions: race.sessions.map((session) => ({ ...session, creditedSeconds: creditedSeconds(session) })),
+    expedition: {
+      mode: expeditionModeOf(race.expeditionMode),
+      isExpedition: isExpedition(race),
+      checkpointsPayXp: checkpointsPayXp(race.runtimeSec),
+      coverageSec: history.coverageSeconds,
+      completionText: formatCoveragePercent(history.coverageSeconds, race.runtimeSec),
+      ticks: checkpointTicks(history.coverageSeconds, race.runtimeSec),
+      nextCheckpoint: nextCheckpoint(history.coverageSeconds, race.runtimeSec),
+      summary,
+    },
+
+    sessions: race.sessions.map((session) => ({
+      ...session,
+      creditedSeconds: creditedSeconds(session),
+      newCoverageSeconds: added.get(session.id) ?? 0,
+    })),
   };
 }
 
 /** The race the dashboard shows as "current stint". */
-export async function getCurrentStint(userId: string) {
+export async function getCurrentStint(userId: string): Promise<CurrentStintData | null> {
   const race = await prisma.race.findFirst({
     where: {
       userId,
@@ -305,6 +360,14 @@ export async function getCurrentStint(userId: string) {
     completionPercent: estimate.completionPercent,
     realRemainingSec: estimate.realRemainingSec,
     playbackSpeed: Math.round(speed * 100) / 100,
+    // One line when the race is followed as an Expedition: how far, and
+    // which checkpoint is next (null once all five are behind it).
+    expedition: isExpedition(race)
+      ? {
+        completionText: formatCoveragePercent(coverage, race.runtimeSec),
+        nextCheckpointPercent: nextCheckpoint(coverage, race.runtimeSec)?.percent ?? null,
+      }
+      : null,
   };
 }
 

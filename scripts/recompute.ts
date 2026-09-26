@@ -83,6 +83,9 @@ async function rebuild(account: Account, now: Date, options: Arguments): Promise
   if (xp.staleStoryBonuses > 0) {
     console.log(`    released ${xp.staleStoryBonuses} Story Complete bonus(es) — those races can earn it again`);
   }
+  if (xp.staleExpeditionCheckpoints > 0) {
+    console.log(`    removed ${xp.staleExpeditionCheckpoints} expedition checkpoint(s) of races no longer in the library`);
+  }
   if (xp.levelAfter !== xp.levelBefore) {
     console.log(`    level ${xp.levelBefore} -> ${xp.levelAfter}`);
   }
@@ -102,6 +105,19 @@ async function rebuild(account: Account, now: Date, options: Arguments): Promise
   if (options.rebuildMilestoneDates) {
     console.log(`  milestone dates rebuilt from history        ${report.milestoneDatesRebuilt}`);
   }
+
+  const expeditions = report.expeditions;
+  console.log(`  expedition checkpoints newly paid           ${expeditions.checkpointsAwarded}`);
+  if (expeditions.xpAwarded > 0) {
+    console.log(`    paid ${expeditions.xpAwarded} XP for them`);
+  }
+  if (expeditions.checkpointsRevoked > 0) {
+    console.log(`    released ${expeditions.checkpointsRevoked} checkpoint(s) the coverage no longer reaches`);
+  }
+  if (expeditions.checkpointsResized > 0) {
+    console.log(`    re-sized ${expeditions.checkpointsResized} checkpoint(s) to their race's current length`);
+  }
+  console.log(`  expedition summaries written                ${expeditions.summariesWritten}`);
 
   console.log('\n  Current totals');
   console.log(`    races               ${report.totals.races}`);

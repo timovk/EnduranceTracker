@@ -15,13 +15,14 @@ import {
   weeksRemainingInYear, wholeWeeksRemainingInYear, yearPeriod, yearProgress,
 } from '@/lib/domain/periods';
 import {
-  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, eventLegacyHeadline, EXPIRED_CHALLENGE_NOTE,
-  FORBIDDEN_TONE_WORDS, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
+  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, describeFragments, eventLegacyHeadline,
+  expeditionBudgetNote, expeditionModeMessage, EXPIRED_CHALLENGE_NOTE,
+  FORBIDDEN_TONE_WORDS, milestoneLabel, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
   seasonClosedStintNote, seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
   seasonPassClosedShortNote, stillAheadNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
   yearToDateFact,
 } from '@/lib/copy/tone';
-import { CAREER_MILESTONES, CAREER_MILESTONES_BY_ID } from '@/lib/config';
+import { CAREER_MILESTONES, CAREER_MILESTONES_BY_ID, MILESTONES } from '@/lib/config';
 
 describe('viewing weeks', () => {
   it('starts on Monday by default', () => {
@@ -211,6 +212,23 @@ function everyUserFacingString(): string[] {
   ] as const) {
     strings.push(eventLegacyHeadline({ name: '24 Hours of Le Mans', editionsExperienced, creditedSeconds, storyCompleteRaces }));
   }
+  for (const intervals of [[], [{ start: 0, end: 86_400 }], [{ start: 0, end: 3_600 }], [{ start: 0, end: 3_600 }, { start: 7_200, end: 86_000 }]]) {
+    strings.push(describeFragments(intervals, 86_400));
+  }
+  for (const [realRemainingSec, yearRemainingHours, weekRemainingHours, recommendedPaceHours] of [
+    [0, 200, 8, 8], [1_800, 200, 8, 8], [45_000, 200, 0, 8], [45_000, 5, 2, 8], [45_000, 0, 0, 0], [360_000, 336, 7.5, 6.5],
+  ] as const) {
+    strings.push(expeditionBudgetNote({ realRemainingSec, speed: 1.25, year: 2026, yearRemainingHours, weekRemainingHours, recommendedPaceHours }));
+  }
+  for (const mode of ['auto', 'on', 'off'] as const) {
+    for (const [isExpedition, paysXp, checkpointsBehind, xpAwarded, summaryWritten, hasSummary] of [
+      [true, true, 0, 0, false, false], [true, true, 3, 1_500, false, false], [true, true, 5, 3_000, true, true],
+      [true, false, 0, 0, false, false], [false, true, 0, 0, false, true], [true, true, 1, 120, false, false],
+    ] as const) {
+      strings.push(expeditionModeMessage({ mode, isExpedition, paysXp, checkpointsBehind, xpAwarded, summaryWritten, hasSummary }));
+    }
+  }
+  for (const def of MILESTONES) for (const threshold of [1, 5, 1_000]) strings.push(milestoneLabel(threshold, def.label));
   return strings;
 }
 
@@ -350,6 +368,65 @@ describe('tone', () => {
     expect(stillAheadNote(249.99, 250, 'hours')).toBe('Still ahead: 249 of 250 hours');
     expect(stillAheadNote(3, 10, 'count')).toBe('Still ahead: 3 of 10');
     expect(stillAheadNote(1_234, 2_500, 'hours')).toBe('Still ahead: 1,234 of 2,500 hours');
+  });
+
+  it('describeFragments counts stretches and gaps', () => {
+    const H = 3_600;
+    expect(describeFragments([{ start: 0, end: 6 * H }, { start: 7 * H, end: 12 * H + 12 * 60 }, { start: 17 * H, end: 24 * H }], 24 * H))
+      .toBe('Watched in 3 stretches: 18h 12m of 24h 00m. 2 stretches still to watch, 5h 48m in total.');
+    // Reaching the end names the stretch before it that is still to watch.
+    expect(describeFragments([{ start: 0, end: 10 * H }, { start: 11 * H, end: 12 * H }], 12 * H))
+      .toBe('Watched in 2 stretches: 11h 00m of 12h 00m. 1 stretch still to watch, 1h 00m.');
+    // Forty seconds short is still forty seconds short.
+    expect(describeFragments([{ start: 0, end: 6 * H - 40 }], 6 * H))
+      .toBe('Watched in 1 stretch: 5h 59m of 6h 00m. 1 stretch still to watch, 40s.');
+    expect(describeFragments([{ start: 0, end: 6 * H }], 6 * H)).toBe('Watched in 1 stretch: 6h 00m of 6h 00m. Every second of it is watched.');
+    expect(describeFragments([], 6 * H)).toBe('Nothing watched yet: 6h 00m still to watch.');
+    // Coverage stored past a shortened runtime is not counted.
+    expect(describeFragments([{ start: 0, end: 7 * H }], 6 * H)).toBe('Watched in 1 stretch: 6h 00m of 6h 00m. Every second of it is watched.');
+  });
+
+  it('says what the rest of an Expedition asks of the plan as information, never as a limit', () => {
+    const note = (realRemainingSec: number, yearRemainingHours: number, weekRemainingHours: number, recommendedPaceHours: number) =>
+      expeditionBudgetNote({ realRemainingSec, speed: 1.25, year: 2026, yearRemainingHours, weekRemainingHours, recommendedPaceHours });
+    expect(note(12.5 * 3_600, 180, 6.5, 8)).toBe(
+      'The rest of this race is about 12h 30m of real time at 1.25×, about 7% of the 180 hours left in your 2026 plan. '
+        + 'This week’s plan has 6.5 hours left. At the plan’s pace of 8 hours a week, that is roughly 2 weeks of viewing.',
+    );
+    expect(note(12.5 * 3_600, 5, 0, 8)).toContain('more than the 5 hours left in your 2026 plan, which is entirely fine.');
+    expect(note(12.5 * 3_600, 0, 0, 0)).toBe(
+      'The rest of this race is about 12h 30m of real time at 1.25×. Your 2026 plan has no hours left in it, which is entirely fine: '
+        + 'the plan is a guide. This week’s planned hours are all watched.',
+    );
+    expect(note(1_800, 200, 8, 8)).toContain('under 1% of the 200 hours left');
+    expect(note(1_800, 200, 8, 8)).toContain('that is less than a week of viewing.');
+    expect(note(0, 200, 8, 8)).toBe('Nothing of this race is still to watch, so it asks nothing more of your 2026 plan.');
+    for (const text of [note(45_000, 200, 0, 8), note(45_000, 5, 2, 8), note(360_000, 1, 0, 1)]) {
+      expect(text).toContain('plan');
+      expect(text).not.toMatch(/exceed|over budget|too much|warning|limit/i);
+    }
+  });
+
+  it('says what switching Expedition Mode did, and that switching it off takes nothing back', () => {
+    const base = { isExpedition: true, paysXp: true, checkpointsBehind: 0, xpAwarded: 0, summaryWritten: false, hasSummary: false };
+    expect(expeditionModeMessage({ ...base, mode: 'on', checkpointsBehind: 3, xpAwarded: 600 }))
+      .toBe('Expedition Mode is on. 3 checkpoints were already behind you: +600 XP.');
+    expect(expeditionModeMessage({ ...base, mode: 'on', checkpointsBehind: 1, xpAwarded: 120 }))
+      .toBe('Expedition Mode is on. 1 checkpoint was already behind you: +120 XP.');
+    expect(expeditionModeMessage({ ...base, mode: 'on', paysXp: false }))
+      .toBe('Expedition Mode is on. Checkpoints on races of 6 hours or more also earn XP.');
+    expect(expeditionModeMessage({ ...base, mode: 'on' }))
+      .toBe('Expedition Mode is on. Its checkpoints are at 10%, 25%, 50%, 75% and 90% of the story.');
+    expect(expeditionModeMessage({ ...base, mode: 'on', checkpointsBehind: 5, xpAwarded: 3_000, summaryWritten: true, hasSummary: true }))
+      .toBe('Expedition Mode is on. 5 checkpoints were already behind you: +3,000 XP. The story is already complete, so its Expedition Summary is ready.');
+    expect(expeditionModeMessage({ ...base, mode: 'off', isExpedition: false }))
+      .toBe('Expedition Mode is off. Checkpoints you already reached keep their XP.');
+    expect(expeditionModeMessage({ ...base, mode: 'off', isExpedition: false, hasSummary: true }))
+      .toBe('Expedition Mode is off. Checkpoints you already reached keep their XP. Its Expedition Summary stays.');
+    expect(expeditionModeMessage({ ...base, mode: 'auto', isExpedition: false }))
+      .toBe('Expedition Mode follows the race’s length again (automatic from 10 hours).');
+    expect(expeditionModeMessage({ ...base, mode: 'auto', checkpointsBehind: 2, xpAwarded: 750 }))
+      .toBe('Expedition Mode follows the race’s length again (automatic from 10 hours). 2 checkpoints were already behind you: +750 XP.');
   });
 
   it('makes even a short stint feel worthwhile', () => {

@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  clipToWindow, dayKeyToLocalDate, daysInYear, isLeapYear, localDayKey, localMonthKey, localTimeZoneName,
+  clipToWindow, dayKeyToLocalDate, daysInYear, isLeapYear, localDayKey, localDaysSpanned, localMonthKey, localTimeZoneName,
   monthWindow, samePeriodEnd, splitAcrossLocalDays, weekKeyForDay, weekLabel, yearWindow,
 } from '@/lib/domain/calendar';
 import { viewingWeek } from '@/lib/domain/periods';
@@ -130,6 +130,15 @@ describe('the calendar in London', () => {
     const sunday = weekKeyForDay('2026-12-29', 0);
     expect(weekLabel(sunday, 0).label).toBe('Sun 27 Dec – Sat 2 Jan');
     expect(weekLabel(sunday, 0, yearWindow(2027))).toMatchObject({ label: 'Fri 1 – Sat 2 Jan', clipped: true });
+  });
+
+  it('counts the local days a span touches, both ends included, across a change of the clocks', () => {
+    expect(localDaysSpanned(localTime('2026-06-13T08:00'), localTime('2026-06-13T23:59'))).toBe(1);
+    expect(localDaysSpanned(localTime('2026-06-13T23:30'), localTime('2026-06-14T00:30'))).toBe(2);
+    // The 23-hour day of 29 March is still one day.
+    expect(localDaysSpanned(localTime('2026-03-28T23:00'), localTime('2026-03-30T00:30'))).toBe(3);
+    expect(localDaysSpanned(localTime('2026-10-24T12:00'), localTime('2026-10-26T12:00'))).toBe(3);
+    expect(localDaysSpanned(localTime('2026-12-31T20:00'), localTime('2027-01-01T02:00'))).toBe(2);
   });
 });
 

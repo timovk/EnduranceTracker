@@ -38,6 +38,11 @@
  *                   career had already passed written and paid once, and
  *                   every undated milestone and event step dated from the
  *                   replay. One chunk.
+ *   P4  expeditions Every race that is an Expedition gets the checkpoints its
+ *                   replayed coverage had already reached (paid now, naming
+ *                   no stint), and one whose story is complete gets its
+ *                   Expedition Summary, retrospectively. Chunks of Expedition
+ *                   races, in id order.
  *
  * Later work appends its own phases to `CAREER_BACKFILL_PHASES`; an account
  * completed by an earlier build simply runs the new ones.
@@ -54,9 +59,12 @@ import { z } from 'zod';
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
 import { buildCareerTimeline, type CareerTimeline } from '@/lib/domain/career-timeline';
+import { isExpedition } from '@/lib/domain/expedition';
+import type { RecordEvent } from '@/lib/domain/records';
 import { syncMilestones } from '@/lib/engines/achievement-engine';
 import { fillLandmarkDates, syncCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { loadTimelineInputs, type TimelineInputs } from '@/lib/engines/career-timeline-engine';
+import { careerRecordProgression, reconcileExpedition, writeExpeditionSummary } from '@/lib/engines/expedition-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from '@/lib/engines/mastery-engine';
 import { computeCareerMetricsWithHistory } from '@/lib/engines/metrics';
 import { reconcileStoryBonus, storyBonusKey } from '@/lib/engines/progression-resync';
@@ -70,7 +78,7 @@ export const CAREER_BACKFILL_KEY = 'careerBackfill';
 export const CAREER_BACKFILL_VERSION = '0.4.0';
 
 /** The phases this build runs, in order. */
-export const CAREER_BACKFILL_PHASES = ['P1', 'P2', 'P3'] as const;
+export const CAREER_BACKFILL_PHASES = ['P1', 'P2', 'P3', 'P4'] as const;
 export type PhaseKey = (typeof CAREER_BACKFILL_PHASES)[number];
 
 /**
@@ -86,6 +94,14 @@ const CHUNK_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
 /** Races per P1 chunk. */
 const RACE_CHUNK = 500;
 
+/**
+ * Expedition races per P4 chunk. Each can pay five checkpoints and write a
+ * summary, which reads the ledger and the unlocks around its completing
+ * stint, so a chunk is kept far smaller than a race chunk. Recompute uses the
+ * same size.
+ */
+export const EXPEDITION_CHUNK = 25;
+
 /** The least a chunk is assumed to take before one has been measured. */
 const MINIMUM_CHUNK_ESTIMATE_MS = 1_000;
 
@@ -96,20 +112,20 @@ const MINIMUM_CHUNK_ESTIMATE_MS = 1_000;
 const markerSchema = z.object({
   version: z.string(),
   done: z.array(z.string()),
-  cursors: z.object({ P1: z.string().optional() }).default({}),
+  cursors: z.object({ P1: z.string().optional(), P4: z.string().optional() }).default({}),
   lastRunAt: z.string().nullable().default(null),
 });
 
 /**
- * An account's backfill progress: the phases done, how far the race phase
- * got (the last race id a chunk finished), and when a chunk last ran for it.
- * A type alias rather than an interface, so it is a Prisma `Json` value as it
- * stands.
+ * An account's backfill progress: the phases done, how far the chunked
+ * phases got (the last race id a chunk finished, for the race phase and the
+ * Expedition phase), and when a chunk last ran for it. A type alias rather
+ * than an interface, so it is a Prisma `Json` value as it stands.
  */
 export type CareerBackfillMarker = {
   version: string;
   done: PhaseKey[];
-  cursors: { P1?: string };
+  cursors: { P1?: string; P4?: string };
   lastRunAt: string | null;
 };
 
@@ -123,6 +139,7 @@ function parseMarker(value: unknown): CareerBackfillMarker | null {
   if (!parsed.success) return null;
   const cursors: CareerBackfillMarker['cursors'] = {};
   if (parsed.data.cursors.P1 !== undefined) cursors.P1 = parsed.data.cursors.P1;
+  if (parsed.data.cursors.P4 !== undefined) cursors.P4 = parsed.data.cursors.P4;
   return {
     version: parsed.data.version,
     done: parsed.data.done.filter(isPhaseKey),
@@ -200,10 +217,11 @@ export function deadlineClock(deadline: number, now: () => number = Date.now): B
 
 /**
  * What one account's run builds once, outside the chunk transactions: the
- * career replay every phase reads. At start-up nothing else writes while it
- * is in use — `register()` finishes before the server answers a request — and
- * every chunk re-checks what it writes anyway, so a stale context can never
- * pay anything twice.
+ * career replay every phase reads, and its record progression, which every
+ * Expedition Summary the run writes names its records from. At start-up
+ * nothing else writes while it is in use — `register()` finishes before the
+ * server answers a request — and every chunk re-checks what it writes anyway,
+ * so a stale context can never pay anything twice.
  */
 export interface PhaseContext {
   userId: string;
@@ -211,11 +229,13 @@ export interface PhaseContext {
   timeline: CareerTimeline;
   /** The stints and races the replay was built from. */
   history: TimelineInputs;
+  progression: readonly RecordEvent[];
 }
 
 export async function buildPhaseContext(userId: string, now: Date): Promise<PhaseContext> {
   const history = await loadTimelineInputs(prisma, userId);
-  return { userId, now, timeline: buildCareerTimeline(history.sessions, history.races), history };
+  const timeline = buildCareerTimeline(history.sessions, history.races);
+  return { userId, now, timeline, history, progression: await careerRecordProgression(prisma, userId, timeline) };
 }
 
 export interface RaceChunkResult {
@@ -361,6 +381,66 @@ export async function backfillMilestones(
   };
 }
 
+export interface ExpeditionChunkResult {
+  /** Checkpoints paid, and their XP. */
+  checkpoints: number;
+  xp: number;
+  /** Checkpoints taken back because the coverage no longer reaches them. */
+  revoked: number;
+  /** Checkpoints re-sized to the race's current runtime (`resize` only). */
+  resized: number;
+  summaries: number;
+}
+
+/** The races P4 works through: those that are Expeditions, in id order. */
+export function expeditionRaceIds(timeline: CareerTimeline): string[] {
+  return [...timeline.racesById.values()].filter(isExpedition).map((race) => race.id).sort();
+}
+
+/**
+ * P4 for one chunk of races, inside the chunk's transaction (§5.2).
+ *
+ * Each race's checkpoints are reconciled with its replay from the context:
+ * the checkpoints an Expedition had already reached are paid now, naming no
+ * stint, and — with `resize`, which recompute asks for — held ones are
+ * re-sized to the race's current runtime. A race that is an Expedition with a
+ * complete story and no summary gets its summary, retrospectively, from the
+ * context's replay and records. Races are re-read inside the account, so an id
+ * that is not this account's is ignored. The ledger is settled once, for
+ * whatever came off; on a first run nothing can.
+ */
+export async function backfillExpeditions(
+  tx: Tx,
+  ctx: PhaseContext,
+  chunk: readonly string[],
+  options: { resize: boolean },
+): Promise<ExpeditionChunkResult> {
+  const result: ExpeditionChunkResult = { checkpoints: 0, xp: 0, revoked: 0, resized: 0, summaries: 0 };
+  if (chunk.length === 0) return result;
+  const { userId, now, timeline } = ctx;
+
+  const owned = await tx.race.findMany({ where: { userId, id: { in: [...chunk] } }, select: { id: true }, orderBy: { id: 'asc' } });
+  const revocations: XpRevocation[] = [];
+  for (const { id } of owned) {
+    const history = timeline.races.get(id);
+    if (history === undefined) continue;
+    const reconcile = await reconcileExpedition(tx, userId, id, { history, resize: options.resize });
+    revocations.push(reconcile.revocation);
+    result.checkpoints += reconcile.awarded.length;
+    result.xp += reconcile.awarded.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
+    result.revoked += reconcile.revoked.length;
+    result.resized += reconcile.resized.length;
+    if (!reconcile.isExpedition || !reconcile.storyCompleted) continue;
+    const summary = await writeExpeditionSummary(tx, userId, id, now, {
+      retrospective: true, history, timeline, progression: ctx.progression,
+    });
+    if (summary !== null) result.summaries += 1;
+  }
+
+  await settleLedger(tx, userId, revocations);
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Running it
 // ---------------------------------------------------------------------------
@@ -384,6 +464,9 @@ export interface CareerBackfillSummary {
   milestoneXp: number;
   datesFilled: number;
   datesRecognised: number;
+  expeditionCheckpoints: number;
+  expeditionXp: number;
+  summariesWritten: number;
   /** What 0.3.x left in the ledger: counted when the account completes, never removed here (R11). */
   leftovers: { orphanedViewingRows: number; storyBonusesOfDeletedRaces: number };
 }
@@ -394,6 +477,7 @@ function emptySummary(userId: string): CareerBackfillSummary {
     racesCredited: 0, legacyRacesRepaired: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
     eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
     milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+    expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0,
     leftovers: { orphanedViewingRows: 0, storyBonusesOfDeletedRaces: 0 },
   };
 }
@@ -418,6 +502,7 @@ async function countLeftovers(userId: string): Promise<CareerBackfillSummary['le
 function withPhaseDone(marker: CareerBackfillMarker, phase: PhaseKey, now: Date): CareerBackfillMarker {
   const cursors = { ...marker.cursors };
   if (phase === 'P1') delete cursors.P1;
+  if (phase === 'P4') delete cursors.P4;
   return {
     ...marker,
     done: CAREER_BACKFILL_PHASES.filter((known) => known === phase || marker.done.includes(known)),
@@ -527,6 +612,28 @@ export async function runCareerBackfillFor(
       summary.datesFilled += result.filled;
       summary.datesRecognised += result.recognised;
     }
+
+    if (phase === 'P4') {
+      for (;;) {
+        if (!clock.shouldStartChunk(estimate)) {
+          summary.pausedBefore = { phase, cursor: marker.cursors.P4 ?? null };
+          return summary;
+        }
+        const ctx = await contextFor();
+        const cursor = marker.cursors.P4;
+        const remaining = expeditionRaceIds(ctx.timeline).filter((id) => cursor === undefined || id > cursor);
+        const ids = remaining.slice(0, EXPEDITION_CHUNK);
+        const last = remaining.length <= EXPEDITION_CHUNK;
+        const next = last
+          ? withPhaseDone(marker, phase, now)
+          : { ...marker, cursors: { ...marker.cursors, P4: ids[ids.length - 1] }, lastRunAt: now.toISOString() };
+        const result = await chunk(next, (tx) => backfillExpeditions(tx, ctx, ids, { resize: false }));
+        summary.expeditionCheckpoints += result.checkpoints;
+        summary.expeditionXp += result.xp;
+        summary.summariesWritten += result.summaries;
+        if (last) break;
+      }
+    }
   }
 
   summary.completed = isComplete(marker);
@@ -559,7 +666,9 @@ export function describeCareerBackfill(summary: CareerBackfillSummary, name?: st
     `${count(summary.eventStepsUnlocked)} event steps (+${count(summary.eventStepXp)} XP), ` +
     `${count(summary.creditsWritten)} credits; ` +
     `${count(summary.milestonesCreated)} new milestones (+${count(summary.milestoneXp)} XP), ` +
-    `${count(summary.datesFilled)} dates filled, ${count(summary.datesRecognised)} recorded only`;
+    `${count(summary.datesFilled)} dates filled, ${count(summary.datesRecognised)} recorded only; ` +
+    `${count(summary.expeditionCheckpoints)} expedition checkpoints (+${count(summary.expeditionXp)} XP), ` +
+    `${count(summary.summariesWritten)} ${summary.summariesWritten === 1 ? 'summary' : 'summaries'}`;
   if (summary.pausedBefore === null) return `[career-backfill] ${who}: ${work}`;
   const where = summary.pausedBefore.cursor === null ? '' : ` (after race ${summary.pausedBefore.cursor})`;
   return `[career-backfill] ${who}: ${work}; paused before ${summary.pausedBefore.phase}${where}; continues on the next start`;

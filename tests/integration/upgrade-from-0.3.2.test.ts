@@ -21,7 +21,8 @@ import {
   CAREER_BACKFILL_PHASES, deadlineClock, isCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill,
   runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
-import { eventStepProblems, ledgerProblems } from '../helpers/career-db';
+import { expeditionSummarySnapshotSchema } from '@/lib/domain/expedition';
+import { eventStepProblems, expeditionProblems, ledgerProblems } from '../helpers/career-db';
 import type { FixtureCopy } from '../helpers/fixture-db';
 import { FIXTURE_GENERATED_AT, FIXTURE_USER_ID, pointPrismaAtFixture } from '../helpers/fixture-db';
 
@@ -162,7 +163,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
 
   /** Everything the backfill writes, for comparing one run with the next. */
   async function written() {
-    const [ledger, milestones, steps, races, credits] = await Promise.all([
+    const [ledger, milestones, steps, races, credits, summaries] = await Promise.all([
       prisma.xPTransaction.findMany({
         where: { userId: FIXTURE_USER_ID },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -176,8 +177,9 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
       }),
       prisma.race.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' }, select: { id: true, creditedViewingSec: true } }),
       prisma.eventStepCredit.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
+      prisma.expeditionSummary.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
     ]);
-    return { ledger, milestones, steps, races, credits };
+    return { ledger, milestones, steps, races, credits, summaries };
   }
 
   let before: ReturnType<typeof untouchable>;
@@ -334,6 +336,49 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(await eventStepProblems(FIXTURE_USER_ID)).toEqual([]);
   });
 
+  it('pays each Expedition the checkpoints it had already reached, naming no stint, and sums up every completed one', async () => {
+    // The fixture's races of ten hours or more: two editions of Fort Aurelia (24 h,
+    // one complete, one a little over half watched), Redstone (12 h) and Karoo (10 h).
+    const races = await prisma.race.findMany({
+      where: { userId: FIXTURE_USER_ID, runtimeSec: { gte: 10 * 3600 } },
+      select: { id: true, name: true, runtimeSec: true, coverageSec: true, storyCompletedAt: true },
+    });
+    expect(races).toHaveLength(4);
+    const rows = await prisma.xPTransaction.findMany({
+      where: { userId: FIXTURE_USER_ID, source: 'EXPEDITION' },
+      select: { sourceRef: true, dedupeKey: true, amount: true, seasonAmount: true, sessionId: true },
+    });
+    // I3: every checkpoint held is one its race's coverage reaches, once.
+    expect(await expeditionProblems(FIXTURE_USER_ID)).toEqual([]);
+    for (const row of rows) expect(row).toMatchObject({ seasonAmount: 0, sessionId: null });
+    const percentsOf = (raceId: string) => rows.filter((row) => row.sourceRef === raceId)
+      .map((row) => Number(row.dedupeKey!.split(':')[2])).sort((a, b) => a - b);
+    for (const race of races) {
+      const expected = race.storyCompletedAt !== null ? [10, 25, 50, 75, 90] : [10, 25, 50];
+      expect(percentsOf(race.id), race.name).toEqual(expected);
+    }
+    expect(rows.filter((row) => row.sourceRef === races.find((race) => race.runtimeSec === 86_400 && race.storyCompletedAt !== null)?.id)
+      .reduce((sum, row) => sum + row.amount, 0)).toBe(3_000);
+
+    const summaries = await prisma.expeditionSummary.findMany({ where: { userId: FIXTURE_USER_ID } });
+    const complete = races.filter((race) => race.storyCompletedAt !== null);
+    expect(summaries.map((summary) => summary.raceId).sort()).toEqual(complete.map((race) => race.id).sort());
+    for (const summary of summaries) {
+      const race = complete.find((candidate) => candidate.id === summary.raceId)!;
+      expect(summary).toMatchObject({ retrospective: true, raceName: race.name, createdAt: STARTED });
+      const snapshot = expeditionSummarySnapshotSchema.parse(summary.snapshot);
+      expect(snapshot).toMatchObject({
+        unlocks: 'reconstructed', mastery: { championship: null }, uniqueCoverageSeconds: race.runtimeSec, finalCompletionText: '100%',
+      });
+      // Completed by one of its own stints, in the history 0.3.2 recorded.
+      const completing = await prisma.raceViewingSession.findFirstOrThrow({ where: { id: snapshot.completingSessionId }, select: { raceId: true, watchedAt: true } });
+      expect(completing.raceId).toBe(race.id);
+      expect(summary.completedAt).toEqual(completing.watchedAt);
+      expect(snapshot.xp.total).toBe(snapshot.xp.viewing + snapshot.xp.rewatch + snapshot.xp.storyComplete + snapshot.xp.checkpoints);
+      expect(snapshot.xp.storyComplete).toBeGreaterThan(0);
+    }
+  });
+
   it('keeps the ledger whole: every dedupe key once, and every running total right', async () => {
     const keys = await prisma.xPTransaction.groupBy({
       by: ['dedupeKey'],
@@ -353,6 +398,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
       completed: true, racesCredited: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
       eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
       milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+      expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0,
     });
     const again = await written();
     expect(again.ledger).toEqual(settled.ledger);
@@ -360,5 +406,6 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(again.steps).toEqual(settled.steps);
     expect(again.races).toEqual(settled.races);
     expect(again.credits).toEqual(settled.credits);
+    expect(again.summaries).toEqual(settled.summaries);
   });
 });

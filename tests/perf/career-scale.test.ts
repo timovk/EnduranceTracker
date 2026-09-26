@@ -26,10 +26,12 @@ import {
   getEventLegacy, getEventsIndex, linkRaces, mergeEvents, renameEvent, unlinkRace,
 } from '@/lib/engines/event-legacy-engine';
 import { deleteRace, deleteViewingSession } from '@/lib/engines/session-engine';
+import { getExpeditionView, setExpeditionMode } from '@/lib/engines/expedition-engine';
 import {
-  backfillEventProgression, backfillMilestones, backfillRaces, buildPhaseContext, runCareerBackfillFor,
+  backfillEventProgression, backfillExpeditions, backfillMilestones, backfillRaces, buildPhaseContext, EXPEDITION_CHUNK,
+  expeditionRaceIds, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
-import { eventStepProblems, ledgerProblems, logStint } from '../helpers/career-db';
+import { eventStepProblems, expeditionProblems, ledgerProblems, logStint } from '../helpers/career-db';
 import type { LargeCareerDatabase, SeededCareer } from '../helpers/large-career-db';
 import { createLargeCareerDatabase } from '../helpers/large-career-db';
 import type { SyntheticCareer } from '../helpers/synthetic-career';
@@ -236,6 +238,31 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
     expect(await prisma.milestoneProgress.count({ where: { userId: large.userId, achievedPrecision: null } })).toBe(0);
   }, SLOW);
 
+  it('backfills a large career’s Expeditions (P4) in chunks of under 5 s each, holding only what their coverage reaches', async () => {
+    const context = await timedAsync(() => buildPhaseContext(large.userId, large.now));
+    expect(context.ms).toBeLessThan(3_000);
+    const ids = expeditionRaceIds(context.result.timeline);
+    expect(ids.length).toBeGreaterThan(1_000);
+
+    let slowest = 0;
+    let checkpoints = 0;
+    let summaries = 0;
+    for (let index = 0; index < ids.length; index += EXPEDITION_CHUNK) {
+      const chunk = ids.slice(index, index + EXPEDITION_CHUNK);
+      const { result, ms } = await timedAsync(() => prisma.$transaction(
+        (tx) => backfillExpeditions(tx as Tx, context.result, chunk, { resize: false }),
+        CHUNK_TRANSACTION,
+      ));
+      slowest = Math.max(slowest, ms);
+      checkpoints += result.checkpoints;
+      summaries += result.summaries;
+    }
+    expect(checkpoints).toBeGreaterThan(5_000);
+    expect(summaries).toBeGreaterThan(500);
+    expect(slowest).toBeLessThan(5_000);
+    expect(await expeditionProblems(large.userId)).toEqual([]);
+  }, 900_000);
+
   it('backfills a career’s recurring events (P2) in one chunk, under 5 s, crediting every step they had reached', async () => {
     // As 0.3.2 left them: steps reached, and no record of which races reached them.
     for (const career of [real, large]) await prisma.eventStepCredit.deleteMany({ where: { userId: career.userId } });
@@ -293,6 +320,45 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
     expect(warm.ms).toBeLessThan(800);
     expect(index.ms).toBeLessThan(3_000);
     expect(realPage.ms).toBeLessThan(500);
+  }, SLOW);
+
+  it('builds the Expedition page in under 500 ms for a real career and 1 s for a large one', async () => {
+    // The first-year 24-hour race of 200 stints: the longest page either career has.
+    for (const [career, limit] of [[real, 500], [large, 1_000]] as const) {
+      const view = await timedAsync(() => getExpeditionView(career.userId, career.bigRaceId, career.now));
+      expect(view.result?.isExpedition).toBe(true);
+      expect(view.result?.stints.length).toBeGreaterThanOrEqual(199);
+      expect(view.ms, career.userId).toBeLessThan(limit);
+    }
+  }, SLOW);
+
+  it('switches Expedition Mode, writing a missing summary, in under 500 ms for a real career and 2 s for a large one', async () => {
+    const EXPEDITION_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
+    for (const [career, limit] of [[real, 500], [large, 2_000]] as const) {
+      const race = await prisma.race.findFirstOrThrow({
+        where: { userId: career.userId, runtimeSec: { gte: 10 * H }, storyCompletedAt: { not: null } },
+        select: { id: true },
+        orderBy: { id: 'asc' },
+      });
+      await prisma.$transaction((tx) => setExpeditionMode(tx as Tx, career.userId, race.id, 'off', career.now), EXPEDITION_TRANSACTION);
+      // As if its summary had never been written: switching it on writes it.
+      await prisma.expeditionSummary.deleteMany({ where: { userId: career.userId, raceId: race.id } });
+      const on = await timedAsync(() => prisma.$transaction(
+        (tx) => setExpeditionMode(tx as Tx, career.userId, race.id, 'on', career.now), EXPEDITION_TRANSACTION));
+      expect(on.result?.summaryWritten).toBe(true);
+      expect(on.ms, career.userId).toBeLessThan(limit);
+    }
+  }, SLOW);
+
+  it('logs the stint that completes an Expedition, summary and all, in under 1 s for a real career and 6 s for a large one', async () => {
+    for (const [career, limit] of [[real, 1_000], [large, 6_000]] as const) {
+      await prisma.$transaction((tx) => setExpeditionMode(tx as Tx, career.userId, career.openRaceId, 'on', career.now));
+      const race = await prisma.race.findUniqueOrThrow({ where: { id: career.openRaceId }, select: { runtimeSec: true } });
+      const log = await timedAsync(() => logStint(career.userId, career.openRaceId, { from: 0, to: race.runtimeSec, now: career.now }));
+      expect(log.result.expedition?.completed).toBe(true);
+      expect(log.ms, career.userId).toBeLessThan(limit);
+    }
+    expect(await expeditionProblems(real.userId)).toEqual([]);
   }, SLOW);
 
   it('deletes a stint from the last month in under 1 s for a real career and 2 s for a large one', async () => {

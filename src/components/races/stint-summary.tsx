@@ -14,15 +14,19 @@
  * NOTABLE stint takes the accent in its heading and its unlocks rise into
  * view; a major Career Milestone is drawn as a highlighted block rather than a
  * row. It is all CSS, so the global reduced-motion rule covers it.
+ *
+ * A race followed as an Expedition (0.4.0) adds a quiet group: the moment the
+ * Expedition begins, and every checkpoint the stint reached. The stint that
+ * completes one gets the full treatment and a way to its summary.
  */
 
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowRight, Award, Check, Layers, ListChecks, Milestone, Ticket, Trophy, Zap } from 'lucide-react';
-import type { CareerMilestoneUnlock, SessionOutcome } from '@/lib/engines/contracts';
+import { ArrowRight, Award, Check, Layers, ListChecks, Milestone, Mountain, Ticket, Trophy, Zap } from 'lucide-react';
+import type { CareerMilestoneUnlock, ExpeditionOutcome, SessionOutcome } from '@/lib/engines/contracts';
 import { celebrationView } from '@/lib/domain/celebration';
 import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
-import { precisionLabel, seasonClosedStintNote } from '@/lib/copy/tone';
+import { milestoneLabel, precisionLabel, seasonClosedStintNote } from '@/lib/copy/tone';
 import { Panel, RarityBadge, SectorRule, TimingBar } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 import { cn, formatDate, formatHours, formatNumber } from '@/lib/utils';
@@ -146,9 +150,15 @@ export function StintSummary({
                 (notable || spectacular) && 'animate-[rise_0.42s_var(--ease-out-quint)_0.12s_both]',
               )}
             >
+              {outcome.expedition?.completed ? (
+                <ExpeditionComplete raceId={outcome.raceId} expedition={outcome.expedition} />
+              ) : null}
+
               {view.highlighted.map((milestone) => (
                 <HighlightedMilestone key={`${milestone.id}:${milestone.metric}`} milestone={milestone} />
               ))}
+
+              {outcome.expedition ? <ExpeditionGroup raceId={outcome.raceId} expedition={outcome.expedition} /> : null}
 
               <UnlockGroup icon={<Milestone size={12} />} title="Career milestones">
                 {outcome.careerMilestones
@@ -327,27 +337,6 @@ function UnlockRow({
   );
 }
 
-/**
- * "5 real viewing hours", but "1 real viewing hour".
- *
- * Milestone labels are written plural because that is how they read on the
- * board; the very first rung of a ladder is the one case where that grates.
- * Only the final word is touched, and only the two English plural endings that
- * actually occur in these labels — this is not a general-purpose inflector and
- * is not trying to be.
- */
-export function milestoneLabel(threshold: number, label: string): string {
-  const lower = label.toLowerCase();
-  if (threshold !== 1) return `${formatNumber(threshold)} ${lower}`;
-
-  const words = lower.split(' ');
-  const last = words[words.length - 1] ?? '';
-  if (last.endsWith('ies')) words[words.length - 1] = `${last.slice(0, -3)}y`;
-  else if (last.endsWith('s') && !last.endsWith('ss')) words[words.length - 1] = last.slice(0, -1);
-
-  return `${formatNumber(threshold)} ${words.join(' ')}`;
-}
-
 /** How a milestone's moment is known, in the words of the Career Milestones page. */
 function milestoneWhen(milestone: CareerMilestoneUnlock): string | null {
   const at = milestone.achievedAt ?? milestone.recordedAt;
@@ -373,9 +362,63 @@ function HighlightedMilestone({ milestone }: { milestone: CareerMilestoneUnlock 
   );
 }
 
+/** The stint that completed an Expedition: drawn like "Season Complete", with the way to its summary. */
+function ExpeditionComplete({ raceId, expedition }: { raceId: string; expedition: ExpeditionOutcome }) {
+  return (
+    <div className="rounded-md border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-3 py-2.5">
+      <div className="label flex items-center gap-1.5 text-[var(--accent)]">
+        <Mountain size={11} /> Expedition complete
+      </div>
+      <Link
+        href={`/races/${raceId}/expedition`}
+        className="mt-0.5 inline-flex items-center gap-1 text-sm text-ink hover:text-[var(--accent)]"
+      >
+        Expedition complete — see the summary <ArrowRight size={12} />
+      </Link>
+      <div className="mt-0.5 text-xs text-ink-dim">{expedition.coveragePercentText} of the story watched</div>
+    </div>
+  );
+}
+
+/**
+ * The Expedition group, at the quiet level: that the Expedition began, so the
+ * moment shows before the first checkpoint, and each checkpoint the stint
+ * reached with what it paid.
+ */
+function ExpeditionGroup({ raceId, expedition }: { raceId: string; expedition: ExpeditionOutcome }) {
+  const next = expedition.nextCheckpoint === null ? null : `next checkpoint ${expedition.nextCheckpoint.percent}%`;
+  const where = [`${expedition.coveragePercentText} of the story`, next].filter(Boolean).join(' · ');
+  return (
+    <UnlockGroup icon={<Mountain size={12} />} title="Expedition">
+      {expedition.began && !expedition.completed ? (
+        <li key="began" className="flex items-center gap-2.5 rounded-md border border-hairline bg-panel-2 px-2.5 py-1.5">
+          <Check size={12} className="shrink-0 text-verde" />
+          <div className="min-w-0 flex-1">
+            <Link href={`/races/${raceId}/expedition`} className="block truncate text-xs text-ink hover:text-[var(--accent)]">
+              Expedition under way — open it
+            </Link>
+            <div className="truncate text-[0.6875rem] text-ink-faint">{where}</div>
+          </div>
+        </li>
+      ) : null}
+      {expedition.checkpointsReached.map((checkpoint) => (
+        <UnlockRow
+          key={`checkpoint-${checkpoint.percent}`}
+          name={`Checkpoint — ${checkpoint.percent}% of the story`}
+          detail={expedition.began ? undefined : where}
+          xp={checkpoint.xpAwarded}
+        />
+      ))}
+    </UnlockGroup>
+  );
+}
+
 function hasUnlocks(outcome: SessionOutcome): boolean {
   return (
     outcome.careerMilestones.length > 0 ||
+    (outcome.expedition?.began ?? false) ||
+    (outcome.expedition?.checkpointsReached.length ?? 0) > 0 ||
+    (outcome.expedition?.completed ?? false) ||
     outcome.achievements.length > 0 ||
     outcome.mastery.length > 0 ||
     outcome.challenges.length > 0 ||
