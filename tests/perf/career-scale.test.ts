@@ -28,6 +28,9 @@ import {
 import { deleteRace, deleteViewingSession } from '@/lib/engines/session-engine';
 import { getExpeditionView, setExpeditionMode } from '@/lib/engines/expedition-engine';
 import {
+  getFilterOptions, getRecords, getStatistics, getYearComparison, type StatsFilter,
+} from '@/lib/engines/stats-engine';
+import {
   backfillEventProgression, backfillExpeditions, backfillMilestones, backfillRaces, buildPhaseContext, EXPEDITION_CHUNK,
   expeditionRaceIds, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
@@ -359,6 +362,55 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
       expect(log.ms, career.userId).toBeLessThan(limit);
     }
     expect(await expeditionProblems(real.userId)).toEqual([]);
+  }, SLOW);
+
+  /** What `/stats` asks for on every load: the core tabs and the filter options, side by side as the page runs them. */
+  function statsPage(career: SeededCareer, filter: StatsFilter = {}) {
+    return Promise.all([getStatistics(career.userId, filter, career.now), getFilterOptions(career.userId, filter)]);
+  }
+
+  it('builds the Career Statistics core tabs in under 1 s for a real career, and 5 s cold and 1.5 s warm for a large one', async () => {
+    clearCareerTimelineCache();
+    const realCold = await timedAsync(() => statsPage(real));
+    const realWarm = await timedAsync(() => statsPage(real));
+    clearCareerTimelineCache();
+    const cold = await timedAsync(() => statsPage(large));
+    const warm = await timedAsync(() => statsPage(large));
+    // A year and a championship: the scope the page is most often narrowed to.
+    const year = large.now.getFullYear() - 3;
+    const narrowed = await timedAsync(() => statsPage(large, { year, championshipId: `large-championship-0` }));
+    console.info(`/stats core tabs — real ${realCold.ms.toFixed(0)} / ${realWarm.ms.toFixed(0)} ms, `
+      + `large ${cold.ms.toFixed(0)} / ${warm.ms.toFixed(0)} ms (cold / warm), large ${year} + championship ${narrowed.ms.toFixed(0)} ms`);
+
+    expect(warm.result[0].viewing.sessions).toBeGreaterThanOrEqual(60_200);
+    expect(warm.result[1].years.length).toBeGreaterThanOrEqual(10);
+    expect(realCold.ms).toBeLessThan(1_000);
+    expect(realWarm.ms).toBeLessThan(1_000);
+    expect(cold.ms).toBeLessThan(5_000);
+    expect(warm.ms).toBeLessThan(1_500);
+    expect(narrowed.ms).toBeLessThan(1_500);
+  }, SLOW);
+
+  it('adds Records or Compare in under 1 s for a real career, and 5 s cold and 2 s warm for a large one', async () => {
+    const compare = (career: SeededCareer) => getYearComparison(career.userId, undefined, undefined, {}, career.now);
+    for (const [name, extra] of [
+      ['records', (career: SeededCareer) => getRecords(career.userId, {})],
+      ['compare', compare],
+    ] as const) {
+      clearCareerTimelineCache();
+      const realCold = await timedAsync(() => Promise.all([statsPage(real), extra(real)]));
+      clearCareerTimelineCache();
+      const cold = await timedAsync(() => Promise.all([statsPage(large), extra(large)]));
+      const warm = await timedAsync(() => Promise.all([statsPage(large), extra(large)]));
+      console.info(`/stats?tab=${name} — real ${realCold.ms.toFixed(0)} ms, large ${cold.ms.toFixed(0)} / ${warm.ms.toFixed(0)} ms (cold / warm)`);
+      expect(realCold.ms, name).toBeLessThan(1_000);
+      expect(cold.ms, name).toBeLessThan(5_000);
+      expect(warm.ms, name).toBeLessThan(2_000);
+    }
+    const records = await getRecords(large.userId, {});
+    expect(records.records.length).toBeGreaterThan(5);
+    const comparison = await compare(large);
+    expect(comparison.rows.length).toBeGreaterThan(0);
   }, SLOW);
 
   it('deletes a stint from the last month in under 1 s for a real career and 2 s for a large one', async () => {

@@ -9,7 +9,7 @@ import { CAREER_STATS_SHAPE, DURATION_CLASSES } from '@/lib/config';
 import type { CareerTimeline, TimelineRaceRow, TimelineSessionRow } from '@/lib/domain/career-timeline';
 import { yearWindow } from '@/lib/domain/calendar';
 import type { CompareSide } from '@/lib/domain/window-summary';
-import { COMPARE_ROW_ORDER, compareSummaries, durationClassOf, summariseWindow } from '@/lib/domain/window-summary';
+import { COMPARE_ROW_ORDER, compareSummaries, durationClassOf, durationClassRange, summariseWindow } from '@/lib/domain/window-summary';
 import { career, localTime, race, stint } from '../helpers/timeline-fixture';
 import { inTimeZone, ZONES } from '../helpers/time-zone';
 
@@ -30,6 +30,23 @@ describe('race lengths', () => {
     expect(durationClassOf(24 * H).key).toBe('h24');
     expect(durationClassOf(20 * H).label).toBe('13 to 20 hours');
     expect(durationClassOf(48 * H).key).toBe(DURATION_CLASSES[DURATION_CLASSES.length - 1].key);
+  });
+});
+
+describe('the length filter', () => {
+  it('asks for exactly the runtimes each band holds', () => {
+    expect(durationClassRange('short')).toEqual({ minSec: 0, maxSec: 3.5 * H });
+    expect(durationClassRange('h10')).toEqual({ minSec: 9 * H, maxSec: 11 * H });
+    expect(durationClassRange('h24')).toEqual({ minSec: 21 * H, maxSec: null });
+    expect(durationClassRange('no-such-band')).toBeNull();
+    // Every runtime falls in the range of the band `durationClassOf` gives it, and in no other.
+    for (let seconds = 0; seconds <= 30 * H; seconds += 15 * 60) {
+      const inRange = DURATION_CLASSES.filter((band) => {
+        const range = durationClassRange(band.key)!;
+        return seconds >= range.minSec && (range.maxSec === null || seconds < range.maxSec);
+      });
+      expect(inRange.map((band) => band.key)).toEqual([durationClassOf(seconds).key]);
+    }
   });
 });
 

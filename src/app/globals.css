@@ -101,6 +101,17 @@
 [data-theme="daytona"]     { --accent: var(--color-rust);   --accent-soft: color-mix(in oklab, #d97a3a 16%, transparent); }
 [data-theme="nordschleife"]{ --accent: #7f9f4f;             --accent-soft: color-mix(in oklab, #7f9f4f 16%, transparent); }
 
+/* Chart series beside the accent. A chart's first series is the accent, so
+   the second and third must never be the accent's colour or near it, or two
+   series read as one: each theme moves whichever would clash. */
+:root {
+  --chart-2: var(--color-azure);
+  --chart-3: var(--color-verde);
+}
+[data-theme="midnight"] { --chart-2: var(--color-gold); }
+[data-theme="sarthe"],
+[data-theme="nordschleife"] { --chart-3: var(--color-violet); }
+
 html, body {
   background: var(--color-base);
   color: var(--color-ink);

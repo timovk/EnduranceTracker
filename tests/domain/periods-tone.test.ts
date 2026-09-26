@@ -15,7 +15,7 @@ import {
   weeksRemainingInYear, wholeWeeksRemainingInYear, yearPeriod, yearProgress,
 } from '@/lib/domain/periods';
 import {
-  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, describeFragments, eventLegacyHeadline,
+  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, describeFragments, differencePhrase, eventLegacyHeadline,
   expeditionBudgetNote, expeditionModeMessage, EXPIRED_CHALLENGE_NOTE,
   FORBIDDEN_TONE_WORDS, milestoneLabel, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
   seasonClosedStintNote, seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
@@ -229,6 +229,11 @@ function everyUserFacingString(): string[] {
     }
   }
   for (const def of MILESTONES) for (const threshold of [1, 5, 1_000]) strings.push(milestoneLabel(threshold, def.label));
+  for (const unit of ['seconds', 'count', 'xp', 'percent-points'] as const) {
+    for (const difference of [0, 0.04, 1, -1, 12.5, -59, 3_600, -15_000, 1_234_567]) {
+      strings.push(differencePhrase(difference, unit));
+    }
+  }
   return strings;
 }
 
@@ -427,6 +432,26 @@ describe('tone', () => {
       .toBe('Expedition Mode follows the race’s length again (automatic from 10 hours).');
     expect(expeditionModeMessage({ ...base, mode: 'auto', checkpointsBehind: 2, xpAwarded: 750 }))
       .toBe('Expedition Mode follows the race’s length again (automatic from 10 hours). 2 checkpoints were already behind you: +750 XP.');
+  });
+
+  it('says a difference between two years as an amount, never as a judgement', () => {
+    expect(differencePhrase(4 * 3_600 + 10 * 60, 'seconds')).toBe('4h 10m more');
+    expect(differencePhrase(-(4 * 3_600 + 10 * 60), 'seconds')).toBe('4h 10m less');
+    expect(differencePhrase(-2, 'count')).toBe('2 fewer');
+    expect(differencePhrase(1, 'count')).toBe('1 more');
+    expect(differencePhrase(1_200, 'xp')).toBe('1,200 XP more');
+    expect(differencePhrase(-1_200, 'xp')).toBe('1,200 XP less');
+    expect(differencePhrase(3.54, 'percent-points')).toBe('3.5 points higher');
+    expect(differencePhrase(-1, 'percent-points')).toBe('1 point lower');
+    // Nothing the figures beside it can show is "the same".
+    for (const [difference, unit] of [[0, 'count'], [0, 'xp'], [45, 'seconds'], [-59, 'seconds'], [0.04, 'percent-points']] as const) {
+      expect(differencePhrase(difference, unit)).toBe('the same');
+    }
+    for (const unit of ['seconds', 'count', 'xp', 'percent-points'] as const) {
+      for (const difference of [-50_000, -3, 0, 3, 50_000]) {
+        expect(differencePhrase(difference, unit)).not.toMatch(/worse|better|decline|behind|drop|down|up|lost|gain/i);
+      }
+    }
   });
 
   it('makes even a short stint feel worthwhile', () => {

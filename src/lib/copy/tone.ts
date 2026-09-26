@@ -412,6 +412,42 @@ export function expeditionModeMessage(input: {
 }
 
 // ---------------------------------------------------------------------------
+// Career Statistics (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// Two years side by side are two chapters of one career, not a race between
+// them. A difference is said as an amount — more, fewer, higher, lower, the
+// same — and never as a judgement: nothing here is worse, a decline, or behind.
+
+/**
+ * `b − a` in words: "4h 10m more", "2 fewer", "1,200 XP less", "3.5 points
+ * higher", "the same". Time under a minute, and a share under a twentieth of
+ * a point, reads as the same: the figures beside it are shown to that
+ * precision, and a difference they cannot show is not worth a word.
+ */
+export function differencePhrase(difference: number, unit: 'seconds' | 'count' | 'xp' | 'percent-points'): string {
+  const size = Math.abs(difference);
+  const up = difference > 0;
+  switch (unit) {
+    case 'seconds':
+      return size < 60 ? 'the same' : `${formatDuration(size)} ${up ? 'more' : 'less'}`;
+    case 'count': {
+      const whole = Math.round(size);
+      return whole === 0 ? 'the same' : `${count(whole)} ${up ? 'more' : 'fewer'}`;
+    }
+    case 'xp': {
+      const whole = Math.round(size);
+      return whole === 0 ? 'the same' : `${count(whole)} XP ${up ? 'more' : 'less'}`;
+    }
+    case 'percent-points': {
+      const tenths = Math.round(size * 10) / 10;
+      if (tenths === 0) return 'the same';
+      return `${tenths.toLocaleString('en-GB')} ${tenths === 1 ? 'point' : 'points'} ${up ? 'higher' : 'lower'}`;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lifetime ladders
 // ---------------------------------------------------------------------------
 

@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import type { CareerTimeline } from '@/lib/domain/career-timeline';
 import { yearWindow } from '@/lib/domain/calendar';
 import type { RecordEvent, RecordKind, RecordOptions } from '@/lib/domain/records';
-import { beatenAfter, computeRecordProgression, currentRecords, RECORD_ORDER, recordsSetIn } from '@/lib/domain/records';
+import { beatenAfter, computeRecordProgression, currentRecords, RECORD_ORDER, recordLabel, recordsSetIn } from '@/lib/domain/records';
 import { career, localTime, race, stint } from '../helpers/timeline-fixture';
 import { inTimeZone, ZONES } from '../helpers/time-zone';
 
@@ -250,5 +250,14 @@ describe('the rules', () => {
     expect(kinds).toEqual(RECORD_ORDER.filter((kind) => kinds.includes(kind)));
     expect(recordsSetIn(events, yearWindow(2027)).every((e) => e.at >= localTime('2027-01-01'))).toBe(true);
     expect(recordsSetIn(events, yearWindow(2027)).map((e) => e.kind)).toContain('longest-race-story-completed');
+  });
+
+  it('names every record the same way on its card and in the list of those still to be set', () => {
+    const r = race('r', { hours: 24 });
+    const events = progression(career([r], [stint(r, '2026-12-30T21:00', { from: '0:00', to: '24:00' })]));
+    for (const event of events) expect(event.label).toBe(recordLabel(event.kind, OPTIONS.rollingDays));
+    expect(recordLabel('most-in-seven-days', 7)).toBe('Most in seven days');
+    expect(recordLabel('most-in-seven-days', 14)).toBe('Most in 14 days');
+    expect(new Set(RECORD_ORDER.map((kind) => recordLabel(kind))).size).toBe(RECORD_ORDER.length);
   });
 });

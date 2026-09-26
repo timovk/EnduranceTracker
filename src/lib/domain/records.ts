@@ -82,7 +82,8 @@ export function careerRecordOptions(weekStartsOn: number): RecordOptions {
 
 const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'] as const;
 
-function labelFor(kind: RecordKind, rollingDays: number): string {
+/** What a record is called, on its card and in the list of records still to be set. */
+export function recordLabel(kind: RecordKind, rollingDays: number = CAREER_STATS_SHAPE.recordRollingDays): string {
   switch (kind) {
     case 'longest-session': return 'Longest session';
     case 'most-in-a-day': return 'Most in a day';
@@ -160,7 +161,7 @@ export function computeRecordProgression(timeline: CareerTimeline, options: Reco
   };
 
   const events: RecordEvent[] = [];
-  const emit = (event: Omit<RecordEvent, 'label'>) => events.push({ ...event, label: labelFor(event.kind, options.rollingDays) });
+  const emit = (event: Omit<RecordEvent, 'label'>) => events.push({ ...event, label: recordLabel(event.kind, options.rollingDays) });
 
   const creditedByDay = new Map<string, number>();
   const coverageByDay = new Map<string, number>();

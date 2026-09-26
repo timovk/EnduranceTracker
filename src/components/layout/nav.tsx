@@ -30,13 +30,13 @@ const NAV = [
   { href: '/challenges', label: 'Challenges', icon: ListChecks },
   { href: '/season-pass', label: 'Season Pass', icon: Ticket },
   { href: '/career', label: 'Career', icon: Target },
+  { href: '/stats', label: 'Career Statistics', icon: BarChart3 },
   { href: '/events', label: 'Events', icon: Repeat },
   { href: '/mastery', label: 'Mastery', icon: Layers },
   { href: '/collections', label: 'Collections', icon: Layers },
   { href: '/achievements', label: 'Achievements', icon: Award },
   { href: '/trophies', label: 'Trophy Cabinet', icon: Trophy },
   { href: '/hall-of-fame', label: 'Hall of Fame', icon: Landmark },
-  { href: '/stats', label: 'Statistics', icon: BarChart3 },
   { href: '/settings', label: 'Settings', icon: Settings },
 ] as const;
 

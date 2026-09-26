@@ -118,6 +118,24 @@ export function durationClassOf(runtimeSec: number): { key: string; label: strin
   return { key: band.key, label: band.label };
 }
 
+/**
+ * The runtimes a length band holds, in seconds: from the top of the band
+ * before it (included) to its own top (excluded; null for the last band, which
+ * has none). The Statistics length filter asks the database for exactly this
+ * range, so a race it finds is always a race `durationClassOf` puts in the
+ * band. Null for a key no band has.
+ */
+export function durationClassRange(key: string): { minSec: number; maxSec: number | null } | null {
+  const index = DURATION_CLASSES.findIndex((entry) => entry.key === key);
+  if (index < 0) return null;
+  const band = DURATION_CLASSES[index]!;
+  const below = index === 0 ? null : DURATION_CLASSES[index - 1]!;
+  return {
+    minSec: below === null ? 0 : Math.round(below.maxHours * 3600),
+    maxSec: Number.isFinite(band.maxHours) ? Math.round(band.maxHours * 3600) : null,
+  };
+}
+
 function emptyBucket(): Bucket {
   return { creditedSeconds: 0, newCoverageSeconds: 0, rewatchSeconds: 0, sessions: 0, storyCompletes: 0 };
 }

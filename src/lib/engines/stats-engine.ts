@@ -1,5 +1,5 @@
 /**
- * Personal statistics.
+ * Career Statistics.
  *
  * This engine is READ-ONLY. It opens no transaction, writes nothing and awards
  * nothing — everything it reports was earned somewhere else, and a statistics
@@ -7,27 +7,47 @@
  * page. It therefore reads through the global client rather than taking a
  * transaction client the way the writing engines do.
  *
+ * THE REPLAY IS THE SOURCE (0.4.0)
+ *
+ * Every viewing figure comes from the career replay (`domain/career-timeline`,
+ * cached per account by `career-timeline-engine`), folded by the same
+ * `summariseWindow` the Career Chronicle and the year comparison use. A year
+ * on this page, that year's chapter and that year in a comparison therefore
+ * cannot disagree, and a deleted stint is gone from every figure at once —
+ * nothing here reads the coverage snapshot a stint row took when it was
+ * logged. The database is asked which races a filter chooses, and for what
+ * the replay does not hold: the ledger, landmarks, the budget, challenges and
+ * the season pass.
+ *
  * TWO QUANTITIES THAT ARE NEVER THE SAME THING
  *
- * Real viewing time is what a person actually spent in front of the screen. It
- * comes from `RaceViewingSession.realSeconds`, it counts every re-watch, and it
- * is what the viewing budget is denominated in.
+ * Viewing time is what a person actually spent in front of the screen,
+ * counted the way XP counts it: a stint's real time, but never more than its
+ * timeline at the 0.75× credit floor (`creditedSeconds`). For every speed of
+ * 0.75× and above that is simply its real time. It counts every re-watch.
+ * Every `realSeconds` / `realHours` field in this file is this CREDITED time;
+ * the viewing budget alone keeps raw real time (`STATISTICS_NOTE` says so).
  *
  * Unique race-timeline coverage is how much of a race's story has been seen at
- * least once. It comes from `Race.coverageSec`, which is rebuilt from the
- * merged `WatchedInterval` set, and re-watching cannot increase it.
+ * least once: the replay's merged intervals, clamped to the race's runtime.
+ * Re-watching cannot increase it.
  *
  * The worked example: watch 00:00–01:00 of a race, then re-watch 00:30–01:00.
- * That is 1h 30m of real viewing time and 1h of unique coverage. Both figures
- * are true and they measure different things, so every field in this file
- * carries the distinction in its name —
+ * That is 1h 30m of viewing time and 1h of unique coverage. Both figures are
+ * true and they measure different things, so every field in this file carries
+ * the distinction in its name —
  *
- *   * `realSeconds` / `realHours`      time spent, re-watches included
+ *   * `realSeconds` / `realHours`      time spent (credited), re-watches included
  *   * `uniqueCoverageSeconds`          story seen, re-watches excluded
  *   * `timelinePlayedSeconds`          timeline played, re-watches included
  *   * `newCoverageSeconds`             story seen for the first time in a window
+ *   * `rewatchSeconds`                 time spent on story already seen
  *
  * — so that nothing downstream can quietly put one in the other's place.
+ *
+ * Time is spread over each stint's window and split at local midnights, and
+ * only the part inside a window counts; facts — a session, a race started or
+ * completed — happen at the stint's instant (`domain/window-summary`).
  *
  * EVERY PERCENTAGE IS SCOPED
  *
@@ -42,16 +62,11 @@
  *
  * WHERE THE WORK HAPPENS
  *
- * Totals and per-race figures are aggregated by the database: one `aggregate`
- * for the scope's totals and one `groupBy` for its per-race sums, both of which
- * stay constant in size as the session history grows. The one thing Postgres is
- * not asked to do is bucket sessions into calendar days and months, because
- * doing that in SQL would mean committing to a timezone in the query, and the
- * rest of the application (`domain/periods`, the momentum history, the viewing
- * week) treats a day as a LOCAL calendar day. Those buckets are therefore built
- * in JavaScript from the narrowest possible projection — three columns, no
- * relations — which keeps the one unbounded read small enough to stay honest
- * with tens of thousands of sessions.
+ * One cached replay per account, one query for the races a filter chooses,
+ * and folds over the stints that are linear in their number — no query per
+ * race anywhere. The ledger series stay database aggregates, bounded by the
+ * months or years they cover rather than by the rows the ledger holds.
+ * Records and the year comparison are computed only when their tab asks.
  *
  * Everything returned is plainly serialisable: numbers, strings and Dates. No
  * BigInt crosses this boundary, because these views are rendered by client
@@ -59,14 +74,28 @@
  */
 
 import type { Prisma } from '@/generated/prisma/client';
-import { ACHIEVEMENTS, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG, STATS_CONFIG } from '@/lib/config';
+import {
+  ACHIEVEMENTS, CAREER_STATS_SHAPE, DURATION_CLASSES, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG, STATS_CONFIG,
+} from '@/lib/config';
 import { EXPIRED_CHALLENGE_NOTE, backlogFraming } from '@/lib/copy/tone';
 import { prisma } from '@/lib/db/client';
-import { localDayKey, yearWindow } from '@/lib/domain/calendar';
-import { isoWeekParts, monthPeriod } from '@/lib/domain/periods';
+import { clipToWindow, samePeriodEnd, yearWindow, type LocalWindow } from '@/lib/domain/calendar';
+import { coverageAt, type CareerTimeline, type RaceHistory, type TimelineRaceRow } from '@/lib/domain/career-timeline';
+import { monthPeriod } from '@/lib/domain/periods';
 import { averagePlaybackSpeed } from '@/lib/domain/playback';
 import { levelFromXp, prestigeForLevel, titleForLevel, totalXpForLevel } from '@/lib/domain/progression';
+import {
+  RECORD_ORDER, careerRecordOptions, computeRecordProgression, currentRecords, recordLabel,
+  type RecordEvent, type RecordKind,
+} from '@/lib/domain/records';
+import { formatDuration, formatElapsed } from '@/lib/domain/time';
 import type { ChallengeScope, RaceStatus, RaceType } from '@/lib/domain/types';
+import {
+  compareSummaries, durationClassOf, durationClassRange, summariseWindow,
+  type Bucket, type CompareGroupRow, type CompareRow, type CompareSide, type GroupRow, type StintRef, type WindowSummary,
+} from '@/lib/domain/window-summary';
+import { getCareerTimeline } from './career-timeline-engine';
+import { eventHref } from './mastery-engine';
 
 // ===========================================================================
 // The filter
@@ -76,11 +105,12 @@ import type { ChallengeScope, RaceStatus, RaceType } from '@/lib/domain/types';
  * How the statistics page narrows what it is looking at.
  *
  * Two different kinds of narrowing live in one object, and the difference
- * matters. `championshipId`, `seasonId`, `circuitSlug`, `raceType`, the runtime
- * bounds, `status` and `storyCompleteOnly` choose a set of RACES. `year`
- * chooses a WINDOW OF TIME: viewing figures come from the sessions logged
- * inside it, and a race counts as in scope for a year when something actually
- * happened to it in that year.
+ * matters. Everything but `year` chooses a set of RACES: a championship, a
+ * season, a circuit, a recurring event, one race, a length band, the legacy
+ * race type, the runtime bounds, a library status, Story Complete only.
+ * `year` chooses a WINDOW OF TIME: viewing figures come from the part of each
+ * stint inside it, and a race counts as in scope for a year when it was
+ * watched in that year.
  *
  * Every field is optional and an empty filter means the whole career.
  */
@@ -91,6 +121,17 @@ export interface StatsFilter {
   seasonId?: string;
   /** The normalised circuit key, so spellings of one circuit stay one circuit. */
   circuitSlug?: string;
+  /**
+   * A recurring event, by its key. Matched on `Race.iconicKey`, the key the
+   * replay groups a race's editions by, so the filter chooses exactly the
+   * races the event's rows and options count.
+   */
+  eventKey?: string;
+  /** One race. */
+  raceId?: string;
+  /** A race-length band, by its `DURATION_CLASSES` key. */
+  length?: string;
+  /** The race's own type label. Still honoured in a URL; the length bands are what the page offers. */
   raceType?: RaceType;
   /** Race runtime bounds, in hours: "only the long ones", "only the sprints". */
   minRuntimeHours?: number;
@@ -132,13 +173,25 @@ export interface StatsCircuitOption {
   races: number;
 }
 
-export interface StatsDurationOption {
-  raceType: RaceType;
+export interface StatsEventOption {
+  key: string;
+  name: string;
+  /** Credited hours across the event's races, the whole career. */
+  hours: number;
+}
+
+export interface StatsRaceOption {
+  id: string;
+  name: string;
+  /** Credited hours inside the chosen year, or the whole career without one. */
+  hours: number;
+}
+
+export interface StatsLengthOption {
+  /** A `DURATION_CLASSES` key. */
+  key: string;
   label: string;
   races: number;
-  /** Shortest and longest runtime actually present for this type. */
-  minRuntimeHours: number;
-  maxRuntimeHours: number;
 }
 
 export interface StatsStatusOption {
@@ -159,7 +212,16 @@ export interface StatsFilterOptions {
   championships: StatsChampionshipOption[];
   seasons: StatsSeasonOption[];
   circuits: StatsCircuitOption[];
-  durations: StatsDurationOption[];
+  events: StatsEventOption[];
+  /**
+   * Offered once a championship, event or year narrows the library (a career
+   * of thousands of races is no list to choose from): the races in that scope,
+   * most watched first, at most `CAREER_STATS_SHAPE.raceOptionLimit`. Empty
+   * until then.
+   */
+  races: StatsRaceOption[];
+  /** The length bands the library has races in, shortest first. */
+  lengths: StatsLengthOption[];
   statuses: StatsStatusOption[];
   /** Bounds for the runtime slider, in hours. */
   runtimeHours: { min: number; max: number };
@@ -171,10 +233,10 @@ export interface StatsFilterOptions {
 
 /** Time spent and story seen, kept rigorously apart. */
 export interface ViewingTotals {
-  /** Real-world seconds in front of the screen. Re-watches included. */
+  /** Credited seconds in front of the screen. Re-watches included. */
   realSeconds: number;
   realHours: number;
-  /** Real viewing time expressed in whole days' worth of hours. */
+  /** Viewing time expressed in whole days' worth of hours. */
   equivalentDays: number;
 
   /** Race-timeline seconds played, re-watches included. NOT coverage. */
@@ -182,28 +244,30 @@ export interface ViewingTotals {
   timelinePlayedHours: number;
 
   /**
-   * Unique race-timeline seconds covered by the races in scope, as a lifetime
-   * figure per race. Re-watching never increases it.
+   * Unique race-timeline seconds covered by the races in scope. Under a year
+   * filter it is each race's coverage as the year ended (or as it stands, for
+   * the year in progress); otherwise as it stands. Re-watching never
+   * increases it.
    */
   uniqueCoverageSeconds: number;
   uniqueCoverageHours: number;
 
   /**
-   * Unique race-timeline seconds seen for the FIRST time by the sessions in
-   * scope. Under a year filter this is the story the year actually uncovered,
-   * which is a different question from how much of those races has ever been
-   * seen — hence both figures, separately named.
+   * Unique race-timeline seconds seen for the FIRST time in scope. Under a
+   * year filter this is the story the year actually uncovered, which is a
+   * different question from how much of those races has ever been seen —
+   * hence both figures, separately named.
    */
   newCoverageSeconds: number;
   newCoverageHours: number;
 
   /**
-   * Real seconds attributable to re-watched timeline, apportioned from the
-   * scope's own average speed. Re-watching is a perfectly good way to spend an
-   * evening; this is here to be interesting, never to be deducted.
+   * Credited seconds spent on timeline already seen. Re-watching is a
+   * perfectly good way to spend an evening; this is here to be interesting,
+   * never to be deducted.
    */
   rewatchRealSeconds: number;
-  /** Share of the timeline played that had been seen before, 0-1. */
+  /** Share of the viewing time that was a re-watch, 0-1. */
   rewatchShare: number;
 
   sessions: number;
@@ -215,6 +279,11 @@ export interface RaceTotals {
   /** Races matching the filter. Every percentage below is taken against this. */
   racesInScope: number;
   racesStarted: number;
+  /**
+   * Races completed, which in 0.4.0 means Story Complete in the replay: the
+   * same number as `racesStoryComplete`, shown once as "Races completed
+   * (Story Complete)". A race marked Completed by hand counts in neither.
+   */
   racesCompleted: number;
   racesStoryComplete: number;
   /** Races not yet begun. A library of future experiences, not a backlog. */
@@ -240,10 +309,12 @@ export interface RaceTotals {
   libraryNote: string;
 }
 
+/** One stint, as the page names it: the longest, or the shortest that means anything. */
 export interface LongestSessionView {
   raceId: string;
   raceName: string;
   watchedAt: Date;
+  /** Credited seconds. */
   realSeconds: number;
   timelineSeconds: number;
   playbackSpeed: number;
@@ -251,12 +322,12 @@ export interface LongestSessionView {
 
 export interface SessionTotals {
   sessions: number;
-  /** Mean real seconds per logged stint. */
+  /** Mean credited seconds per logged stint. */
   averageRealSeconds: number;
   averageRealMinutes: number;
   longestRealSeconds: number;
   longestSession: LongestSessionView | null;
-  /** Timeline played ÷ real time: the speed actually watched at, weighted. */
+  /** Timeline played ÷ the real time it took: the speed actually watched at, weighted. */
   averagePlaybackSpeed: number;
   averageSessionsPerActiveDay: number;
 }
@@ -330,14 +401,14 @@ export interface FavouriteEntry {
 }
 
 export interface FavouriteStats {
-  /** Most real viewing time. */
+  /** Most viewing time. */
   championshipByHours: FavouriteEntry | null;
   /** Most races seen through — a different question, and often a different answer. */
   championshipByCompletions: FavouriteEntry | null;
   circuit: FavouriteEntry | null;
-  /** The recurring event (`Race.iconicKey`) with the most real viewing time. */
+  /** The recurring event with the most viewing time. */
   event: FavouriteEntry | null;
-  /** The single race with the most real viewing time. */
+  /** The single race with the most viewing time. */
   race: FavouriteEntry | null;
 }
 
@@ -361,8 +432,7 @@ export interface CompletionStats {
   mastery: ScopedPercent;
   masteryTreesCompleted: number;
   masteryTreesTotal: number;
-  /** Against the races in the current filter. */
-  library: ScopedPercent;
+  /** Story Complete races against the races in the current filter. */
   storyLibrary: ScopedPercent;
   note: string;
 }
@@ -524,6 +594,74 @@ export interface CareerSnapshot {
 }
 
 /**
+ * One row of a breakdown the replay groups: an event, a length band, a
+ * championship. Its time is the scope's credited time that fell on its races.
+ */
+export interface GroupStat {
+  id: string | null;
+  name: string;
+  accentColor: string | null;
+  /** The event's own page, on an event row; null otherwise. */
+  href: string | null;
+  realSeconds: number;
+  realHours: number;
+  racesExperienced: number;
+  storyCompletes: number;
+  /** Of the scope's viewing time, 0-1. */
+  share: number;
+}
+
+/** One day of the week, whichever weeks it fell in. */
+export interface WeekdayStat {
+  /** 0 = Sunday, as `Date.getDay()`. */
+  weekday: number;
+  label: string;
+  short: string;
+  realSeconds: number;
+  realHours: number;
+  sessions: number;
+}
+
+/** A count of Story Completes, per championship. */
+export interface StoryCompleteCount {
+  id: string | null;
+  name: string;
+  accentColor: string | null;
+  storyCompletes: number;
+}
+
+export interface YearStoryCompletes {
+  year: number;
+  storyCompletes: number;
+}
+
+/** Races completed, month by month and in total so far. */
+export interface CompletionsPoint {
+  /** `2026-03`. */
+  month: string;
+  label: string;
+  storyCompletes: number;
+  cumulative: number;
+}
+
+/** Landmarks reached by the end of a month, each kind counted from the start of the scope. */
+export interface LandmarksPoint {
+  /** `2026-03`. */
+  month: string;
+  label: string;
+  achievements: number;
+  masteryNodes: number;
+  milestones: number;
+}
+
+/** A calendar year of the ledger: the XP it earned and the levels it climbed. */
+export interface XpYearStat {
+  year: number;
+  xpEarned: number;
+  levelsGained: number;
+}
+
+/**
  * Everything the statistics page renders for one scope.
  *
  * Assembled by `getStatistics`, which is the only place the pieces are brought
@@ -534,6 +672,10 @@ export interface StatisticsView {
   /** The filter as applied, echoed back so the UI never has to guess. */
   filter: StatsFilter;
   scopeLabel: string;
+  /** A filter narrows the races. */
+  narrowed: boolean;
+  /** Said beside XP, levels and landmarks while a filter narrows the races: those are the whole career's. */
+  careerWideNote: string | null;
 
   viewing: ViewingTotals;
   races: RaceTotals;
@@ -553,6 +695,32 @@ export interface StatisticsView {
   levelHistory: LevelHistoryPoint[];
   budgetHistory: BudgetYearStat[];
 
+  /** Credited seconds spent on story already seen. */
+  rewatchSeconds: number;
+  /** Races watched in scope that reached "experienced": a tenth of the race, or an hour of a long one. */
+  racesExperienced: number;
+  /** Of the races started in scope, the share Story Complete, 0-100; null below `rateMinimumRaces` started. */
+  storyCompleteRate: number | null;
+  /** The plain mean of each watched race's completion, 0-100. */
+  averageRaceCompletionPercent: number | null;
+  shortestMeaningfulSession: LongestSessionView | null;
+  /** The longest race experienced in scope, by runtime. */
+  longestRace: { raceId: string; name: string; runtimeSec: number } | null;
+  championshipsFollowed: number;
+  eventsFollowed: number;
+  byEvent: GroupStat[];
+  /** Seven days, starting on the user's first day of the week. */
+  byWeekday: WeekdayStat[];
+  /** The length bands with anything in them, shortest first. */
+  byDurationClass: GroupStat[];
+  storyCompletesByChampionship: StoryCompleteCount[];
+  /** Oldest year first, every year from the first with viewing to the last, quiet years at 0. */
+  storyCompletesByYear: YearStoryCompletes[];
+  completionsOverTime: CompletionsPoint[];
+  landmarksOverTime: LandmarksPoint[];
+  /** Newest year first, one row for every year in `years`. */
+  xpAndLevelsByYear: XpYearStat[];
+
   career: CareerSnapshot;
   note: string;
 }
@@ -562,9 +730,22 @@ export const SCOPED_PERCENTAGE_NOTE =
   'Every percentage here is measured against a scope you defined — this filter, a season, ' +
   'a championship, a quarter. Nothing measures your career against every race ever run.';
 
-/** Framing for the page as a whole. A record, not a scoreboard. */
+/**
+ * Framing for the page as a whole. A record, not a scoreboard — and the one
+ * sentence on why an hour here and an hour on the Viewing Budget can differ.
+ */
 export const STATISTICS_NOTE =
-  'A record of what you have watched. Nothing here expires, and nothing here goes down.';
+  'A record of what you have watched. Nothing here expires. Hours here count the way XP does and are ' +
+  'spread over the time a stint took, so a stint below 0.75× or one that crossed midnight can read a ' +
+  'little differently on the Viewing Budget, which counts real time on the day a stint was logged.';
+
+/** Said once, under the Records grid, instead of on every card it applies to. */
+export const RECORDS_LOGGED_TIME_NOTE =
+  'Records marked * depend on when stints were logged: a stint’s time is spread over the time before it was logged.';
+
+/** Why XP, levels and landmarks do not follow a race filter. */
+export const CAREER_WIDE_XP_NOTE =
+  'XP, levels and landmarks count your whole career, whatever the filter: they are kept for the career, not per race.';
 
 /** Display names for race statuses, so the filter reads as English. */
 export const RACE_STATUS_LABELS: Readonly<Record<RaceStatus, string>> = {
@@ -585,6 +766,12 @@ const MS_PER_DAY = 86_400_000;
 /** Seconds in a day. A unit conversion for "days spent watching", not a tunable. */
 const SECONDS_PER_DAY = 86_400;
 const SECONDS_PER_HOUR = 3_600;
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] as const;
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const;
 
 function round1(value: number): number {
   return Math.round(value * 10) / 10;
@@ -643,9 +830,27 @@ function monthWindowsBetween(start: Date, end: Date): { key: string; label: stri
   return months;
 }
 
-/** The label the Add Race form uses for a race type, so the filter agrees with it. */
+/** Local midnight on the first day of the month after `at`'s. */
+function startOfNextMonth(at: Date): Date {
+  return new Date(at.getFullYear(), at.getMonth() + 1, 1, 0, 0, 0, 0);
+}
+
+/** The label the Add Race form uses for a race type, so a legacy filter agrees with it. */
 export function raceTypeLabel(raceType: RaceType): string {
   return RACE_TYPE_PRESETS.find((preset) => preset.type === raceType)?.label ?? raceType;
+}
+
+/**
+ * Whether a value from an address is a library status. A filter reaches the
+ * database as it is, so an unknown value must be dropped before it gets there.
+ */
+export function isRaceStatus(value: string | undefined): value is RaceStatus {
+  return value !== undefined && Object.hasOwn(RACE_STATUS_LABELS, value);
+}
+
+/** Whether a value from an address is a race type the Add Race form offers. */
+export function isRaceType(value: string | undefined): value is RaceType {
+  return RACE_TYPE_PRESETS.some((preset) => preset.type === value);
 }
 
 function isWithin(date: Date | null, window: DateWindow | null): boolean {
@@ -654,15 +859,22 @@ function isWithin(date: Date | null, window: DateWindow | null): boolean {
   return date >= window.start && date < window.end;
 }
 
+/** "22 September 2026". */
+function longDate(at: Date): string {
+  return `${at.getDate()} ${MONTH_NAMES[at.getMonth()]} ${at.getFullYear()}`;
+}
+
 // ===========================================================================
 // Turning a filter into queries
 // ===========================================================================
 
 /**
- * The race predicates of a filter — everything except the year.
+ * The race predicates of a filter — everything except the year — always
+ * inside the account.
  *
- * Used both to choose the races in scope and, nested, to choose the sessions
- * that belong to them, so the two can never drift apart.
+ * A length band is a runtime range from `durationClassRange`, the same bands
+ * `durationClassOf` sorts races into, so the filter and the length chart can
+ * never disagree about which band a race is in.
  */
 export function buildRaceScopeWhere(userId: string, filter: StatsFilter = {}): Prisma.RaceWhereInput {
   const where: Prisma.RaceWhereInput = { userId };
@@ -670,208 +882,54 @@ export function buildRaceScopeWhere(userId: string, filter: StatsFilter = {}): P
   if (filter.championshipId !== undefined) where.championshipId = filter.championshipId;
   if (filter.seasonId !== undefined) where.seasonId = filter.seasonId;
   if (filter.circuitSlug !== undefined) where.circuitSlug = filter.circuitSlug;
+  if (filter.eventKey !== undefined) where.iconicKey = filter.eventKey;
+  if (filter.raceId !== undefined) where.id = filter.raceId;
   if (filter.raceType !== undefined) where.raceType = filter.raceType;
   if (filter.status !== undefined) where.status = filter.status;
   if (filter.storyCompleteOnly === true) where.storyCompletedAt = { not: null };
 
-  const min = filter.minRuntimeHours;
-  const max = filter.maxRuntimeHours;
-  if (min !== undefined || max !== undefined) {
+  // The runtime bounds and a length band both narrow `runtimeSec`, so they
+  // are folded into one range: the tighter lower bound, and each upper bound.
+  let atLeast = filter.minRuntimeHours === undefined ? null : Math.round(filter.minRuntimeHours * SECONDS_PER_HOUR);
+  const atMost = filter.maxRuntimeHours === undefined ? null : Math.round(filter.maxRuntimeHours * SECONDS_PER_HOUR);
+  const band = filter.length === undefined ? null : durationClassRange(filter.length);
+  if (band !== null) atLeast = Math.max(atLeast ?? 0, band.minSec);
+  const below = band?.maxSec ?? null;
+  if (atLeast !== null || atMost !== null || below !== null) {
     where.runtimeSec = {
-      ...(min !== undefined ? { gte: Math.round(min * SECONDS_PER_HOUR) } : {}),
-      ...(max !== undefined ? { lte: Math.round(max * SECONDS_PER_HOUR) } : {}),
+      ...(atLeast !== null ? { gte: atLeast } : {}),
+      ...(atMost !== null ? { lte: atMost } : {}),
+      ...(below !== null ? { lt: below } : {}),
     };
   }
 
   return where;
 }
 
-/**
- * The races a filter puts in scope.
- *
- * With a year, a race is in scope when something happened to it that year: it
- * was watched, its story finished, or it was marked complete. That is what
- * makes "2025" read as the year rather than as the whole library seen through
- * a date field.
- */
-export function buildRacesInScopeWhere(userId: string, filter: StatsFilter = {}): Prisma.RaceWhereInput {
-  const where = buildRaceScopeWhere(userId, filter);
-  if (filter.year === undefined) return where;
-
-  const window = yearWindow(filter.year);
-  const inYear = { gte: window.start, lt: window.end };
-  return {
-    ...where,
-    OR: [
-      { sessions: { some: { watchedAt: inYear } } },
-      { storyCompletedAt: inYear },
-      { completedAt: inYear },
-    ],
-  };
-}
-
-/** The sessions a filter puts in scope: the right races, inside the right window. */
-export function buildSessionScopeWhere(
-  userId: string,
-  filter: StatsFilter = {},
-): Prisma.RaceViewingSessionWhereInput {
-  const where: Prisma.RaceViewingSessionWhereInput = {
-    userId,
-    race: buildRaceScopeWhere(userId, filter),
-  };
-  if (filter.year !== undefined) {
-    const window = yearWindow(filter.year);
-    where.watchedAt = { gte: window.start, lt: window.end };
-  }
-  return where;
+/** Whether a filter narrows the races at all, or only (at most) the window of time. */
+export function narrowsRaces(filter: StatsFilter): boolean {
+  return filter.championshipId !== undefined || filter.seasonId !== undefined || filter.circuitSlug !== undefined
+    || filter.eventKey !== undefined || filter.raceId !== undefined || filter.length !== undefined
+    || filter.raceType !== undefined || filter.minRuntimeHours !== undefined || filter.maxRuntimeHours !== undefined
+    || filter.status !== undefined || filter.storyCompleteOnly === true;
 }
 
 // ===========================================================================
-// Calendar buckets
-// ===========================================================================
-
-interface DayBucket {
-  date: string;
-  realSeconds: number;
-  sessions: number;
-  newCoverageSeconds: number;
-}
-
-interface MonthBucket {
-  key: string;
-  year: number;
-  month: number;
-  realSeconds: number;
-  sessions: number;
-  newCoverageSeconds: number;
-  days: Set<string>;
-}
-
-interface YearBucket {
-  year: number;
-  realSeconds: number;
-  sessions: number;
-  newCoverageSeconds: number;
-  days: Set<string>;
-}
-
-interface ActivityBuckets {
-  days: Map<string, DayBucket>;
-  months: Map<string, MonthBucket>;
-  years: Map<number, YearBucket>;
-  /** Distinct viewing weeks with activity, as `2026-W12` keys. */
-  weeks: Set<string>;
-}
-
-/**
- * Bucket sessions into local days, months, years and viewing weeks.
- *
- * This is the one read in the file that grows with the session history, so the
- * projection is as narrow as the database allows: three scalar columns, no
- * relations, no ordering. It is done here rather than in SQL because a calendar
- * day in this application is a LOCAL day — `domain/periods`, the momentum
- * history and the viewing week all agree on that — and expressing it in the
- * query would mean freezing a timezone into it.
- */
-async function loadActivityBuckets(
-  where: Prisma.RaceViewingSessionWhereInput,
-  weekStartsOn = 1,
-): Promise<ActivityBuckets> {
-  const rows = await prisma.raceViewingSession.findMany({
-    where,
-    select: { watchedAt: true, realSeconds: true, newCoverageSeconds: true },
-  });
-
-  const buckets: ActivityBuckets = {
-    days: new Map(),
-    months: new Map(),
-    years: new Map(),
-    weeks: new Set(),
-  };
-
-  for (const row of rows) {
-    const at = row.watchedAt;
-    const dayKey = localDayKey(at);
-    const year = at.getFullYear();
-    const monthKey = dayKey.slice(0, 7);
-
-    const day = buckets.days.get(dayKey) ??
-      { date: dayKey, realSeconds: 0, sessions: 0, newCoverageSeconds: 0 };
-    day.realSeconds += row.realSeconds;
-    day.newCoverageSeconds += row.newCoverageSeconds;
-    day.sessions += 1;
-    buckets.days.set(dayKey, day);
-
-    const month = buckets.months.get(monthKey) ??
-      { key: monthKey, year, month: at.getMonth() + 1, realSeconds: 0, sessions: 0, newCoverageSeconds: 0, days: new Set<string>() };
-    month.realSeconds += row.realSeconds;
-    month.newCoverageSeconds += row.newCoverageSeconds;
-    month.sessions += 1;
-    month.days.add(dayKey);
-    buckets.months.set(monthKey, month);
-
-    const yearBucket = buckets.years.get(year) ??
-      { year, realSeconds: 0, sessions: 0, newCoverageSeconds: 0, days: new Set<string>() };
-    yearBucket.realSeconds += row.realSeconds;
-    yearBucket.newCoverageSeconds += row.newCoverageSeconds;
-    yearBucket.sessions += 1;
-    yearBucket.days.add(dayKey);
-    buckets.years.set(year, yearBucket);
-
-    const week = isoWeekParts(at, weekStartsOn);
-    buckets.weeks.add(`${week.isoYear}-W${`${week.isoWeek}`.padStart(2, '0')}`);
-  }
-
-  return buckets;
-}
-
-// ===========================================================================
-// The scope: one load, shared by every breakdown on the page
+// The replay, the filter, and one window of it
 // ===========================================================================
 
 const STATS_RACE_SELECT = {
   id: true,
   name: true,
   championshipId: true,
-  seasonId: true,
   circuit: true,
   circuitSlug: true,
   country: true,
-  raceType: true,
-  status: true,
   runtimeSec: true,
-  coverageSec: true,
   isMajorEvent: true,
-  iconicKey: true,
-  raceDate: true,
-  startedAt: true,
-  completedAt: true,
-  storyCompletedAt: true,
-  lastWatchedAt: true,
 } satisfies Prisma.RaceSelect;
 
 type StatsRaceRow = Prisma.RaceGetPayload<{ select: typeof STATS_RACE_SELECT }>;
-
-/** Real viewing figures for one race, inside the current scope. */
-interface RaceSessionTotals {
-  sessions: number;
-  realSeconds: number;
-  timelineSeconds: number;
-  newCoverageSeconds: number;
-  longestRealSeconds: number;
-  firstWatchedAt: Date | null;
-  lastWatchedAt: Date | null;
-}
-
-const EMPTY_RACE_TOTALS: RaceSessionTotals = {
-  sessions: 0,
-  realSeconds: 0,
-  timelineSeconds: 0,
-  newCoverageSeconds: 0,
-  longestRealSeconds: 0,
-  firstWatchedAt: null,
-  lastWatchedAt: null,
-};
 
 interface ChampionshipRow {
   id: string;
@@ -880,140 +938,355 @@ interface ChampionshipRow {
   accentColor: string;
 }
 
-/**
- * Everything one scope needs, loaded once.
- *
- * The totals and the per-race sums are aggregated by the database; only the
- * calendar buckets and the race rows themselves come back as rows, and the race
- * library is bounded by what the user has added rather than by how long they
- * have been watching.
- */
-interface StatsScope {
+/** What a filter resolves to, before any window is applied. */
+interface FilterContext {
   filter: StatsFilter;
-  window: DateWindow | null;
-  races: StatsRaceRow[];
-  perRace: Map<string, RaceSessionTotals>;
-  totals: RaceSessionTotals;
-  buckets: ActivityBuckets;
-  championships: ChampionshipRow[];
+  timeline: CareerTimeline;
   weekStartsOn: number;
+  /** The races the filter's race predicates choose, read from the library inside the account. */
+  races: StatsRaceRow[];
+  /** The same choice as a predicate over the replay's races; undefined when nothing narrows the races. */
+  include: ((race: TimelineRaceRow) => boolean) | undefined;
+  championships: ChampionshipRow[];
+  scopeLabel: string;
 }
 
-async function loadScope(userId: string, filter: StatsFilter): Promise<StatsScope> {
-  const raceWhere = buildRacesInScopeWhere(userId, filter);
-  const sessionWhere = buildSessionScopeWhere(userId, filter);
-  const window = filter.year === undefined ? null : yearWindow(filter.year);
-
+async function loadWeekStart(userId: string): Promise<number> {
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { weekStart: true } });
-  const weekStartsOn = user?.weekStart ?? 1;
+  return user?.weekStart ?? 1;
+}
 
-  const [races, perRaceRows, aggregate, buckets, championships] = await Promise.all([
-    prisma.race.findMany({ where: raceWhere, select: STATS_RACE_SELECT }),
-    prisma.raceViewingSession.groupBy({
-      by: ['raceId'],
-      where: sessionWhere,
-      _sum: { realSeconds: true, timelineSeconds: true, newCoverageSeconds: true },
-      _max: { realSeconds: true, watchedAt: true },
-      _min: { watchedAt: true },
-      _count: true,
-    }),
-    prisma.raceViewingSession.aggregate({
-      where: sessionWhere,
-      _sum: { realSeconds: true, timelineSeconds: true, newCoverageSeconds: true },
-      _max: { realSeconds: true, watchedAt: true },
-      _min: { watchedAt: true },
-      _count: true,
-    }),
-    loadActivityBuckets(sessionWhere, weekStartsOn),
+/**
+ * The replay, the races a filter chooses, and the words for the choice.
+ *
+ * Every id in the filter came from a URL, so each is only ever read inside
+ * the account: the race query carries `userId`, a season is found through its
+ * championship's owner, and an event or race name comes from this account's
+ * own replay or races — an id from anywhere else simply chooses nothing.
+ */
+async function loadFilterContext(userId: string, filter: StatsFilter): Promise<FilterContext> {
+  const [timeline, weekStartsOn, races, championships, season] = await Promise.all([
+    getCareerTimeline(userId),
+    loadWeekStart(userId),
+    prisma.race.findMany({ where: buildRaceScopeWhere(userId, filter), select: STATS_RACE_SELECT }),
     prisma.championship.findMany({
       where: { userId },
       select: { id: true, name: true, slug: true, accentColor: true },
     }),
+    filter.seasonId === undefined
+      ? Promise.resolve(null)
+      : prisma.championshipSeason.findFirst({
+          where: { id: filter.seasonId, championship: { userId } },
+          select: { year: true, label: true, championship: { select: { name: true } } },
+        }),
   ]);
 
-  const perRace = new Map<string, RaceSessionTotals>();
-  for (const row of perRaceRows) {
-    perRace.set(row.raceId, {
-      sessions: row._count,
-      realSeconds: row._sum.realSeconds ?? 0,
-      timelineSeconds: row._sum.timelineSeconds ?? 0,
-      newCoverageSeconds: row._sum.newCoverageSeconds ?? 0,
-      longestRealSeconds: row._max.realSeconds ?? 0,
-      firstWatchedAt: row._min.watchedAt,
-      lastWatchedAt: row._max.watchedAt,
-    });
+  const chosen = new Set(races.map((race) => race.id));
+  const include = narrowsRaces(filter) ? (race: TimelineRaceRow) => chosen.has(race.id) : undefined;
+
+  let eventName: string | null = null;
+  if (filter.eventKey !== undefined) {
+    for (const race of timeline.racesById.values()) {
+      if (race.eventKey === filter.eventKey) {
+        eventName = race.eventName ?? race.eventKey;
+        break;
+      }
+    }
   }
 
+  const scopeLabel = describeScope(filter, {
+    championship: filter.championshipId === undefined
+      ? null
+      : championships.find((row) => row.id === filter.championshipId)?.name ?? null,
+    season: season === null ? null : season.label ?? `${season.championship.name} ${season.year}`,
+    circuit: filter.circuitSlug === undefined
+      ? null
+      : races.find((race) => race.circuitSlug === filter.circuitSlug)?.circuit ?? filter.circuitSlug,
+    event: eventName,
+    race: filter.raceId === undefined ? null : timeline.racesById.get(filter.raceId)?.name ?? null,
+  });
+
+  return { filter, timeline, weekStartsOn, races, include, championships, scopeLabel };
+}
+
+function windowOptions(weekStartsOn: number, include?: (race: TimelineRaceRow) => boolean) {
   return {
-    filter,
-    window,
-    races,
-    perRace,
-    totals: {
-      sessions: aggregate._count,
-      realSeconds: aggregate._sum.realSeconds ?? 0,
-      timelineSeconds: aggregate._sum.timelineSeconds ?? 0,
-      newCoverageSeconds: aggregate._sum.newCoverageSeconds ?? 0,
-      longestRealSeconds: aggregate._max.realSeconds ?? 0,
-      firstWatchedAt: aggregate._min.watchedAt,
-      lastWatchedAt: aggregate._max.watchedAt,
-    },
-    buckets,
-    championships,
     weekStartsOn,
+    include,
+    meaningfulSessionSeconds: CAREER_STATS_SHAPE.meaningfulSessionMinutes * 60,
+    rateMinimumRaces: CAREER_STATS_SHAPE.rateMinimumRaces,
   };
 }
 
-/** Real viewing figures for one race in this scope, or zeroes if it was not watched. */
+/**
+ * The unfiltered lifetime summary of a replay, kept beside it.
+ *
+ * The page and its filter options both ask for it, and a cached replay is the
+ * same object until the history changes, so it is folded once per replay. A
+ * `WeakMap`, so it goes when the replay does. Its maps are shared: read them,
+ * never write to them.
+ */
+const lifetimeSummaries = new WeakMap<CareerTimeline, Map<number, WindowSummary>>();
+
+function lifetimeSummary(timeline: CareerTimeline, weekStartsOn: number): WindowSummary {
+  let byWeekStart = lifetimeSummaries.get(timeline);
+  if (byWeekStart === undefined) {
+    byWeekStart = new Map();
+    lifetimeSummaries.set(timeline, byWeekStart);
+  }
+  let summary = byWeekStart.get(weekStartsOn);
+  if (summary === undefined) {
+    summary = summariseWindow(timeline, null, windowOptions(weekStartsOn));
+    byWeekStart.set(weekStartsOn, summary);
+  }
+  return summary;
+}
+
+function summariseScope(context: FilterContext, window: LocalWindow | null): WindowSummary {
+  if (window === null && context.include === undefined) return lifetimeSummary(context.timeline, context.weekStartsOn);
+  return summariseWindow(context.timeline, window, windowOptions(context.weekStartsOn, context.include));
+}
+
+// ---------------------------------------------------------------------------
+// Per race, inside the window
+// ---------------------------------------------------------------------------
+
+/** Viewing figures for one race (or the whole scope) inside the window. */
+interface RaceSessionTotals {
+  /** Stints whose instant is inside the window. */
+  sessions: number;
+  /** Credited seconds inside the window. */
+  realSeconds: number;
+  timelineSeconds: number;
+  newCoverageSeconds: number;
+  rewatchSeconds: number;
+  /** The real time the timeline took to play at its speeds, for the average speed. */
+  playbackRealSeconds: number;
+  longestRealSeconds: number;
+  firstWatchedAt: Date | null;
+  lastWatchedAt: Date | null;
+  /** The race's unique coverage as the window ends (as it stands, for the whole career). */
+  coverageSeconds: number;
+}
+
+function emptyTotals(): RaceSessionTotals {
+  return {
+    sessions: 0, realSeconds: 0, timelineSeconds: 0, newCoverageSeconds: 0, rewatchSeconds: 0,
+    playbackRealSeconds: 0, longestRealSeconds: 0, firstWatchedAt: null, lastWatchedAt: null, coverageSeconds: 0,
+  };
+}
+
+/** A race's coverage as the window ends: after its last stint logged before the end. */
+function coverageAtEnd(history: RaceHistory, window: LocalWindow | null): number {
+  return window === null ? history.coverageSeconds : coverageAt(history, new Date(window.end.getTime() - 1));
+}
+
+/**
+ * Each chosen race's stints, clipped to the window.
+ *
+ * A race's time inside the window is the part of each stint's window that
+ * falls in it (the same clip `summariseWindow` makes), and its sessions are
+ * the stints logged inside it. A race enters the map when either is true, so
+ * under a year filter the map's keys are the races the year touched.
+ */
+function raceTotalsInWindow(
+  context: FilterContext,
+  window: LocalWindow | null,
+): { perRace: Map<string, RaceSessionTotals>; totals: RaceSessionTotals } {
+  const perRace = new Map<string, RaceSessionTotals>();
+  const totals = emptyTotals();
+
+  for (const race of context.races) {
+    const history = context.timeline.races.get(race.id);
+    if (history === undefined || history.stints.length === 0) continue;
+
+    let row: RaceSessionTotals | null = null;
+    for (const stint of history.stints) {
+      const part = window === null
+        ? { fraction: 1 }
+        : clipToWindow(stint.startsAt, stint.watchedAt, window);
+      const counted = isWithin(stint.watchedAt, window);
+      if (part === null && !counted) continue;
+
+      row ??= emptyTotals();
+      const fraction = part?.fraction ?? 0;
+      for (const target of [row, totals]) {
+        target.realSeconds += stint.creditedSeconds * fraction;
+        target.timelineSeconds += stint.timelineSeconds * fraction;
+        target.newCoverageSeconds += stint.addedCoverageSeconds * fraction;
+        target.rewatchSeconds += stint.rewatchCreditedSeconds * fraction;
+        if (stint.playbackSpeed > 0) target.playbackRealSeconds += (stint.timelineSeconds * fraction) / stint.playbackSpeed;
+        if (!counted) continue;
+        target.sessions += 1;
+        target.longestRealSeconds = Math.max(target.longestRealSeconds, stint.creditedSeconds);
+        target.firstWatchedAt = earliest(target.firstWatchedAt, stint.watchedAt);
+        target.lastWatchedAt = latest(target.lastWatchedAt, stint.watchedAt);
+      }
+    }
+
+    if (row !== null) {
+      row.coverageSeconds = Math.min(coverageAtEnd(history, window), race.runtimeSec);
+      totals.coverageSeconds += row.coverageSeconds;
+      perRace.set(race.id, row);
+    }
+  }
+
+  return { perRace, totals };
+}
+
+// ---------------------------------------------------------------------------
+// Calendar buckets, from the summary
+// ---------------------------------------------------------------------------
+
+interface DayBucket {
+  date: string;
+  realSeconds: number;
+  sessions: number;
+  newCoverageSeconds: number;
+}
+
+interface PeriodBucket {
+  realSeconds: number;
+  sessions: number;
+  newCoverageSeconds: number;
+  storyCompletes: number;
+  /** Local days in the period with viewing time on them. */
+  activeDays: number;
+}
+
+interface ActivityBuckets {
+  days: Map<string, DayBucket>;
+  /** Keyed `YYYY-MM`. */
+  months: Map<string, PeriodBucket>;
+  years: Map<number, PeriodBucket>;
+  /** Viewing weeks with viewing time in them, as the budget keys them. */
+  activeWeeks: number;
+}
+
+/**
+ * The summary's local days, weeks, months and years, in the shapes this page
+ * reports. A day is active when viewing time fell on it — the same rule the
+ * summary's own `activeDays` follows — so a stint logged with no time behind
+ * it counts as a session on its day without making the day active.
+ */
+function bucketsFromSummary(summary: WindowSummary): ActivityBuckets {
+  const days = new Map<string, DayBucket>();
+  const activeByMonth = new Map<string, number>();
+  const activeByYear = new Map<number, number>();
+
+  for (const [key, bucket] of summary.days) {
+    days.set(key, {
+      date: key,
+      realSeconds: Math.round(bucket.creditedSeconds),
+      sessions: bucket.sessions,
+      newCoverageSeconds: Math.round(bucket.newCoverageSeconds),
+    });
+    if (bucket.creditedSeconds > 0) {
+      const month = key.slice(0, 7);
+      const year = Number.parseInt(key.slice(0, 4), 10);
+      activeByMonth.set(month, (activeByMonth.get(month) ?? 0) + 1);
+      activeByYear.set(year, (activeByYear.get(year) ?? 0) + 1);
+    }
+  }
+
+  const period = (bucket: Bucket, active: number): PeriodBucket => ({
+    realSeconds: Math.round(bucket.creditedSeconds),
+    sessions: bucket.sessions,
+    newCoverageSeconds: Math.round(bucket.newCoverageSeconds),
+    storyCompletes: bucket.storyCompletes,
+    activeDays: active,
+  });
+
+  const months = new Map<string, PeriodBucket>();
+  for (const [key, bucket] of summary.months) months.set(key, period(bucket, activeByMonth.get(key) ?? 0));
+  const years = new Map<number, PeriodBucket>();
+  for (const [year, bucket] of summary.years) years.set(year, period(bucket, activeByYear.get(year) ?? 0));
+
+  let activeWeeks = 0;
+  for (const bucket of summary.weeks.values()) if (bucket.creditedSeconds > 0) activeWeeks += 1;
+
+  return { days, months, years, activeWeeks };
+}
+
+// ---------------------------------------------------------------------------
+// The scope: one load, shared by every breakdown on the page
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything one scope needs, loaded once: the filter's context, the window,
+ * the summary of that window, and each race's figures inside it.
+ */
+interface StatsScope extends FilterContext {
+  window: LocalWindow | null;
+  summary: WindowSummary;
+  /**
+   * The races in scope: every race the filter chooses, or under a year filter
+   * those the year touched — watched in it, or with viewing time in it.
+   */
+  inScope: StatsRaceRow[];
+  perRace: Map<string, RaceSessionTotals>;
+  totals: RaceSessionTotals;
+  buckets: ActivityBuckets;
+}
+
+async function loadScope(userId: string, filter: StatsFilter): Promise<StatsScope> {
+  const context = await loadFilterContext(userId, filter);
+  const window = filter.year === undefined ? null : yearWindow(filter.year);
+  const summary = summariseScope(context, window);
+  const { perRace, totals } = raceTotalsInWindow(context, window);
+  return {
+    ...context,
+    window,
+    summary,
+    inScope: window === null ? context.races : context.races.filter((race) => perRace.has(race.id)),
+    perRace,
+    totals,
+    buckets: bucketsFromSummary(summary),
+  };
+}
+
+/** Viewing figures for one race in this scope, or zeroes if it was not watched. */
 function totalsFor(scope: StatsScope, raceId: string): RaceSessionTotals {
-  return scope.perRace.get(raceId) ?? EMPTY_RACE_TOTALS;
+  return scope.perRace.get(raceId) ?? emptyTotals();
 }
 
 // ===========================================================================
 // Building the view
 // ===========================================================================
 
-function buildViewingTotals(scope: StatsScope, uniqueCoverageSeconds: number): ViewingTotals {
-  const { totals } = scope;
-
-  // Timeline played that had been seen before. Re-watching is a perfectly good
-  // evening; this figure exists to be interesting, and nothing subtracts it
-  // from anything.
-  const rewatchTimelineSeconds = Math.max(0, totals.timelineSeconds - totals.newCoverageSeconds);
-  const rewatchShare = divide(rewatchTimelineSeconds, totals.timelineSeconds);
+function buildViewingTotals(scope: StatsScope): ViewingTotals {
+  const { summary, totals } = scope;
+  const realSeconds = Math.round(summary.creditedSeconds);
+  const rewatchSeconds = Math.round(summary.rewatchSeconds);
 
   return {
-    realSeconds: totals.realSeconds,
-    realHours: toHours(totals.realSeconds),
-    equivalentDays: round1(totals.realSeconds / SECONDS_PER_DAY),
+    realSeconds,
+    realHours: toHours(realSeconds),
+    equivalentDays: round1(realSeconds / SECONDS_PER_DAY),
 
-    timelinePlayedSeconds: totals.timelineSeconds,
-    timelinePlayedHours: toHours(totals.timelineSeconds),
+    timelinePlayedSeconds: Math.round(summary.timelineSeconds),
+    timelinePlayedHours: toHours(summary.timelineSeconds),
 
-    uniqueCoverageSeconds,
-    uniqueCoverageHours: toHours(uniqueCoverageSeconds),
+    uniqueCoverageSeconds: Math.round(totals.coverageSeconds),
+    uniqueCoverageHours: toHours(totals.coverageSeconds),
 
-    newCoverageSeconds: totals.newCoverageSeconds,
-    newCoverageHours: toHours(totals.newCoverageSeconds),
+    newCoverageSeconds: Math.round(summary.newCoverageSeconds),
+    newCoverageHours: toHours(summary.newCoverageSeconds),
 
-    // Apportioned rather than measured: the session rows hold one speed each,
-    // so the honest conversion from re-watched timeline to real time is the
-    // scope's own ratio of real seconds to timeline seconds.
-    rewatchRealSeconds: Math.round(totals.realSeconds * rewatchShare),
-    rewatchShare: round2(rewatchShare),
+    // Measured, stint by stint, by the replay: the credited time of each stint
+    // that went on timeline its race had already covered.
+    rewatchRealSeconds: rewatchSeconds,
+    rewatchShare: round2(divide(rewatchSeconds, realSeconds)),
 
-    sessions: totals.sessions,
+    sessions: summary.sessions,
     firstWatchedAt: totals.firstWatchedAt,
     lastWatchedAt: totals.lastWatchedAt,
   };
 }
 
 function buildRaceTotals(scope: StatsScope): RaceTotals {
-  const window = scope.window;
+  const { summary } = scope;
 
-  let started = 0;
-  let completed = 0;
-  let storyComplete = 0;
   let unstarted = 0;
   let runtimeSum = 0;
   let longestRuntime = 0;
@@ -1021,33 +1294,34 @@ function buildRaceTotals(scope: StatsScope): RaceTotals {
   let majorEvents = 0;
   let majorEventsStoryComplete = 0;
 
-  for (const race of scope.races) {
+  for (const race of scope.inScope) {
+    const history = scope.timeline.races.get(race.id);
     runtimeSum += race.runtimeSec;
     longestRuntime = Math.max(longestRuntime, race.runtimeSec);
-    coverageRatioSum += divide(Math.min(race.coverageSec, race.runtimeSec), race.runtimeSec);
+    coverageRatioSum += divide(totalsFor(scope, race.id).coverageSeconds, race.runtimeSec);
 
-    if (race.startedAt === null) unstarted += 1;
-    if (isWithin(race.startedAt, window)) started += 1;
-    if (isWithin(race.completedAt, window)) completed += 1;
-    if (isWithin(race.storyCompletedAt, window)) storyComplete += 1;
+    if (history === undefined || history.firstStintAt === null) unstarted += 1;
     if (race.isMajorEvent) {
       majorEvents += 1;
-      if (isWithin(race.storyCompletedAt, window)) majorEventsStoryComplete += 1;
+      if (history !== undefined && isWithin(history.storyCompletedAt, scope.window)) majorEventsStoryComplete += 1;
     }
   }
 
-  const racesInScope = scope.races.length;
+  const racesInScope = scope.inScope.length;
+  // One number for one idea: completed is Story Complete in the replay, dated
+  // by the stint that completed it.
+  const completed = summary.storyCompletes;
 
   return {
     racesInScope,
-    racesStarted: started,
+    racesStarted: summary.racesStarted,
     racesCompleted: completed,
-    racesStoryComplete: storyComplete,
+    racesStoryComplete: completed,
     racesUnstarted: unstarted,
 
     completionPercent: percentOf(completed, racesInScope),
-    storyCompletePercent: percentOf(storyComplete, racesInScope),
-    startedCompletionPercent: percentOf(completed, started),
+    storyCompletePercent: percentOf(completed, racesInScope),
+    startedCompletionPercent: percentOf(completed, summary.racesStarted),
 
     averageRuntimeSec: Math.round(divide(runtimeSum, racesInScope)),
     averageRuntimeHours: toHours(divide(runtimeSum, racesInScope)),
@@ -1061,44 +1335,38 @@ function buildRaceTotals(scope: StatsScope): RaceTotals {
   };
 }
 
-function buildSessionTotals(scope: StatsScope, longest: LongestSessionView | null): SessionTotals {
-  const { totals } = scope;
-  const activeDays = scope.buckets.days.size;
+/** A stint the summary picked out, with the few figures the page shows beside it. */
+function sessionView(timeline: CareerTimeline, ref: StintRef | null): LongestSessionView | null {
+  if (ref === null) return null;
+  const stint = timeline.races.get(ref.raceId)?.stints.find((candidate) => candidate.sessionId === ref.sessionId);
+  return {
+    raceId: ref.raceId,
+    raceName: ref.raceName,
+    watchedAt: ref.at,
+    realSeconds: ref.creditedSeconds,
+    timelineSeconds: stint?.timelineSeconds ?? 0,
+    playbackSpeed: ref.playbackSpeed,
+  };
+}
+
+function buildSessionTotals(scope: StatsScope): SessionTotals {
+  const { summary, totals } = scope;
+  const longest = sessionView(scope.timeline, summary.longestSession);
+  const average = summary.averageSessionSeconds ?? 0;
 
   return {
-    sessions: totals.sessions,
-    averageRealSeconds: Math.round(divide(totals.realSeconds, totals.sessions)),
-    averageRealMinutes: round1(divide(totals.realSeconds, totals.sessions) / 60),
-    longestRealSeconds: totals.longestRealSeconds,
+    sessions: summary.sessions,
+    averageRealSeconds: Math.round(average),
+    averageRealMinutes: round1(average / 60),
+    longestRealSeconds: longest?.realSeconds ?? 0,
     longestSession: longest,
     // Weighted by timeline seconds rather than by session count, so a two-minute
     // stint at 3x cannot drag the average of a six-hour race.
     averagePlaybackSpeed: averagePlaybackSpeed([
-      { timelineSeconds: totals.timelineSeconds, realSeconds: totals.realSeconds },
+      { timelineSeconds: totals.timelineSeconds, realSeconds: totals.playbackRealSeconds },
     ]),
-    averageSessionsPerActiveDay: round2(divide(totals.sessions, activeDays)),
+    averageSessionsPerActiveDay: round2(divide(summary.sessions, summary.activeDays)),
   };
-}
-
-/**
- * Story completions per local month and per year, from the races in scope.
- *
- * Taken from `Race.storyCompletedAt` rather than from the session rows: a story
- * finishes once, on the day it finished, however many stints it took.
- */
-function storyCompletionsByPeriod(scope: StatsScope): { months: Map<string, number>; years: Map<number, number> } {
-  const months = new Map<string, number>();
-  const years = new Map<number, number>();
-
-  for (const race of scope.races) {
-    const at = race.storyCompletedAt;
-    if (at === null || !isWithin(at, scope.window)) continue;
-    const key = localDayKey(at).slice(0, 7);
-    months.set(key, (months.get(key) ?? 0) + 1);
-    years.set(at.getFullYear(), (years.get(at.getFullYear()) ?? 0) + 1);
-  }
-
-  return { months, years };
 }
 
 /**
@@ -1108,11 +1376,7 @@ function storyCompletionsByPeriod(scope: StatsScope): { months: Map<string, numb
  * gap in it invites the reader to wonder what went wrong; a chart with a quiet
  * month in it simply shows a quiet month, which is all it was.
  */
-function buildMonthlyStats(
-  buckets: ActivityBuckets,
-  storyCompletions: Map<string, number>,
-  range: DateWindow | null,
-): MonthlyStat[] {
+function buildMonthlyStats(buckets: ActivityBuckets, range: DateWindow | null, now: Date): MonthlyStat[] {
   let start: Date;
   let end: Date;
 
@@ -1125,8 +1389,7 @@ function buildMonthlyStats(
     if (first === undefined) return [];
     const [firstYear, firstMonth] = first.split('-');
     start = new Date(Number(firstYear), Number(firstMonth) - 1, 1, 0, 0, 0, 0);
-    const now = new Date();
-    end = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+    end = startOfNextMonth(now);
   }
 
   return monthWindowsBetween(start, end).map((month): MonthlyStat => {
@@ -1145,40 +1408,42 @@ function buildMonthlyStats(
       realSeconds,
       realHours: toHours(realSeconds),
       sessions,
-      activeDays: bucket?.days.size ?? 0,
+      activeDays: bucket?.activeDays ?? 0,
       newCoverageSeconds,
       newCoverageHours: toHours(newCoverageSeconds),
-      racesStoryComplete: storyCompletions.get(month.key) ?? 0,
+      racesStoryComplete: bucket?.storyCompletes ?? 0,
       averageSessionRealSeconds: Math.round(divide(realSeconds, sessions)),
     };
   });
 }
 
-function buildYearStats(buckets: ActivityBuckets, storyCompletions: Map<number, number>): YearStat[] {
-  return [...buckets.years.values()]
-    .map((bucket): YearStat => ({
-      year: bucket.year,
+function buildYearStats(buckets: ActivityBuckets): YearStat[] {
+  return [...buckets.years.entries()]
+    .map(([year, bucket]): YearStat => ({
+      year,
       realSeconds: bucket.realSeconds,
       realHours: toHours(bucket.realSeconds),
       sessions: bucket.sessions,
-      activeDays: bucket.days.size,
+      activeDays: bucket.activeDays,
       newCoverageSeconds: bucket.newCoverageSeconds,
-      racesStoryComplete: storyCompletions.get(bucket.year) ?? 0,
+      racesStoryComplete: bucket.storyCompletes,
     }))
     .sort((a, b) => b.year - a.year);
 }
 
 function buildCadence(scope: StatsScope, monthly: MonthlyStat[], years: YearStat[], now: Date): CadenceStats {
-  const { totals, buckets } = scope;
+  const { buckets, summary } = scope;
+  const realSeconds = summary.creditedSeconds;
 
   // The span the averages are taken over: the filtered window if there is one,
   // otherwise from the first session to today. Never longer than the career.
-  const start = scope.window?.start ?? totals.firstWatchedAt ?? now;
+  const start = scope.window?.start ?? summary.activeFrom ?? now;
   const windowEnd = scope.window?.end ?? now;
   const end = new Date(Math.min(windowEnd.getTime(), now.getTime()));
   const elapsedDays = Math.max(1, (end.getTime() - start.getTime()) / MS_PER_DAY);
   const elapsedWeeks = Math.max(1, elapsedDays / 7);
   const elapsedMonths = Math.max(1, monthly.length);
+  const activeMonths = [...buckets.months.values()].filter((month) => month.activeDays > 0).length;
 
   const recentMonths = monthly.slice(-STATS_CONFIG.recentMonthsWindow);
   const recentSeconds = recentMonths.reduce((sum, month) => sum + month.realSeconds, 0);
@@ -1196,21 +1461,21 @@ function buildCadence(scope: StatsScope, monthly: MonthlyStat[], years: YearStat
     null,
   );
   const mostActiveDayBucket = [...buckets.days.values()].reduce<DayBucket | null>(
-    (best, day) => (best === null || day.realSeconds > best.realSeconds ? day : best),
+    (best, day) => (day.realSeconds > 0 && (best === null || day.realSeconds > best.realSeconds) ? day : best),
     null,
   );
 
   return {
-    activeDays: buckets.days.size,
-    activeWeeks: buckets.weeks.size,
-    activeMonths: buckets.months.size,
+    activeDays: summary.activeDays,
+    activeWeeks: buckets.activeWeeks,
+    activeMonths,
     elapsedWeeks: round1(elapsedWeeks),
     elapsedMonths: monthly.length,
 
-    averageRealHoursPerWeek: round2(divide(totals.realSeconds / SECONDS_PER_HOUR, elapsedWeeks)),
-    averageRealHoursPerActiveWeek: round2(divide(totals.realSeconds / SECONDS_PER_HOUR, buckets.weeks.size)),
-    averageRealHoursPerMonth: round2(divide(totals.realSeconds / SECONDS_PER_HOUR, elapsedMonths)),
-    averageRealHoursPerActiveMonth: round2(divide(totals.realSeconds / SECONDS_PER_HOUR, buckets.months.size)),
+    averageRealHoursPerWeek: round2(divide(realSeconds / SECONDS_PER_HOUR, elapsedWeeks)),
+    averageRealHoursPerActiveWeek: round2(divide(realSeconds / SECONDS_PER_HOUR, buckets.activeWeeks)),
+    averageRealHoursPerMonth: round2(divide(realSeconds / SECONDS_PER_HOUR, elapsedMonths)),
+    averageRealHoursPerActiveMonth: round2(divide(realSeconds / SECONDS_PER_HOUR, activeMonths)),
 
     recentMonths: recentMonths.length,
     recentAverageRealHoursPerWeek: round2(divide(recentSeconds / SECONDS_PER_HOUR, Math.max(1, recentDays / 7))),
@@ -1242,6 +1507,7 @@ interface RaceGroup {
   racesStoryComplete: number;
   realSeconds: number;
   timelineSeconds: number;
+  playbackRealSeconds: number;
   uniqueCoverageSeconds: number;
   sessions: number;
   firstWatchedAt: Date | null;
@@ -1251,18 +1517,20 @@ interface RaceGroup {
 /**
  * Fold the races in scope into groups.
  *
- * Real viewing time always comes from the sessions in scope, and unique
- * coverage always from the race's own merged intervals, so a group's two time
- * figures answer the two different questions they are named for.
+ * Viewing time always comes from the part of each stint inside the window, and
+ * unique coverage from the race's own merged intervals, so a group's two time
+ * figures answer the two different questions they are named for. Started and
+ * completed are the replay's instants: a race's first stint, and the stint
+ * that completed its story.
  */
 function groupRaces(
   scope: StatsScope,
-  keyOf: (race: StatsRaceRow) => { key: string; name: string } | null,
+  keyOf: (race: StatsRaceRow, replayed: TimelineRaceRow | undefined) => { key: string; name: string } | null,
 ): RaceGroup[] {
   const groups = new Map<string, RaceGroup>();
 
-  for (const race of scope.races) {
-    const identity = keyOf(race);
+  for (const race of scope.inScope) {
+    const identity = keyOf(race, scope.timeline.racesById.get(race.id));
     if (identity === null) continue;
 
     const group = groups.get(identity.key) ?? {
@@ -1274,6 +1542,7 @@ function groupRaces(
       racesStoryComplete: 0,
       realSeconds: 0,
       timelineSeconds: 0,
+      playbackRealSeconds: 0,
       uniqueCoverageSeconds: 0,
       sessions: 0,
       firstWatchedAt: null,
@@ -1281,13 +1550,17 @@ function groupRaces(
     };
 
     const totals = totalsFor(scope, race.id);
+    const history = scope.timeline.races.get(race.id);
     group.races += 1;
-    if (isWithin(race.startedAt, scope.window)) group.racesStarted += 1;
-    if (isWithin(race.completedAt, scope.window)) group.racesCompleted += 1;
-    if (isWithin(race.storyCompletedAt, scope.window)) group.racesStoryComplete += 1;
+    if (history !== undefined && isWithin(history.firstStintAt, scope.window)) group.racesStarted += 1;
+    if (history !== undefined && isWithin(history.storyCompletedAt, scope.window)) {
+      group.racesCompleted += 1;
+      group.racesStoryComplete += 1;
+    }
     group.realSeconds += totals.realSeconds;
     group.timelineSeconds += totals.timelineSeconds;
-    group.uniqueCoverageSeconds += Math.min(race.coverageSec, race.runtimeSec);
+    group.playbackRealSeconds += totals.playbackRealSeconds;
+    group.uniqueCoverageSeconds += totals.coverageSeconds;
     group.sessions += totals.sessions;
     group.firstWatchedAt = earliest(group.firstWatchedAt, totals.firstWatchedAt);
     group.lastWatchedAt = latest(group.lastWatchedAt, totals.lastWatchedAt);
@@ -1314,13 +1587,13 @@ function toFavourite(group: RaceGroup, detail: string): FavouriteEntry {
   return {
     key: group.key,
     name: group.name,
-    realSeconds: group.realSeconds,
+    realSeconds: Math.round(group.realSeconds),
     realHours: toHours(group.realSeconds),
     sessions: group.sessions,
     races: group.races,
     racesCompleted: group.racesCompleted,
     racesStoryComplete: group.racesStoryComplete,
-    uniqueCoverageSeconds: group.uniqueCoverageSeconds,
+    uniqueCoverageSeconds: Math.round(group.uniqueCoverageSeconds),
     detail,
   };
 }
@@ -1358,14 +1631,14 @@ function buildChampionshipStats(
         racesCompleted: group.racesCompleted,
         racesStoryComplete: group.racesStoryComplete,
 
-        realSeconds: group.realSeconds,
+        realSeconds: Math.round(group.realSeconds),
         realHours: toHours(group.realSeconds),
-        timelinePlayedSeconds: group.timelineSeconds,
-        uniqueCoverageSeconds: group.uniqueCoverageSeconds,
+        timelinePlayedSeconds: Math.round(group.timelineSeconds),
+        uniqueCoverageSeconds: Math.round(group.uniqueCoverageSeconds),
         uniqueCoverageHours: toHours(group.uniqueCoverageSeconds),
         sessions: group.sessions,
         averagePlaybackSpeed: averagePlaybackSpeed([
-          { timelineSeconds: group.timelineSeconds, realSeconds: group.realSeconds },
+          { timelineSeconds: group.timelineSeconds, realSeconds: group.playbackRealSeconds },
         ]),
 
         completionPercent: percentOf(group.racesCompleted, group.races),
@@ -1382,7 +1655,7 @@ function buildCircuitStats(scope: StatsScope): CircuitStat[] {
   // A race with no circuit recorded is simply not a circuit, so it is left out
   // rather than folded into an "unknown" row that would sort above real ones.
   const displayNames = new Map<string, { name: string; country: string | null }>();
-  for (const race of scope.races) {
+  for (const race of scope.inScope) {
     if (race.circuitSlug === null) continue;
     if (!displayNames.has(race.circuitSlug)) {
       displayNames.set(race.circuitSlug, { name: race.circuit ?? race.circuitSlug, country: race.country });
@@ -1403,16 +1676,16 @@ function buildCircuitStats(scope: StatsScope): CircuitStat[] {
       racesInScope: group.races,
       racesCompleted: group.racesCompleted,
       racesStoryComplete: group.racesStoryComplete,
-      realSeconds: group.realSeconds,
+      realSeconds: Math.round(group.realSeconds),
       realHours: toHours(group.realSeconds),
-      uniqueCoverageSeconds: group.uniqueCoverageSeconds,
+      uniqueCoverageSeconds: Math.round(group.uniqueCoverageSeconds),
       sessions: group.sessions,
       lastWatchedAt: group.lastWatchedAt,
     }))
     .sort((a, b) => b.realSeconds - a.realSeconds || a.name.localeCompare(b.name));
 }
 
-function buildFavourites(scope: StatsScope, eventNames: Map<string, string>): FavouriteStats {
+function buildFavourites(scope: StatsScope): FavouriteStats {
   const championshipNames = new Map(scope.championships.map((row) => [row.id, row.name]));
   const championships = groupRaces(scope, (race) =>
     race.championshipId === null
@@ -1425,10 +1698,10 @@ function buildFavourites(scope: StatsScope, eventNames: Map<string, string>): Fa
   const circuits = groupRaces(scope, (race) =>
     race.circuitSlug === null ? null : { key: race.circuitSlug, name: race.circuit ?? race.circuitSlug },
   );
-  const events = groupRaces(scope, (race) =>
-    race.iconicKey === null
+  const events = groupRaces(scope, (_race, replayed) =>
+    replayed === undefined || replayed.eventKey === null
       ? null
-      : { key: race.iconicKey, name: eventNames.get(race.iconicKey) ?? race.name },
+      : { key: replayed.eventKey, name: replayed.eventName ?? replayed.eventKey },
   );
   const races = groupRaces(scope, (race) => ({ key: race.id, name: race.name }));
 
@@ -1453,21 +1726,253 @@ function buildFavourites(scope: StatsScope, eventNames: Map<string, string>): Fa
       : toFavourite(event, `${event.races} editions, ${event.racesStoryComplete} of them Story Complete.`),
     race: race === null
       ? null
-      : toFavourite(race, `${toHours(race.realSeconds)} real hours across ${race.sessions} sessions.`),
+      : toFavourite(race, `${toHours(race.realSeconds)} hours across ${race.sessions} sessions.`),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The replay's own breakdowns
+// ---------------------------------------------------------------------------
+
+function toGroupStat(row: GroupRow, href: string | null): GroupStat {
+  return {
+    id: row.id,
+    name: row.name,
+    accentColor: row.accent,
+    href,
+    realSeconds: Math.round(row.creditedSeconds),
+    realHours: toHours(row.creditedSeconds),
+    racesExperienced: row.racesExperienced,
+    storyCompletes: row.storyCompletes,
+    share: row.share,
+  };
+}
+
+/**
+ * The events that have a page: a key the replay found linked to its event row.
+ * A key typed onto a race and not yet linked has no page to open.
+ */
+function linkedEventKeys(timeline: CareerTimeline): Set<string> {
+  const keys = new Set<string>();
+  for (const race of timeline.racesById.values()) {
+    if (race.eventKey !== null && race.eventId !== null) keys.add(race.eventKey);
+  }
+  return keys;
+}
+
+function buildByWeekday(summary: WindowSummary, weekStartsOn: number): WeekdayStat[] {
+  return Array.from({ length: 7 }, (_, offset): WeekdayStat => {
+    const weekday = (((weekStartsOn + offset) % 7) + 7) % 7;
+    const bucket = summary.weekdays[weekday];
+    const realSeconds = Math.round(bucket?.creditedSeconds ?? 0);
+    const label = WEEKDAY_NAMES[weekday] ?? '';
+    return {
+      weekday,
+      label,
+      short: label.slice(0, 3),
+      realSeconds,
+      realHours: toHours(realSeconds),
+      sessions: bucket?.sessions ?? 0,
+    };
+  });
+}
+
+/** Races completed month by month, and in total by each month's end: a step line, never a streak. */
+function buildCompletionsOverTime(monthly: readonly MonthlyStat[], now: Date): CompletionsPoint[] {
+  let cumulative = 0;
+  return monthly
+    .filter((month) => month.start <= now)
+    .map((month) => {
+      cumulative += month.racesStoryComplete;
+      return { month: month.key, label: month.label, storyCompletes: month.racesStoryComplete, cumulative };
+    });
+}
+
+/**
+ * Story Completes year by year, oldest first, from the first year with
+ * viewing to the last. A quiet year between them stays in as an empty slot,
+ * so the bars read as a calendar and never close up the years around a gap.
+ */
+function buildStoryCompletesByYear(years: readonly YearStat[]): YearStoryCompletes[] {
+  if (years.length === 0) return [];
+  const byYear = new Map(years.map((year) => [year.year, year.racesStoryComplete]));
+  const first = Math.min(...byYear.keys());
+  const last = Math.max(...byYear.keys());
+  return Array.from({ length: last - first + 1 }, (_, offset): YearStoryCompletes => ({
+    year: first + offset,
+    storyCompletes: byYear.get(first + offset) ?? 0,
+  }));
+}
+
+/** When each landmark was reached, by kind. */
+interface LandmarkDates {
+  achievements: Date[];
+  masteryNodes: Date[];
+  milestones: Date[];
+}
+
+/**
+ * The keys of events merged into another. Their trees keep their own unlocks,
+ * but the steps now live — dated — in the event they were merged into, so a
+ * count of steps leaves those trees out, as the Mastery page does.
+ */
+async function mergedEventKeys(userId: string): Promise<string[]> {
+  const rows = await prisma.raceMastery.findMany({
+    where: { userId, mergedIntoId: { not: null } },
+    select: { key: true },
+  });
+  return rows.map((row) => row.key);
+}
+
+/** Leaves out the trees of events merged into another, when there are any. */
+function outsideMergedTrees(merged: readonly string[]): Prisma.MasteryTreeWhereInput {
+  if (merged.length === 0) return {};
+  return { OR: [{ kind: { not: 'RACE_EVENT' } }, { iconicKey: null }, { iconicKey: { notIn: [...merged] } }] };
+}
+
+/**
+ * When every achievement, mastery step and milestone was reached: the date the
+ * history places it at (`achievedAt`) where there is one, otherwise when it was
+ * recorded. Three reads of dates alone.
+ */
+async function loadLandmarkDates(userId: string, merged: Promise<string[]>): Promise<LandmarkDates> {
+  const trees = outsideMergedTrees(await merged);
+  const [achievements, masteryNodes, milestones] = await Promise.all([
+    prisma.achievementProgress.findMany({
+      where: { userId, unlockedAt: { not: null } },
+      select: { unlockedAt: true },
+    }),
+    prisma.masteryProgress.findMany({
+      where: { userId, unlockedAt: { not: null }, node: { tree: trees } },
+      select: { unlockedAt: true, achievedAt: true },
+    }),
+    prisma.milestoneProgress.findMany({
+      where: { userId, reachedAt: { not: null } },
+      select: { reachedAt: true, achievedAt: true },
+    }),
+  ]);
+  const dates = (rows: readonly (Date | null)[]) => rows.filter((at): at is Date => at !== null);
+  return {
+    achievements: dates(achievements.map((row) => row.unlockedAt)),
+    masteryNodes: dates(masteryNodes.map((row) => row.achievedAt ?? row.unlockedAt)),
+    milestones: dates(milestones.map((row) => row.achievedAt ?? row.reachedAt)),
+  };
+}
+
+/**
+ * Landmarks reached, cumulative, month by month: from the first landmark (or
+ * the start of the filtered year) to this month. Under a year filter only
+ * that year's landmarks count, so the lines start from zero in January.
+ */
+function buildLandmarksOverTime(dates: LandmarkDates, window: LocalWindow | null, now: Date): LandmarksPoint[] {
+  const inside = (at: Date) => at <= now && isWithin(at, window);
+  const all = [...dates.achievements, ...dates.masteryNodes, ...dates.milestones].filter(inside);
+  if (all.length === 0) return [];
+
+  const first = all.reduce((min, at) => (at < min ? at : min));
+  const start = window?.start ?? first;
+  const end = new Date(Math.min((window?.end ?? startOfNextMonth(now)).getTime(), startOfNextMonth(now).getTime()));
+
+  const perMonth = (list: readonly Date[]) => {
+    const counts = new Map<string, number>();
+    for (const at of list) {
+      if (!inside(at)) continue;
+      const key = monthPeriod(at).key;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  };
+  const achievements = perMonth(dates.achievements);
+  const masteryNodes = perMonth(dates.masteryNodes);
+  const milestones = perMonth(dates.milestones);
+
+  const running = { achievements: 0, masteryNodes: 0, milestones: 0 };
+  return monthWindowsBetween(start, end).map((month): LandmarksPoint => {
+    running.achievements += achievements.get(month.key) ?? 0;
+    running.masteryNodes += masteryNodes.get(month.key) ?? 0;
+    running.milestones += milestones.get(month.key) ?? 0;
+    return { month: month.key, label: month.label, ...running };
+  });
+}
+
+/** The level the ledger stood at just before an instant: the `levelAfter` of the last row before it. */
+async function levelBefore(userId: string, at: Date): Promise<number> {
+  const row = await prisma.xPTransaction.findFirst({
+    where: { userId, createdAt: { lt: at } },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: { levelAfter: true },
+  });
+  return row?.levelAfter ?? 1;
+}
+
+/**
+ * XP earned and levels gained inside a window of the ledger. Dated by the
+ * ledger's own `createdAt`: when the XP was actually awarded.
+ */
+async function ledgerWindow(userId: string, window: LocalWindow): Promise<{ xpEarned: number; levelsGained: number }> {
+  const [sum, before, after] = await Promise.all([
+    prisma.xPTransaction.aggregate({
+      where: { userId, createdAt: { gte: window.start, lt: window.end } },
+      _sum: { amount: true },
+    }),
+    levelBefore(userId, window.start),
+    levelBefore(userId, window.end),
+  ]);
+  return { xpEarned: sum._sum.amount ?? 0, levelsGained: Math.max(0, after - before) };
+}
+
+/**
+ * XP and levels for each year the page lists: one ledger aggregate per year,
+ * and the level at each year boundary — one read per boundary, shared by the
+ * two years that meet there. Bounded by the number of years, never by rows.
+ */
+async function loadXpAndLevelsByYear(userId: string, years: readonly number[]): Promise<XpYearStat[]> {
+  const sorted = [...new Set(years)].sort((a, b) => b - a);
+  if (sorted.length === 0) return [];
+
+  const boundaries = new Map<number, Date>();
+  for (const year of sorted) {
+    const window = yearWindow(year);
+    boundaries.set(window.start.getTime(), window.start);
+    boundaries.set(window.end.getTime(), window.end);
+  }
+  const [levels, sums] = await Promise.all([
+    Promise.all([...boundaries.entries()].map(async ([ms, at]) => [ms, await levelBefore(userId, at)] as const)),
+    Promise.all(sorted.map((year) => {
+      const window = yearWindow(year);
+      return prisma.xPTransaction.aggregate({
+        where: { userId, createdAt: { gte: window.start, lt: window.end } },
+        _sum: { amount: true },
+      });
+    })),
+  ]);
+  const levelAt = new Map(levels);
+
+  return sorted.map((year, index): XpYearStat => {
+    const window = yearWindow(year);
+    const before = levelAt.get(window.start.getTime()) ?? 1;
+    const after = levelAt.get(window.end.getTime()) ?? before;
+    return { year, xpEarned: sums[index]?._sum.amount ?? 0, levelsGained: Math.max(0, after - before) };
+  });
 }
 
 /** A human description of the current scope, for the heading above the figures. */
 function describeScope(
   filter: StatsFilter,
-  names: { championship: string | null; season: string | null; circuit: string | null },
+  names: { championship: string | null; season: string | null; circuit: string | null; event: string | null; race: string | null },
 ): string {
   const parts: string[] = [];
 
   if (filter.year !== undefined) parts.push(`${filter.year}`);
   if (names.championship !== null) parts.push(names.championship);
   if (names.season !== null) parts.push(names.season);
+  if (filter.eventKey !== undefined) parts.push(names.event ?? filter.eventKey);
+  if (filter.raceId !== undefined) parts.push(names.race ?? 'A race no longer in your library');
   if (names.circuit !== null) parts.push(names.circuit);
+  if (filter.length !== undefined) {
+    const band = DURATION_CLASSES.find((entry) => entry.key === filter.length);
+    if (band !== undefined) parts.push(`Races of ${band.label.toLowerCase()}`);
+  }
   if (filter.raceType !== undefined) parts.push(raceTypeLabel(filter.raceType));
 
   // Compact hour notation rather than the word, which keeps the label short
@@ -1493,41 +1998,44 @@ const STATUS_ORDER: readonly RaceStatus[] = [
 ];
 
 /**
- * The years that have something in them.
- *
- * Read from the span of the session history and then one aggregate per year
- * inside it, rather than by reading every session: the filter needs a short
- * list of years, and the number of years a career spans is a much smaller
- * quantity than the number of stints it holds.
+ * The races the Race select offers: those the rest of the filter chooses,
+ * most watched first (inside the chosen year, when there is one), capped.
+ * The race already chosen is always offered, so the select can show it.
  */
-async function loadActiveYears(userId: string): Promise<StatsYearOption[]> {
-  const span = await prisma.raceViewingSession.aggregate({
-    where: { userId },
-    _min: { watchedAt: true },
-    _max: { watchedAt: true },
-  });
+function raceOptions(
+  timeline: CareerTimeline,
+  candidates: readonly { id: string; name: string }[],
+  filter: StatsFilter,
+): StatsRaceOption[] {
+  const window = filter.year === undefined ? null : yearWindow(filter.year);
+  const options: { id: string; name: string; seconds: number }[] = [];
 
-  const first = span._min.watchedAt;
-  const last = span._max.watchedAt;
-  if (first === null || last === null) return [];
+  for (const candidate of candidates) {
+    const history = timeline.races.get(candidate.id);
+    if (window === null) {
+      options.push({ id: candidate.id, name: candidate.name, seconds: history?.creditedSeconds ?? 0 });
+      continue;
+    }
+    if (history === undefined) continue;
+    let seconds = 0;
+    let watched = false;
+    for (const stint of history.stints) {
+      const part = clipToWindow(stint.startsAt, stint.watchedAt, window);
+      if (part !== null) seconds += stint.creditedSeconds * part.fraction;
+      if (isWithin(stint.watchedAt, window)) watched = true;
+    }
+    if (watched || seconds > 0) options.push({ id: candidate.id, name: candidate.name, seconds });
+  }
 
-  const years: number[] = [];
-  for (let year = first.getFullYear(); year <= last.getFullYear(); year += 1) years.push(year);
-
-  const rows = await Promise.all(
-    years.map(async (year): Promise<StatsYearOption> => {
-      const window = yearWindow(year);
-      const aggregate = await prisma.raceViewingSession.aggregate({
-        where: { userId, watchedAt: { gte: window.start, lt: window.end } },
-        _sum: { realSeconds: true },
-        _count: true,
-      });
-      const realSeconds = aggregate._sum.realSeconds ?? 0;
-      return { year, sessions: aggregate._count, realSeconds, realHours: toHours(realSeconds) };
-    }),
-  );
-
-  return rows.filter((row) => row.sessions > 0).sort((a, b) => b.year - a.year);
+  options.sort((a, b) => b.seconds - a.seconds || a.name.localeCompare(b.name) || (a.id < b.id ? -1 : 1));
+  const offered = options.slice(0, CAREER_STATS_SHAPE.raceOptionLimit);
+  if (filter.raceId !== undefined && !offered.some((option) => option.id === filter.raceId)) {
+    const chosen = options.find((option) => option.id === filter.raceId);
+    const replayed = timeline.racesById.get(filter.raceId);
+    if (chosen !== undefined) offered.push(chosen);
+    else if (replayed !== undefined) offered.push({ id: replayed.id, name: replayed.name, seconds: 0 });
+  }
+  return offered.map((option) => ({ id: option.id, name: option.name, hours: toHours(option.seconds) }));
 }
 
 /**
@@ -1536,13 +2044,19 @@ async function loadActiveYears(userId: string): Promise<StatsYearOption[]> {
  * Nothing here is a fixed catalogue of motorsport. A year appears because
  * something was watched in it, a championship because the user made it, a
  * circuit because the user typed it — which is also why there is no figure
- * anywhere saying how much of "everything" these represent.
+ * anywhere saying how much of "everything" these represent. Years and events
+ * are read from the replay, so their hours are the page's own.
  */
-export async function getFilterOptions(userId: string): Promise<StatsFilterOptions> {
-  const [races, championships, seasons, years] = await Promise.all([
+export async function getFilterOptions(userId: string, filter: StatsFilter = {}): Promise<StatsFilterOptions> {
+  const offersRaces = filter.championshipId !== undefined || filter.eventKey !== undefined
+    || filter.year !== undefined || filter.raceId !== undefined;
+
+  const [timeline, weekStartsOn, races, championships, seasons, candidates] = await Promise.all([
+    getCareerTimeline(userId),
+    loadWeekStart(userId),
     prisma.race.findMany({
       where: { userId },
-      select: { circuit: true, circuitSlug: true, country: true, raceType: true, status: true, runtimeSec: true },
+      select: { circuit: true, circuitSlug: true, country: true, status: true, runtimeSec: true },
     }),
     prisma.championship.findMany({
       where: { userId },
@@ -1561,11 +2075,35 @@ export async function getFilterOptions(userId: string): Promise<StatsFilterOptio
       },
       orderBy: [{ year: 'desc' }],
     }),
-    loadActiveYears(userId),
+    offersRaces
+      ? prisma.race.findMany({
+          where: buildRaceScopeWhere(userId, { ...filter, raceId: undefined }),
+          select: { id: true, name: true },
+        })
+      : Promise.resolve([]),
   ]);
 
+  const lifetime = lifetimeSummary(timeline, weekStartsOn);
+  const years = [...lifetime.years.entries()]
+    .filter(([, bucket]) => bucket.sessions > 0 || bucket.creditedSeconds > 0)
+    .map(([year, bucket]): StatsYearOption => ({
+      year,
+      sessions: bucket.sessions,
+      realSeconds: Math.round(bucket.creditedSeconds),
+      realHours: toHours(bucket.creditedSeconds),
+    }))
+    .sort((a, b) => b.year - a.year);
+
+  const events = new Map<string, { name: string; seconds: number }>();
+  for (const race of timeline.racesById.values()) {
+    if (race.eventKey === null) continue;
+    const event = events.get(race.eventKey) ?? { name: race.eventName ?? race.eventKey, seconds: 0 };
+    event.seconds += timeline.races.get(race.id)?.creditedSeconds ?? 0;
+    events.set(race.eventKey, event);
+  }
+
   const circuits = new Map<string, StatsCircuitOption>();
-  const durations = new Map<RaceType, { races: number; min: number; max: number }>();
+  const lengths = new Map<string, number>();
   const statuses = new Map<RaceStatus, number>();
   let runtimeMin = Number.POSITIVE_INFINITY;
   let runtimeMax = 0;
@@ -1585,12 +2123,8 @@ export async function getFilterOptions(userId: string): Promise<StatsFilterOptio
       }
     }
 
-    const duration = durations.get(race.raceType) ??
-      { races: 0, min: Number.POSITIVE_INFINITY, max: 0 };
-    duration.races += 1;
-    duration.min = Math.min(duration.min, race.runtimeSec);
-    duration.max = Math.max(duration.max, race.runtimeSec);
-    durations.set(race.raceType, duration);
+    const band = durationClassOf(race.runtimeSec).key;
+    lengths.set(band, (lengths.get(band) ?? 0) + 1);
 
     statuses.set(race.status, (statuses.get(race.status) ?? 0) + 1);
     runtimeMin = Math.min(runtimeMin, race.runtimeSec);
@@ -1620,18 +2154,15 @@ export async function getFilterOptions(userId: string): Promise<StatsFilterOptio
 
     circuits: [...circuits.values()].sort((a, b) => b.races - a.races || a.name.localeCompare(b.name)),
 
-    durations: RACE_TYPE_PRESETS
-      .filter((preset) => durations.has(preset.type))
-      .map((preset): StatsDurationOption => {
-        const found = durations.get(preset.type);
-        return {
-          raceType: preset.type,
-          label: preset.label,
-          races: found?.races ?? 0,
-          minRuntimeHours: round1((found?.min ?? 0) / SECONDS_PER_HOUR),
-          maxRuntimeHours: round1((found?.max ?? 0) / SECONDS_PER_HOUR),
-        };
-      }),
+    events: [...events.entries()]
+      .map(([key, event]): StatsEventOption => ({ key, name: event.name, hours: toHours(event.seconds) }))
+      .sort((a, b) => b.hours - a.hours || a.name.localeCompare(b.name)),
+
+    races: offersRaces ? raceOptions(timeline, candidates, filter) : [],
+
+    lengths: DURATION_CLASSES
+      .filter((band) => lengths.has(band.key) || band.key === filter.length)
+      .map((band): StatsLengthOption => ({ key: band.key, label: band.label, races: lengths.get(band.key) ?? 0 })),
 
     statuses: STATUS_ORDER
       .filter((status) => statuses.has(status))
@@ -1713,7 +2244,7 @@ async function monthlyXpSeries(userId: string, start: Date, end: Date): Promise<
 
 /** The default XP window: the trailing months configuration asks for. */
 function defaultXpWindow(now: Date, months: number): DateWindow {
-  const end = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+  const end = startOfNextMonth(now);
   const start = new Date(end.getFullYear(), end.getMonth() - months, 1, 0, 0, 0, 0);
   return { start, end };
 }
@@ -1810,61 +2341,35 @@ export async function getLevelHistory(userId: string): Promise<LevelHistoryPoint
 // ===========================================================================
 
 /**
- * Real viewing seconds per local calendar day of one year.
+ * Viewing seconds per local calendar day of one year, from the replay.
  *
  * Only days with something on them are returned; the calendar fills its own
  * gaps. A quiet day is simply a day, and the grid says nothing about it.
  */
 export async function getActivityCalendar(userId: string, year: number): Promise<ActivityCalendarDay[]> {
-  const window = yearWindow(year);
-  const buckets = await loadActivityBuckets({
-    userId,
-    watchedAt: { gte: window.start, lt: window.end },
-  });
+  const [timeline, weekStartsOn] = await Promise.all([getCareerTimeline(userId), loadWeekStart(userId)]);
+  const summary = summariseWindow(timeline, yearWindow(year), windowOptions(weekStartsOn));
 
-  return [...buckets.days.values()]
-    .map((day): ActivityCalendarDay => ({
-      date: day.date,
-      realSeconds: day.realSeconds,
-      sessions: day.sessions,
-    }))
+  return [...bucketsFromSummary(summary).days.values()]
+    .filter((day) => day.realSeconds > 0 || day.sessions > 0)
+    .map((day): ActivityCalendarDay => ({ date: day.date, realSeconds: day.realSeconds, sessions: day.sessions }))
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
 /**
- * Month-by-month viewing, for one year or for the whole career.
- *
- * Real viewing time comes from the sessions; story completions come from the
- * races, dated by when the story finished. XP is deliberately not here — it has
- * its own series in `getXpHistory`, keyed by the same `YYYY-MM` so a chart can
- * put the two side by side without either engine guessing at the other.
+ * Month-by-month viewing, for one year or for the whole career, from the
+ * replay: viewing time over the stint windows, story completions at the
+ * stint that completed them. XP is deliberately not here — it has its own
+ * series in `getXpHistory`, keyed by the same `YYYY-MM` so a chart can put the
+ * two side by side without either engine guessing at the other.
  */
-export async function getMonthlyBreakdown(userId: string, year?: number): Promise<MonthlyStat[]> {
+export async function getMonthlyBreakdown(userId: string, year?: number, now: Date = new Date()): Promise<MonthlyStat[]> {
   const window = year === undefined ? null : yearWindow(year);
-
-  const [buckets, storyRaces] = await Promise.all([
-    loadActivityBuckets({
-      userId,
-      ...(window === null ? {} : { watchedAt: { gte: window.start, lt: window.end } }),
-    }),
-    prisma.race.findMany({
-      where: {
-        userId,
-        storyCompletedAt: window === null ? { not: null } : { gte: window.start, lt: window.end },
-      },
-      select: { storyCompletedAt: true },
-    }),
-  ]);
-
-  const storyByMonth = new Map<string, number>();
-  for (const race of storyRaces) {
-    const at = race.storyCompletedAt;
-    if (at === null) continue;
-    const key = localDayKey(at).slice(0, 7);
-    storyByMonth.set(key, (storyByMonth.get(key) ?? 0) + 1);
-  }
-
-  return buildMonthlyStats(buckets, storyByMonth, window);
+  const [timeline, weekStartsOn] = await Promise.all([getCareerTimeline(userId), loadWeekStart(userId)]);
+  const summary = window === null
+    ? lifetimeSummary(timeline, weekStartsOn)
+    : summariseWindow(timeline, window, windowOptions(weekStartsOn));
+  return buildMonthlyStats(bucketsFromSummary(summary), window, now);
 }
 
 // ===========================================================================
@@ -1884,11 +2389,13 @@ interface MasteryTotals {
  *
  * A championship's percentage is taken against that championship's own tree,
  * and the career figure against the trees this career actually has. Both are
- * scopes somebody defined by adding a championship or an event.
+ * scopes somebody defined by adding a championship or an event. The tree of an
+ * event merged into another is left out: its steps live on in the event it was
+ * merged into, and counting both would count each step twice.
  */
-async function loadMasteryTotals(userId: string): Promise<MasteryTotals> {
+async function loadMasteryTotals(userId: string, merged: Promise<string[]>): Promise<MasteryTotals> {
   const trees = await prisma.masteryTree.findMany({
-    where: { userId },
+    where: { userId, ...outsideMergedTrees(await merged) },
     select: {
       championshipId: true,
       nodes: { select: { progress: { where: { userId }, select: { unlockedAt: true } } } },
@@ -1920,7 +2427,8 @@ export async function getChampionshipBreakdown(
   userId: string,
   filter: StatsFilter = {},
 ): Promise<ChampionshipStat[]> {
-  const [scope, mastery] = await Promise.all([loadScope(userId, filter), loadMasteryTotals(userId)]);
+  const merged = mergedEventKeys(userId);
+  const [scope, mastery] = await Promise.all([loadScope(userId, filter), loadMasteryTotals(userId, merged)]);
   return buildChampionshipStats(scope, mastery.byChampionship);
 }
 
@@ -1943,7 +2451,9 @@ export async function getCircuitBreakdown(
  * Every figure is a record. A year that ran under its plan and a year that ran
  * over it are both simply reported, because the budget is a planning framework
  * and never a restriction — and because a past year's plan is kept on its own
- * row precisely so that re-balancing this year cannot rewrite it.
+ * row precisely so that re-balancing this year cannot rewrite it. The budget
+ * counts raw real time on the day a stint was logged, as the Viewing Budget
+ * page does.
  */
 export async function getBudgetHistory(userId: string): Promise<BudgetYearStat[]> {
   const now = new Date();
@@ -2129,28 +2639,34 @@ export async function getSeasonPassStats(userId: string): Promise<SeasonPassHist
 // ===========================================================================
 
 /**
- * Every figure the statistics page shows, for one scope.
+ * Every figure the core tabs show — Overview, Cadence, Breakdown and Career —
+ * for one scope.
  *
  * This is the only place the pieces are assembled, so the numbers on one page
- * are always mutually consistent: one load of the scope feeds the totals, the
- * breakdowns and the calendar alike, and nothing is counted twice by two
+ * are always mutually consistent: one summary of the replay feeds the totals,
+ * the breakdowns and the calendar alike, and nothing is counted twice by two
  * different queries that happened to run a second apart.
  *
- * Three of the series ignore the filter, because they are career-long by
- * nature and would be meaningless narrowed to a circuit: the level ladder, the
- * annual budget history and the challenge record. The XP series does follow a
- * year filter, since a year of XP is a perfectly sensible question.
+ * Some series ignore the race filters, because they are career-long by nature
+ * and would be meaningless narrowed to a circuit: the ledger (XP and levels),
+ * the landmarks, the annual budget history and the challenge record. The XP
+ * series and the landmarks do follow a year filter, since a year of either is
+ * a perfectly sensible question. `now` dates the year in progress; the page
+ * passes the clock.
  */
 export async function getStatistics(
   userId: string,
   filter: StatsFilter = {},
+  now: Date = new Date(),
 ): Promise<StatisticsView> {
-  const now = new Date();
   const scope = await loadScope(userId, filter);
+  const { summary } = scope;
   const xpWindow = scope.window ?? defaultXpWindow(now, STATS_CONFIG.xpHistoryDefaultMonths);
+  const monthly = buildMonthlyStats(scope.buckets, scope.window, now);
+  const years = buildYearStats(scope.buckets);
+  const merged = mergedEventKeys(userId);
 
   const [
-    longestSessionRow,
     achievementsUnlocked,
     mastery,
     seasonPasses,
@@ -2159,19 +2675,11 @@ export async function getStatistics(
     levelHistory,
     budgetHistory,
     profile,
-    eventNameRows,
-    season,
+    landmarks,
+    xpAndLevelsByYear,
   ] = await Promise.all([
-    prisma.raceViewingSession.findFirst({
-      where: buildSessionScopeWhere(userId, filter),
-      orderBy: { realSeconds: 'desc' },
-      select: {
-        raceId: true, watchedAt: true, realSeconds: true, timelineSeconds: true,
-        playbackSpeed: true, race: { select: { name: true } },
-      },
-    }),
     prisma.achievementProgress.count({ where: { userId, unlockedAt: { not: null } } }),
-    loadMasteryTotals(userId),
+    loadMasteryTotals(userId, merged),
     getSeasonPassStats(userId),
     getChallengeStats(userId),
     monthlyXpSeries(userId, xpWindow.start, xpWindow.end),
@@ -2181,72 +2689,27 @@ export async function getStatistics(
       where: { userId },
       select: { careerXp: true, level: true, prestige: true },
     }),
-    prisma.raceMastery.findMany({ where: { userId }, select: { key: true, name: true } }),
-    filter.seasonId === undefined
-      ? Promise.resolve(null)
-      // Scoped through the championship, which is where a season's ownership
-      // lives: this id is the raw `?season=` query parameter, so an unscoped
-      // read would put another career's season in this one's header.
-      : prisma.championshipSeason.findFirst({
-          where: { id: filter.seasonId, championship: { userId } },
-          select: { year: true, label: true, championship: { select: { name: true } } },
-        }),
+    loadLandmarkDates(userId, merged),
+    loadXpAndLevelsByYear(userId, years.map((year) => year.year)),
   ]);
 
-  const storyCompletions = storyCompletionsByPeriod(scope);
-  const monthly = buildMonthlyStats(scope.buckets, storyCompletions.months, scope.window);
-  const years = buildYearStats(scope.buckets, storyCompletions.years);
-
-  // Unique coverage is a per-race figure and is summed from the races in scope,
-  // never from the sessions: a re-watched hour appears twice in the session
-  // history and exactly once here, which is the whole point of the distinction.
-  const uniqueCoverageSeconds = scope.races.reduce(
-    (sum, race) => sum + Math.min(race.coverageSec, race.runtimeSec),
-    0,
-  );
-
   const races = buildRaceTotals(scope);
-  const championshipName = filter.championshipId === undefined
-    ? null
-    : scope.championships.find((row) => row.id === filter.championshipId)?.name ?? null;
-  const circuitName = filter.circuitSlug === undefined
-    ? null
-    : scope.races.find((race) => race.circuitSlug === filter.circuitSlug)?.circuit ?? filter.circuitSlug;
-  const seasonName = season === null
-    ? null
-    : season.label ?? `${season.championship.name} ${season.year}`;
-
-  const scopeLabel = describeScope(filter, {
-    championship: championshipName,
-    season: seasonName,
-    circuit: circuitName,
-  });
-
   const careerXp = profile === null ? 0 : Number(profile.careerXp);
   const levelState = levelFromXp(careerXp);
+  const linkedEvents = linkedEventKeys(scope.timeline);
 
   return {
     generatedAt: now,
     filter,
-    scopeLabel,
+    scopeLabel: scope.scopeLabel,
+    narrowed: narrowsRaces(filter),
+    careerWideNote: narrowsRaces(filter) ? CAREER_WIDE_XP_NOTE : null,
 
-    viewing: buildViewingTotals(scope, uniqueCoverageSeconds),
+    viewing: buildViewingTotals(scope),
     races,
-    sessions: buildSessionTotals(
-      scope,
-      longestSessionRow === null
-        ? null
-        : {
-            raceId: longestSessionRow.raceId,
-            raceName: longestSessionRow.race.name,
-            watchedAt: longestSessionRow.watchedAt,
-            realSeconds: longestSessionRow.realSeconds,
-            timelineSeconds: longestSessionRow.timelineSeconds,
-            playbackSpeed: longestSessionRow.playbackSpeed,
-          },
-    ),
+    sessions: buildSessionTotals(scope),
     cadence: buildCadence(scope, monthly, years, now),
-    favourites: buildFavourites(scope, new Map(eventNameRows.map((row) => [row.key, row.name]))),
+    favourites: buildFavourites(scope),
 
     completion: {
       achievements: {
@@ -2263,14 +2726,8 @@ export async function getStatistics(
       },
       masteryTreesCompleted: mastery.treesCompleted,
       masteryTreesTotal: mastery.treesTotal,
-      library: {
-        scope: scopeLabel,
-        percent: races.completionPercent,
-        done: races.racesCompleted,
-        total: races.racesInScope,
-      },
       storyLibrary: {
-        scope: scopeLabel,
+        scope: scope.scopeLabel,
         percent: races.storyCompletePercent,
         done: races.racesStoryComplete,
         total: races.racesInScope,
@@ -2290,6 +2747,33 @@ export async function getStatistics(
     levelHistory,
     budgetHistory,
 
+    rewatchSeconds: Math.round(summary.rewatchSeconds),
+    racesExperienced: summary.racesExperienced,
+    storyCompleteRate: summary.storyCompleteRate === null ? null : round1(summary.storyCompleteRate),
+    averageRaceCompletionPercent: summary.averageRaceCompletionPercent === null
+      ? null
+      : round1(summary.averageRaceCompletionPercent),
+    shortestMeaningfulSession: sessionView(scope.timeline, summary.shortestMeaningfulSession),
+    longestRace: summary.longestRace === null
+      ? null
+      : { raceId: summary.longestRace.raceId, name: summary.longestRace.name, runtimeSec: summary.longestRace.runtimeSec },
+    championshipsFollowed: summary.championshipsWatched,
+    eventsFollowed: summary.eventsWatched,
+    byEvent: summary.byEvent.map((row) =>
+      toGroupStat(row, row.id !== null && linkedEvents.has(row.id) ? eventHref(row.id) : null)),
+    byWeekday: buildByWeekday(summary, scope.weekStartsOn),
+    byDurationClass: summary.byDurationClass.map((row) => toGroupStat(row, null)),
+    storyCompletesByChampionship: summary.byChampionship
+      .filter((row) => row.storyCompletes > 0)
+      .map((row): StoryCompleteCount => ({
+        id: row.id, name: row.name, accentColor: row.accent, storyCompletes: row.storyCompletes,
+      }))
+      .sort((a, b) => b.storyCompletes - a.storyCompletes || a.name.localeCompare(b.name)),
+    storyCompletesByYear: buildStoryCompletesByYear(years),
+    completionsOverTime: buildCompletionsOverTime(monthly, now),
+    landmarksOverTime: buildLandmarksOverTime(landmarks, scope.window, now),
+    xpAndLevelsByYear,
+
     career: {
       level: profile?.level ?? levelState.level,
       prestige: profile?.prestige ?? prestigeForLevel(levelState.level),
@@ -2300,5 +2784,239 @@ export async function getStatistics(
     },
 
     note: STATISTICS_NOTE,
+  };
+}
+
+// ===========================================================================
+// Personal Records
+// ===========================================================================
+
+/** One improvement of a record, as the page shows it. */
+export interface RecordEntry {
+  kind: RecordKind;
+  label: string;
+  value: number;
+  unit: RecordEvent['unit'];
+  valueText: string;
+  at: Date;
+  /** When, in words: the day, seven days, month or year a period record covers, or the day it was set. */
+  when: string;
+  /** The race or event that set it, with its page while it still has one. */
+  subject: { name: string; href: string | null } | null;
+  /** It rests on when stints were logged, so the page marks it (`RECORDS_LOGGED_TIME_NOTE`). */
+  loggedTime: boolean;
+}
+
+/** A record standing now, and every improvement that led to it, newest first. */
+export interface RecordCard extends RecordEntry {
+  history: RecordEntry[];
+}
+
+export interface RecordsView {
+  scopeLabel: string;
+  /** Kept within this year (the year filter): "Your best in 2027". Null for career records. */
+  withinYear: number | null;
+  /** The races are narrowed by a filter. */
+  narrowed: boolean;
+  /** Only records that are set, in `RECORD_ORDER`. */
+  records: RecordCard[];
+  /** The rest, named once: "most Story Completes in a year, …". */
+  stillToBeSet: string[];
+  /** Shown under the grid when a card carries the mark. */
+  loggedTimeNote: string | null;
+}
+
+/** Periods read as themselves; stints and races read as the day they happened. */
+const PERIOD_KINDS = new Set<RecordKind>([
+  'most-in-a-day', 'most-in-seven-days', 'most-in-a-month', 'most-completions-in-a-month',
+  'most-story-completes-in-a-year', 'most-new-coverage-in-a-day',
+]);
+
+/** Records measured from the first stint to the last: they can run to days, so they read as such. */
+const ELAPSED_KINDS = new Set<RecordKind>(['fastest-long-race-completion', 'longest-start-to-finish']);
+
+function recordValueText(event: RecordEvent): string {
+  if (event.unit === 'editions') return `${event.value} editions`;
+  if (event.unit === 'count') return `${event.value}`;
+  return ELAPSED_KINDS.has(event.kind) ? formatElapsed(event.value) : formatDuration(event.value);
+}
+
+function recordEntry(event: RecordEvent, timeline: CareerTimeline, linkedEvents: ReadonlySet<string>): RecordEntry {
+  let subject: RecordEntry['subject'] = null;
+  if (event.kind === 'longest-edition-streak' && event.eventKey !== null) {
+    subject = { name: event.detail, href: linkedEvents.has(event.eventKey) ? eventHref(event.eventKey) : null };
+  } else if (event.raceId !== null) {
+    subject = { name: event.detail, href: timeline.racesById.has(event.raceId) ? `/races/${event.raceId}` : null };
+  }
+  return {
+    kind: event.kind,
+    label: event.label,
+    value: event.value,
+    unit: event.unit,
+    valueText: recordValueText(event),
+    at: event.at,
+    when: PERIOD_KINDS.has(event.kind) ? event.detail : longDate(event.at),
+    subject,
+    loggedTime: event.basis === 'logged-time',
+  };
+}
+
+/**
+ * Personal Records inside a filter: the records standing, each with every
+ * improvement that led to it. With a year filter they are the best within
+ * that year ("your best in 2027"); otherwise the career's.
+ */
+export async function getRecords(userId: string, filter: StatsFilter = {}): Promise<RecordsView> {
+  const context = await loadFilterContext(userId, filter);
+  const progression = computeRecordProgression(context.timeline, {
+    ...careerRecordOptions(context.weekStartsOn),
+    include: context.include,
+    within: filter.year === undefined ? undefined : yearWindow(filter.year),
+  });
+
+  const linkedEvents = linkedEventKeys(context.timeline);
+  const records = currentRecords(progression).map((current): RecordCard => ({
+    ...recordEntry(current, context.timeline, linkedEvents),
+    history: progression
+      .filter((event) => event.kind === current.kind)
+      .map((event) => recordEntry(event, context.timeline, linkedEvents))
+      .reverse(),
+  }));
+  const set = new Set(records.map((record) => record.kind));
+  const rollingDays = careerRecordOptions(context.weekStartsOn).rollingDays;
+
+  return {
+    scopeLabel: context.scopeLabel,
+    withinYear: filter.year ?? null,
+    narrowed: narrowsRaces(filter),
+    records,
+    stillToBeSet: RECORD_ORDER
+      .filter((kind) => !set.has(kind))
+      .map((kind) => {
+        const label = recordLabel(kind, rollingDays);
+        return `${label.charAt(0).toLowerCase()}${label.slice(1)}`;
+      }),
+    loggedTimeNote: records.some((record) => record.loggedTime) ? RECORDS_LOGGED_TIME_NOTE : null,
+  };
+}
+
+// ===========================================================================
+// Two years compared
+// ===========================================================================
+
+export type { CompareGroupRow, CompareRow };
+
+export interface YearComparisonView {
+  /** The calendar years the career spans, newest first. A comparison needs two. */
+  years: number[];
+  /** The base year and the year compared with it; null while there is nothing to compare. */
+  a: number | null;
+  b: number | null;
+  /** Either year is the one in progress, so both can be cut to the same stretch of the year. */
+  samePeriodOffered: boolean;
+  samePeriod: boolean;
+  /** "1 January to 26 September", when both years are cut to the same stretch. */
+  stretchLabel: string | null;
+  /** The race filters, in words; a comparison ignores the year filter. */
+  scopeLabel: string;
+  narrowed: boolean;
+  /** Said beside XP and levels while a filter narrows the races: those are the whole career's. */
+  careerWideNote: string | null;
+  rows: CompareRow[];
+  championships: CompareGroupRow[];
+  events: CompareGroupRow[];
+  /** Credited seconds, month by month, side by side. */
+  months: { month: number; a: number; b: number }[];
+  /** "Your 2026 chapter began on 22 September", said first when it applies. */
+  partialNote: string | null;
+  /** Said instead of a comparison while the career spans a single calendar year. */
+  emptyNote: string | null;
+}
+
+/**
+ * Two calendar years side by side (`compareSummaries`), inside the race
+ * filters. `a` is the base: differences are `b − a`. Years that are missing or
+ * outside the career fall back to the previous year and the current one, and
+ * a base equal to `b` falls back to the year before `b` (the newest other
+ * year, when `b` is the career's first).
+ *
+ * When either year is the one in progress, both are cut by default to the
+ * same stretch of the year — 1 January to this moment's date and time in
+ * each — so a year still under way is never compared with a whole one.
+ * XP and levels come from the ledger for the same windows, and are the whole
+ * career's whatever the race filters say.
+ */
+export async function getYearComparison(
+  userId: string,
+  a: number | undefined,
+  b: number | undefined,
+  options: { samePeriod?: boolean; filter?: StatsFilter } = {},
+  now: Date = new Date(),
+): Promise<YearComparisonView> {
+  const filter: StatsFilter = { ...(options.filter ?? {}), year: undefined };
+  const context = await loadFilterContext(userId, filter);
+  const currentYear = now.getFullYear();
+  const first = context.timeline.stints[0]?.watchedAt ?? null;
+  const last = context.timeline.stints[context.timeline.stints.length - 1]?.watchedAt ?? null;
+  const firstYear = first?.getFullYear() ?? currentYear;
+  const lastYear = Math.max(currentYear, last?.getFullYear() ?? currentYear);
+
+  const years: number[] = [];
+  if (first !== null) for (let year = lastYear; year >= firstYear; year -= 1) years.push(year);
+
+  const base = {
+    years,
+    scopeLabel: context.scopeLabel,
+    narrowed: narrowsRaces(filter),
+    careerWideNote: narrowsRaces(filter) ? CAREER_WIDE_XP_NOTE : null,
+  };
+
+  if (years.length < 2) {
+    return {
+      ...base,
+      a: null, b: null, samePeriodOffered: false, samePeriod: false, stretchLabel: null,
+      rows: [], championships: [], events: [], months: [], partialNote: null,
+      emptyNote: `Comparisons open once your career spans two calendar years. Your first year ends on 31 December ${firstYear}.`,
+    };
+  }
+
+  const valid = (year: number | undefined): year is number => year !== undefined && years.includes(year);
+  const newest = years[0]!;
+  const yearB = valid(b) ? b : newest;
+  // A year compared with itself says "the same" on every row, so the base
+  // falls back to another year then too. The career spans two, so one exists.
+  const yearA = valid(a) && a !== yearB
+    ? a
+    : years.find((year) => year < yearB) ?? years.find((year) => year !== yearB)!;
+
+  const samePeriodOffered = yearA === currentYear || yearB === currentYear;
+  const samePeriod = samePeriodOffered && options.samePeriod !== false;
+  const windowFor = (year: number): LocalWindow => (
+    samePeriod ? { start: yearWindow(year).start, end: samePeriodEnd(year, now) } : yearWindow(year)
+  );
+
+  const side = async (year: number): Promise<CompareSide> => {
+    const window = windowFor(year);
+    const summary = summariseWindow(context.timeline, window, windowOptions(context.weekStartsOn, context.include));
+    const ledger = await ledgerWindow(userId, window);
+    const began = first !== null && first.getFullYear() === year && first > yearWindow(year).start ? first : null;
+    return { ...summary, year, xpEarned: ledger.xpEarned, levelsGained: ledger.levelsGained, careerBeganInYear: began };
+  };
+  const [sideA, sideB] = await Promise.all([side(yearA), side(yearB)]);
+  const compared = compareSummaries(sideA, sideB);
+
+  return {
+    ...base,
+    a: yearA,
+    b: yearB,
+    samePeriodOffered,
+    samePeriod,
+    stretchLabel: samePeriod ? `1 January to ${now.getDate()} ${MONTH_NAMES[now.getMonth()]}` : null,
+    rows: compared.rows,
+    championships: compared.championships,
+    events: compared.events,
+    months: compared.months.map((month) => ({ month: month.month, a: Math.round(month.a), b: Math.round(month.b) })),
+    partialNote: compared.partialNote,
+    emptyNote: null,
   };
 }
