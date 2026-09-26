@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation';
 import { PageHeader } from '@/components/layout/page-header';
 import { EditRaceForm } from '@/components/races/edit-race-form';
-import { getChampionshipOptions, getIconicKeysInUse, getRaceDetail } from '@/lib/server/races';
+import { getChampionshipOptions, getEventOptions, getRaceDetail } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
 
@@ -13,10 +13,10 @@ export default async function EditRacePage(props: PageProps<'/races/[id]/edit'>)
   await ensureCareer(userId);
   const { id } = await props.params;
 
-  const [race, championships, iconicKeys] = await Promise.all([
+  const [race, championships, events] = await Promise.all([
     getRaceDetail(userId, id),
     getChampionshipOptions(userId),
-    getIconicKeysInUse(userId),
+    getEventOptions(userId),
   ]);
   if (!race) notFound();
 
@@ -36,7 +36,7 @@ export default async function EditRacePage(props: PageProps<'/races/[id]/edit'>)
           accentColor: c.accentColor,
           seasons: c.seasons.map((s) => ({ id: s.id, year: s.year, raceCount: s._count.races })),
         }))}
-        iconicKeysInUse={iconicKeys}
+        events={events}
       />
     </div>
   );

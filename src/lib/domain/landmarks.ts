@@ -115,8 +115,18 @@ function nthEditionStint(
   return null;
 }
 
-/** Every event's stints, canonical order, keyed by event key. */
+/** `stintsByEvent`, once per replay. */
+const eventStintCache = new WeakMap<CareerTimeline, Map<string, StintEvent[]>>();
+
+/**
+ * Every event's stints, canonical order, keyed by event key. Worked out once
+ * per replay: an account's event steps are dated together, seventeen an
+ * event, and filtering every stint of the career again for each one would be
+ * nearly all the cost of dating them on a long career.
+ */
 function stintsByEvent(timeline: CareerTimeline): Map<string, StintEvent[]> {
+  const cached = eventStintCache.get(timeline);
+  if (cached !== undefined) return cached;
   const byEvent = new Map<string, StintEvent[]>();
   for (const stint of timeline.stints) {
     const key = timeline.racesById.get(stint.raceId)?.eventKey;
@@ -125,6 +135,7 @@ function stintsByEvent(timeline: CareerTimeline): Map<string, StintEvent[]> {
     if (list) list.push(stint);
     else byEvent.set(key, [stint]);
   }
+  eventStintCache.set(timeline, byEvent);
   return byEvent;
 }
 
@@ -217,7 +228,7 @@ export function eventStepInstant(
   metric: string,
   threshold: number,
 ): InstantResult | null {
-  const stints = timeline.stints.filter((stint) => timeline.racesById.get(stint.raceId)?.eventKey === eventKey);
+  const stints = stintsByEvent(timeline).get(eventKey) ?? [];
   switch (metric) {
     case 'editionsStoryComplete': {
       const stint = nthEditionStint(timeline, stints, threshold, (candidate) => candidate.completesStory);

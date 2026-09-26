@@ -22,6 +22,7 @@ import type {
   AchievementUnlock, ChallengeCompletion, HallOfFameAward, MasteryUnlock, MilestoneUnlock,
   SeasonPassTierUnlock, TrophyAward,
 } from './contracts';
+import { carriedEventStepCopies } from './mastery-engine';
 
 export interface StintUnlocks {
   achievements: AchievementUnlock[];
@@ -97,6 +98,7 @@ export async function reconstructStintUnlocks(
     db.masteryProgress.findMany({
       where: { userId, unlockedAt: within },
       select: {
+        unlockedAt: true,
         node: {
           select: {
             key: true, name: true, description: true, rarity: true, xpReward: true,
@@ -124,6 +126,23 @@ export async function reconstructStintUnlocks(
     db.hallOfFameEntry.findMany({ where: { userId, occurredAt: within } }),
   ]);
 
+  // A merge copies the merged event's steps, dates and all, into the event it
+  // joins; the copies were not unlocked by this stint, the originals were.
+  const carried = await carriedEventStepCopies(db, userId, mastery.flatMap((m) =>
+    m.unlockedAt === null ? [] : [{ treeKey: m.node.tree.key, nodeKey: m.node.key, unlockedAt: m.unlockedAt }]));
+  const reached = mastery.filter((m) => !carried.has(`${m.node.tree.key}:${m.node.key}`));
+
+  // What each mastery node actually paid: an event step reached on editions
+  // that had already paid that kind of step elsewhere was recorded XP-free
+  // (0.4.0), and its node's reward is not what it gave.
+  const masteryKeys = reached.map((m) => `mastery:${m.node.tree.key}:${m.node.key}`);
+  const masteryPaid = masteryKeys.length === 0
+    ? new Map<string, number>()
+    : new Map((await db.xPTransaction.findMany({
+      where: { userId, dedupeKey: { in: masteryKeys } },
+      select: { dedupeKey: true, amount: true },
+    })).map((row) => [row.dedupeKey, row.amount]));
+
   return {
     achievements: achievements.map((a) => ({
       key: a.achievement.key,
@@ -145,14 +164,14 @@ export async function reconstructStintUnlocks(
         value: m.valueAtReach ?? m.threshold,
         xpAwarded: m.xpAwarded,
       })),
-    mastery: mastery.map((m) => ({
+    mastery: reached.map((m) => ({
       treeKey: m.node.tree.key,
       treeName: m.node.tree.name,
       nodeKey: m.node.key,
       nodeName: m.node.name,
       description: m.node.description,
       rarity: m.node.rarity,
-      xpAwarded: m.node.xpReward,
+      xpAwarded: masteryPaid.get(`mastery:${m.node.tree.key}:${m.node.key}`) ?? 0,
       treeProgress: 0,
       treeCompleted: false,
     })),

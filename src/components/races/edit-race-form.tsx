@@ -6,6 +6,10 @@
  * Deliberately a flat form rather than the staged Add Race flow: when you are
  * correcting one field you want to see all of them. Changing the runtime
  * re-derives completion, which the page says out loud.
+ *
+ * The race's recurring event is preselected, and choosing another moves the
+ * race there. Whatever it helped its old event reach stays reached, and is
+ * never paid a second time in the new one.
  */
 
 import * as React from 'react';
@@ -15,17 +19,19 @@ import type { RaceDetail } from '@/lib/server/races';
 import type { ChampionshipOption } from './add-race-form';
 import { Button, Field, Input, Select, Textarea, Toggle } from '@/components/ui/controls';
 import { Panel, PanelBody, PanelHeader } from '@/components/ui/primitives';
-import { MAJOR_EVENT_SUGGESTIONS, RACE_TYPE_PRESETS } from '@/lib/config/championships';
+import { RACE_TYPE_PRESETS } from '@/lib/config/championships';
 import { formatTimestamp } from '@/lib/domain/time';
 import { updateRaceAction } from '@/lib/server/actions';
 import { cn } from '@/lib/utils';
+import { EventPicker, type EventChoice } from './event-picker';
 
 export function EditRaceForm({
-  race, championships, iconicKeysInUse,
+  race, championships, events,
 }: {
   race: RaceDetail;
   championships: ChampionshipOption[];
-  iconicKeysInUse: { key: string; count: number }[];
+  /** The account's recurring events, by name. */
+  events: EventChoice[];
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
@@ -36,11 +42,16 @@ export function EditRaceForm({
   const [excitement, setExcitement] = React.useState(race.excitement);
   const [duration, setDuration] = React.useState(formatTimestamp(race.scheduledDurationSec));
 
-  const knownIconicKeys = React.useMemo(() => {
-    const keys = new Map(MAJOR_EVENT_SUGGESTIONS.map((s) => [s.key, s.name]));
-    for (const used of iconicKeysInUse) if (!keys.has(used.key)) keys.set(used.key, used.key);
-    return [...keys.entries()];
-  }, [iconicKeysInUse]);
+  const [eventChoice, setEventChoice] = React.useState(race.event?.key ?? '');
+  const [newEventName, setNewEventName] = React.useState('');
+
+  // The race's own event is always in the list, even one the list would not
+  // otherwise offer (an archived event, or a 0.3.x key not yet recomputed).
+  const eventChoices = React.useMemo(() => {
+    const own = race.event;
+    if (own === null || events.some((event) => event.key === own.key)) return events;
+    return [...events, { key: own.key, name: own.name, editions: 0 }];
+  }, [events, race.event]);
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
@@ -173,14 +184,15 @@ export function EditRaceForm({
             <Toggle checked={isMajorEvent} onChange={setIsMajorEvent} label="Major event" />
             <input type="hidden" name="isMajorEvent" value={isMajorEvent ? 'true' : 'false'} />
 
-            {isMajorEvent ? (
-              <Field label="Recurring event" hint="Links editions of the same event into a lifetime history">
-                <Input name="iconicKey" defaultValue={race.iconicKey ?? ''} list="iconic-keys-edit" />
-                <datalist id="iconic-keys-edit">
-                  {knownIconicKeys.map(([key, name]) => <option key={key} value={key}>{name}</option>)}
-                </datalist>
-              </Field>
-            ) : null}
+            <EventPicker
+              idPrefix="edit-race"
+              events={eventChoices}
+              value={eventChoice}
+              onChange={setEventChoice}
+              newName={newEventName}
+              onNewNameChange={setNewEventName}
+              error={errors.eventKey ?? errors.newEventName}
+            />
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

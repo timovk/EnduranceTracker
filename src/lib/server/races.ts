@@ -10,9 +10,11 @@ import type { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/db/client';
 import { STORY_CONFIG } from '@/lib/config';
 import { creditedSeconds } from '@/lib/domain/career-timeline';
+import { editionIdentity, editionYear } from '@/lib/domain/edition';
 import { coverageSeconds, fromRows, gapsIn, resumePoint } from '@/lib/domain/intervals';
 import { estimateRemaining } from '@/lib/domain/playback';
 import type { Interval, RacePriority, RaceStatus, RaceType } from '@/lib/domain/types';
+import { eventDisplayName, eventHref } from '@/lib/engines/mastery-engine';
 import type { RaceCardData } from '@/components/races/race-card';
 
 export interface RaceFilter {
@@ -45,6 +47,7 @@ const RACE_SELECT = {
 const RACE_DETAIL_SELECT = {
   ...RACE_SELECT,
   creditedViewingSec: true,
+  raceMastery: { select: { key: true, name: true, displayName: true } },
   sessions: {
     select: {
       id: true, startTimestampSec: true, endTimestampSec: true, playbackSpeed: true,
@@ -142,6 +145,11 @@ export interface RaceDetail {
   excitement: number;
   isMajorEvent: boolean;
   iconicKey: string | null;
+  /**
+   * The recurring event this race is an edition of (0.4.0): its key, the
+   * name the user sees and the edition's year. Null when it is in none.
+   */
+  event: { key: string; name: string; editionYear: number | null; href: string } | null;
   notes: string | null;
   replayUrl: string | null;
   posterUrl: string | null;
@@ -224,6 +232,18 @@ export async function getRaceDetail(userId: string, raceId: string): Promise<Rac
     excitement: race.excitement,
     isMajorEvent: race.isMajorEvent,
     iconicKey: race.iconicKey,
+    event: race.iconicKey === null
+      ? null
+      : {
+        key: race.iconicKey,
+        // The link names the event once it exists; until the next recompute
+        // links a key typed by hand, the name is the one derived from the key.
+        name: race.raceMastery !== null && race.raceMastery.key === race.iconicKey
+          ? (race.raceMastery.displayName ?? race.raceMastery.name)
+          : eventDisplayName(race.iconicKey),
+        editionYear: editionYear({ raceDate: race.raceDate, seasonYear: race.season?.year ?? null }),
+        href: eventHref(race.iconicKey),
+      },
     notes: race.notes,
     replayUrl: race.replayUrl,
     posterUrl: race.posterUrl,
@@ -304,17 +324,43 @@ export async function getChampionshipOptions(userId: string) {
   });
 }
 
-/** Distinct iconic-event keys already in use, for the Add Race suggestions. */
-export async function getIconicKeysInUse(userId: string): Promise<{ key: string; count: number }[]> {
-  const rows = await prisma.race.groupBy({
-    by: ['iconicKey'],
-    where: { userId, iconicKey: { not: null } },
-    _count: true,
-  });
-  return rows
-    .filter((r): r is typeof r & { iconicKey: string } => r.iconicKey !== null)
-    .map((r) => ({ key: r.iconicKey, count: r._count }))
-    .sort((a, b) => b.count - a.count);
+/** One of the account's recurring events, for the race forms' event list. */
+export interface EventOption {
+  key: string;
+  name: string;
+  /** Editions of it in the library: races, with two of one year counted once. */
+  editions: number;
+}
+
+/**
+ * The account's active events (neither archived nor merged), by name, for the
+ * "Recurring event" list of the race forms and the Events page's merge
+ * dialog.
+ */
+export async function getEventOptions(userId: string): Promise<EventOption[]> {
+  const [events, races] = await Promise.all([
+    prisma.raceMastery.findMany({
+      where: { userId, archivedAt: null, mergedIntoId: null },
+      select: { key: true, name: true, displayName: true },
+    }),
+    prisma.race.findMany({
+      where: { userId, iconicKey: { not: null } },
+      select: { id: true, iconicKey: true, raceDate: true, season: { select: { year: true } } },
+    }),
+  ]);
+
+  const editions = new Map<string, Set<string>>();
+  for (const race of races) {
+    if (race.iconicKey === null) continue;
+    const identity = editionIdentity({ id: race.id, raceDate: race.raceDate, seasonYear: race.season?.year ?? null });
+    const set = editions.get(race.iconicKey) ?? new Set<string>();
+    set.add(identity);
+    editions.set(race.iconicKey, set);
+  }
+
+  return events
+    .map((event) => ({ key: event.key, name: event.displayName ?? event.name, editions: editions.get(event.key)?.size ?? 0 }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
 }
 
 export const STORY_COMPLETE_THRESHOLDS = STORY_CONFIG;

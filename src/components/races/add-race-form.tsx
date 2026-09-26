@@ -7,6 +7,10 @@
  * duration; naming a circuit is enough; a championship can be created inline
  * rather than sending the user away to make one first. Everything beyond the
  * name, type and duration is optional and tucked into a second section.
+ *
+ * The recurring event is guessed from the name once it is typed — the same
+ * name without its year as an edition already in an event — and picked for
+ * the user, who can change it. It is only ever a guess until they save.
  */
 
 import * as React from 'react';
@@ -14,10 +18,12 @@ import { useRouter } from 'next/navigation';
 import { Plus, Star } from 'lucide-react';
 import { Button, Field, Input, Select, Textarea, Toggle } from '@/components/ui/controls';
 import { Panel, PanelBody, PanelHeader } from '@/components/ui/primitives';
-import { MAJOR_EVENT_SUGGESTIONS, RACE_TYPE_PRESETS } from '@/lib/config/championships';
+import { RACE_TYPE_PRESETS } from '@/lib/config/championships';
 import { formatTimestamp } from '@/lib/domain/time';
 import { createRaceAction } from '@/lib/server/actions';
+import { suggestEventForNameAction } from '@/lib/server/career-actions';
 import { cn } from '@/lib/utils';
+import { EventPicker, type EventChoice } from './event-picker';
 
 export interface ChampionshipOption {
   id: string;
@@ -28,10 +34,11 @@ export interface ChampionshipOption {
 }
 
 export function AddRaceForm({
-  championships, iconicKeysInUse, redirectTo = '/races',
+  championships, events, redirectTo = '/races',
 }: {
   championships: ChampionshipOption[];
-  iconicKeysInUse: { key: string; count: number }[];
+  /** The account's recurring events, by name. */
+  events: EventChoice[];
   redirectTo?: string;
 }) {
   const router = useRouter();
@@ -44,8 +51,16 @@ export function AddRaceForm({
   const [championshipId, setChampionshipId] = React.useState('');
   const [creatingChampionship, setCreatingChampionship] = React.useState(false);
   const [isMajorEvent, setIsMajorEvent] = React.useState(false);
-  const [iconicKey, setIconicKey] = React.useState('');
+  const [eventChoice, setEventChoice] = React.useState('');
+  const [newEventName, setNewEventName] = React.useState('');
+  /**
+   * Once the user picks an event themselves, the guess never overrides them.
+   * A ref, so a guess still on its way when they pick reads their choice.
+   */
+  const eventTouched = React.useRef(false);
+  const [guessedEvent, setGuessedEvent] = React.useState<string | null>(null);
   const [showOptional, setShowOptional] = React.useState(false);
+  const formRef = React.useRef<HTMLFormElement>(null);
   const [excitement, setExcitement] = React.useState(3);
 
   /** Picking a race type fills in the nominal duration, but never locks it. */
@@ -55,11 +70,23 @@ export function AddRaceForm({
     if (preset && type !== 'CUSTOM') setDuration(formatTimestamp(preset.defaultHours * 3600));
   }
 
-  const knownIconicKeys = React.useMemo(() => {
-    const keys = new Map(MAJOR_EVENT_SUGGESTIONS.map((s) => [s.key, s.name]));
-    for (const used of iconicKeysInUse) if (!keys.has(used.key)) keys.set(used.key, used.key);
-    return [...keys.entries()];
-  }, [iconicKeysInUse]);
+  /**
+   * When the name is typed, pick the event it looks like an edition of, unless
+   * the user already chose. A guess the new name no longer supports is taken
+   * back, so a corrected name never saves the race into the old guess's event.
+   */
+  async function guessEvent(name: string) {
+    if (eventTouched.current) return;
+    const circuit = formRef.current ? new FormData(formRef.current).get('circuit') : null;
+    const guess = name.trim() === '' || events.length === 0
+      ? null
+      : await suggestEventForNameAction(name, typeof circuit === 'string' ? circuit : undefined).catch(() => null);
+    if (eventTouched.current) return;
+    // Untouched, the choice is either nothing or an earlier guess.
+    const known = guess !== null && events.some((event) => event.key === guess.key);
+    setEventChoice(known ? guess.key : '');
+    setGuessedEvent(known ? guess.name : null);
+  }
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
@@ -75,12 +102,18 @@ export function AddRaceForm({
   }
 
   return (
-    <form action={onSubmit} className="space-y-4">
+    <form ref={formRef} action={onSubmit} className="space-y-4">
       <Panel>
         <PanelHeader title="The race" />
         <PanelBody className="space-y-4">
           <Field label="Race name" required error={errors.name} hint="For example, 6 Hours of Fuji">
-            <Input name="name" placeholder="6 Hours of Fuji" required autoFocus />
+            <Input
+              name="name"
+              placeholder="6 Hours of Fuji"
+              required
+              autoFocus
+              onBlur={(event) => { void guessEvent(event.target.value); }}
+            />
           </Field>
 
           <div className="grid gap-4 sm:grid-cols-2">
@@ -194,25 +227,18 @@ export function AddRaceForm({
             </div>
           </div>
 
-          {isMajorEvent ? (
-            <Field
-              label="Recurring event"
-              hint="Links editions of the same event together, so it builds a lifetime history"
-            >
-              <Input
-                name="iconicKey"
-                value={iconicKey}
-                onChange={(e) => setIconicKey(e.target.value)}
-                list="iconic-keys"
-                placeholder="le-mans-24"
-              />
-              <datalist id="iconic-keys">
-                {knownIconicKeys.map(([key, name]) => (
-                  <option key={key} value={key}>{name}</option>
-                ))}
-              </datalist>
-            </Field>
-          ) : null}
+          <EventPicker
+            idPrefix="add-race"
+            events={events}
+            value={eventChoice}
+            onChange={(value) => { setEventChoice(value); eventTouched.current = true; setGuessedEvent(null); }}
+            newName={newEventName}
+            onNewNameChange={setNewEventName}
+            error={errors.eventKey ?? errors.newEventName}
+            hint={guessedEvent !== null
+              ? `Looks like an edition of ${guessedEvent}, so it is picked for you. Change it if it is not.`
+              : undefined}
+          />
         </PanelBody>
       </Panel>
 

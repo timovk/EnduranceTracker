@@ -164,7 +164,7 @@ export async function computeCareerMetricsWithHistory(
   userId: string,
   db: Tx = prisma,
 ): Promise<{ metrics: CareerMetrics; history: TimelineInputs }> {
-  const [raceRows, sessions, profile, counts, seasons, masteryTrees, passes] =
+  const [raceRows, sessions, profile, counts, seasons, masteryTrees, passes, mergedEvents] =
     await Promise.all([
       db.race.findMany({
         where: { userId },
@@ -189,9 +189,13 @@ export async function computeCareerMetricsWithHistory(
       }),
       db.masteryTree.findMany({
         where: { userId },
-        select: { id: true, nodes: { select: { id: true, progress: { where: { userId }, select: { unlockedAt: true } } } } },
+        select: {
+          id: true, kind: true, iconicKey: true,
+          nodes: { select: { id: true, progress: { where: { userId }, select: { unlockedAt: true } } } },
+        },
       }),
       db.seasonPass.findMany({ where: { userId }, select: { tier: true } }),
+      db.raceMastery.findMany({ where: { userId, mergedIntoId: { not: null } }, select: { key: true } }),
     ]);
 
   const races = raceRows.map((row) => ({ row, timeline: toTimelineRaceRow(row) }));
@@ -311,8 +315,13 @@ export async function computeCareerMetricsWithHistory(
   }
 
   m.masteryNodesUnlocked = masteryNodesUnlocked;
+  // A merged event's tree is not counted (0.4.0): its steps were carried into
+  // the event it joined, so counting both would make one tree two, and merging
+  // a finished event into a new one would finish another tree for a click.
+  const merged = new Set(mergedEvents.map((event) => event.key));
   m.masteryTreesCompleted = masteryTrees.filter(
-    (t) => t.nodes.length > 0 && t.nodes.every((n) => n.progress.some((p) => p.unlockedAt !== null)),
+    (t) => !(t.kind === 'RACE_EVENT' && t.iconicKey !== null && merged.has(t.iconicKey))
+      && t.nodes.length > 0 && t.nodes.every((n) => n.progress.some((p) => p.unlockedAt !== null)),
   ).length;
   m.achievementsUnlocked = achievementsUnlocked;
   m.challengesCompleted = challengesCompleted;

@@ -1,6 +1,6 @@
 import { PageHeader } from '@/components/layout/page-header';
 import { AddRaceForm } from '@/components/races/add-race-form';
-import { getChampionshipOptions, getIconicKeysInUse } from '@/lib/server/races';
+import { getChampionshipOptions, getEventOptions } from '@/lib/server/races';
 import { ensureCareer } from '@/lib/server/bootstrap';
 import { requireUserId } from '@/lib/auth/session';
 
@@ -10,9 +10,9 @@ export const metadata = { title: 'Add a race' };
 export default async function AddRacePage() {
   const userId = await requireUserId();
   await ensureCareer(userId);
-  const [championships, iconicKeys] = await Promise.all([
+  const [championships, events] = await Promise.all([
     getChampionshipOptions(userId),
-    getIconicKeysInUse(userId),
+    getEventOptions(userId),
   ]);
 
   return (
@@ -30,7 +30,7 @@ export default async function AddRacePage() {
           accentColor: c.accentColor,
           seasons: c.seasons.map((s) => ({ id: s.id, year: s.year, raceCount: s._count.races })),
         }))}
-        iconicKeysInUse={iconicKeys}
+        events={events}
       />
     </div>
   );

@@ -27,6 +27,13 @@
  *                   made to exist exactly when the replay says the race is
  *                   complete — a bonus a 0.3.x runtime edit skipped is paid,
  *                   career XP only. Chunks of races, in id order.
+ *   P2  events      The event trees brought up to date (the steps added in
+ *                   0.4.0 inserted, the renamed ones renamed), the event
+ *                   caches recomputed, and the steps synced: every step an
+ *                   event had already reached is credited to its races
+ *                   first, then the new steps an event had already passed
+ *                   are paid once — on editions that have not paid that kind
+ *                   of step anywhere. One chunk.
  *   P3  milestones  The ladders synced, the new Career Milestone rungs a
  *                   career had already passed written and paid once, and
  *                   every undated milestone and event step dated from the
@@ -49,7 +56,8 @@ import { prisma } from '@/lib/db/client';
 import { buildCareerTimeline, type CareerTimeline } from '@/lib/domain/career-timeline';
 import { syncMilestones } from '@/lib/engines/achievement-engine';
 import { fillLandmarkDates, syncCareerMilestones } from '@/lib/engines/career-milestone-engine';
-import { loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
+import { loadTimelineInputs, type TimelineInputs } from '@/lib/engines/career-timeline-engine';
+import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from '@/lib/engines/mastery-engine';
 import { computeCareerMetricsWithHistory } from '@/lib/engines/metrics';
 import { reconcileStoryBonus, storyBonusKey } from '@/lib/engines/progression-resync';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
@@ -62,7 +70,7 @@ export const CAREER_BACKFILL_KEY = 'careerBackfill';
 export const CAREER_BACKFILL_VERSION = '0.4.0';
 
 /** The phases this build runs, in order. */
-export const CAREER_BACKFILL_PHASES = ['P1', 'P3'] as const;
+export const CAREER_BACKFILL_PHASES = ['P1', 'P2', 'P3'] as const;
 export type PhaseKey = (typeof CAREER_BACKFILL_PHASES)[number];
 
 /**
@@ -201,11 +209,13 @@ export interface PhaseContext {
   userId: string;
   now: Date;
   timeline: CareerTimeline;
+  /** The stints and races the replay was built from. */
+  history: TimelineInputs;
 }
 
 export async function buildPhaseContext(userId: string, now: Date): Promise<PhaseContext> {
-  const inputs = await loadTimelineInputs(prisma, userId);
-  return { userId, now, timeline: buildCareerTimeline(inputs.sessions, inputs.races) };
+  const history = await loadTimelineInputs(prisma, userId);
+  return { userId, now, timeline: buildCareerTimeline(history.sessions, history.races), history };
 }
 
 export interface RaceChunkResult {
@@ -288,6 +298,45 @@ export async function backfillRaces(tx: Tx, ctx: PhaseContext, chunk: readonly s
 }
 
 /**
+ * P2, inside its transaction: the recurring events.
+ *
+ *   - `ensureMasteryTrees` inserts the steps 0.4.0 appended into every event
+ *     tree that exists, and gives the renamed steps their new names.
+ *   - `recomputeRaceMasteries` recounts every event's editions — two races
+ *     of one year are one edition — with credited hours.
+ *   - `syncMastery` credits every step an event had already reached to the
+ *     races that reach it, before it pays anything, and then pays the new
+ *     steps an event had already passed, once, on editions that have not
+ *     helped pay that kind of step anywhere (§4.2.5).
+ *
+ * With `dating`, the steps it unlocked are dated from the replay at once: for
+ * an account whose milestone phase already ran under an earlier build, so
+ * nothing waits for the next stint to be dated.
+ */
+export async function backfillEventProgression(
+  tx: Tx,
+  userId: string,
+  now: Date,
+  dating?: { history: TimelineInputs; timeline: CareerTimeline },
+): Promise<{ unlocked: number; xp: number; credits: number; filled: number; recognised: number }> {
+  const creditsBefore = await tx.eventStepCredit.count({ where: { userId } });
+  await ensureMasteryTrees(tx, userId, now);
+  await recomputeRaceMasteries(tx, userId, now);
+  const steps = (await syncMastery(tx, userId, now)).filter((unlock) => unlock.treeKey.startsWith('event:'));
+  const credits = (await tx.eventStepCredit.count({ where: { userId } })) - creditsBefore;
+  const dates = dating === undefined
+    ? { milestones: 0, eventSteps: 0, recognised: 0 }
+    : await fillLandmarkDates(tx, userId, { history: dating.history, now, timeline: dating.timeline });
+  return {
+    unlocked: steps.length,
+    xp: steps.reduce((sum, step) => sum + step.xpAwarded, 0),
+    credits,
+    filled: dates.milestones + dates.eventSteps,
+    recognised: dates.recognised,
+  };
+}
+
+/**
  * P3, inside its transaction: the ladders, the new Career Milestone rungs a
  * career had already passed (written and paid once), and a date for every
  * milestone and event step without one — rows reached since the history
@@ -328,6 +377,9 @@ export interface CareerBackfillSummary {
   legacyRacesRepaired: number;
   storyBonusesAwarded: number;
   storyBonusesRevoked: number;
+  eventStepsUnlocked: number;
+  eventStepXp: number;
+  creditsWritten: number;
   milestonesCreated: number;
   milestoneXp: number;
   datesFilled: number;
@@ -340,6 +392,7 @@ function emptySummary(userId: string): CareerBackfillSummary {
   return {
     userId, completed: false, skipped: false, pausedBefore: null,
     racesCredited: 0, legacyRacesRepaired: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
+    eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
     milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
     leftovers: { orphanedViewingRows: 0, storyBonusesOfDeletedRaces: 0 },
   };
@@ -445,6 +498,23 @@ export async function runCareerBackfillFor(
       }
     }
 
+    if (phase === 'P2') {
+      if (!clock.shouldStartChunk(estimate)) {
+        summary.pausedBefore = { phase, cursor: null };
+        return summary;
+      }
+      const ctx = await contextFor();
+      // An account whose milestones were done by an earlier build dates the
+      // steps this phase unlocks here; otherwise the milestone phase does.
+      const dating = marker.done.includes('P3') ? { history: ctx.history, timeline: ctx.timeline } : undefined;
+      const result = await chunk(withPhaseDone(marker, phase, now), (tx) => backfillEventProgression(tx, userId, now, dating));
+      summary.eventStepsUnlocked += result.unlocked;
+      summary.eventStepXp += result.xp;
+      summary.creditsWritten += result.credits;
+      summary.datesFilled += result.filled;
+      summary.datesRecognised += result.recognised;
+    }
+
     if (phase === 'P3') {
       if (!clock.shouldStartChunk(estimate)) {
         summary.pausedBefore = { phase, cursor: null };
@@ -486,6 +556,8 @@ export function describeCareerBackfill(summary: CareerBackfillSummary, name?: st
   const work =
     `credited ${count(summary.racesCredited)} races, ${count(summary.legacyRacesRepaired)} legacy races repaired, ` +
     `story bonuses +${count(summary.storyBonusesAwarded)}/−${count(summary.storyBonusesRevoked)}; ` +
+    `${count(summary.eventStepsUnlocked)} event steps (+${count(summary.eventStepXp)} XP), ` +
+    `${count(summary.creditsWritten)} credits; ` +
     `${count(summary.milestonesCreated)} new milestones (+${count(summary.milestoneXp)} XP), ` +
     `${count(summary.datesFilled)} dates filled, ${count(summary.datesRecognised)} recorded only`;
   if (summary.pausedBefore === null) return `[career-backfill] ${who}: ${work}`;

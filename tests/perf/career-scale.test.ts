@@ -21,12 +21,15 @@ import { buildCareerTimeline } from '@/lib/domain/career-timeline';
 import { yearWindow } from '@/lib/domain/calendar';
 import { computeRecordProgression } from '@/lib/domain/records';
 import { summariseWindow } from '@/lib/domain/window-summary';
-import { getCareerTimeline, loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
+import { clearCareerTimelineCache, getCareerTimeline, loadTimelineInputs } from '@/lib/engines/career-timeline-engine';
+import {
+  getEventLegacy, getEventsIndex, linkRaces, mergeEvents, renameEvent, unlinkRace,
+} from '@/lib/engines/event-legacy-engine';
 import { deleteRace, deleteViewingSession } from '@/lib/engines/session-engine';
 import {
-  backfillMilestones, backfillRaces, buildPhaseContext, runCareerBackfillFor,
+  backfillEventProgression, backfillMilestones, backfillRaces, buildPhaseContext, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
-import { ledgerProblems, logStint } from '../helpers/career-db';
+import { eventStepProblems, ledgerProblems, logStint } from '../helpers/career-db';
 import type { LargeCareerDatabase, SeededCareer } from '../helpers/large-career-db';
 import { createLargeCareerDatabase } from '../helpers/large-career-db';
 import type { SyntheticCareer } from '../helpers/synthetic-career';
@@ -231,6 +234,65 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
     expect(milestones.result.filled).toBeGreaterThan(0);
     expect(milestones.ms).toBeLessThan(5_000);
     expect(await prisma.milestoneProgress.count({ where: { userId: large.userId, achievedPrecision: null } })).toBe(0);
+  }, SLOW);
+
+  it('backfills a career’s recurring events (P2) in one chunk, under 5 s, crediting every step they had reached', async () => {
+    // As 0.3.2 left them: steps reached, and no record of which races reached them.
+    for (const career of [real, large]) await prisma.eventStepCredit.deleteMany({ where: { userId: career.userId } });
+    const realP2 = await timedAsync(() =>
+      prisma.$transaction((tx) => backfillEventProgression(tx as Tx, real.userId, real.now), CHUNK_TRANSACTION));
+    const largeP2 = await timedAsync(() =>
+      prisma.$transaction((tx) => backfillEventProgression(tx as Tx, large.userId, large.now), CHUNK_TRANSACTION));
+    expect(realP2.result.credits).toBeGreaterThan(0);
+    expect(largeP2.result.credits).toBeGreaterThan(10_000);
+    expect(realP2.ms).toBeLessThan(5_000);
+    expect(largeP2.ms).toBeLessThan(5_000);
+    expect(await eventStepProblems(large.userId)).toEqual([]);
+  }, SLOW);
+
+  it('logs a stint that reads every event-step credit in under 1 s for a real career and 6 s for a large one', async () => {
+    expect(await prisma.eventStepCredit.count({ where: { userId: large.userId } })).toBeGreaterThan(10_000);
+    const realLog = await timedAsync(() => logStint(real.userId, real.openRaceId, { from: 2_400, to: 3_000, now: real.now }));
+    const largeLog = await timedAsync(() => logStint(large.userId, large.openRaceId, { from: 2_400, to: 3_000, now: large.now }));
+    expect(realLog.ms).toBeLessThan(1_000);
+    expect(largeLog.ms).toBeLessThan(6_000);
+  }, SLOW);
+
+  it('renames, links, unlinks and merges events in under 1 s for a real career and 6 s for a large one', async () => {
+    const EVENT_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
+    for (const [career, limit] of [[real, 1_000], [large, 6_000]] as const) {
+      const outside = `${career.userId.replace('-user', '')}-race-1`;
+      const timings = {
+        rename: await timedAsync(() => prisma.$transaction(
+          (tx) => renameEvent(tx as Tx, career.userId, 'event-0', 'The Opening Classic'), EVENT_TRANSACTION)),
+        link: await timedAsync(() => prisma.$transaction(
+          (tx) => linkRaces(tx as Tx, career.userId, 'event-0', [outside], career.now), EVENT_TRANSACTION)),
+        unlink: await timedAsync(() => prisma.$transaction(
+          (tx) => unlinkRace(tx as Tx, career.userId, outside, career.now), EVENT_TRANSACTION)),
+        merge: await timedAsync(() => prisma.$transaction(
+          (tx) => mergeEvents(tx as Tx, career.userId, 'event-3', 'event-0', career.now), EVENT_TRANSACTION)),
+      };
+      expect(timings.link.result).toBe(1);
+      expect(timings.merge.result.racesMoved).toBeGreaterThan(0);
+      for (const [name, timing] of Object.entries(timings)) {
+        expect(timing.ms, `${career.userId} ${name}`).toBeLessThan(limit);
+      }
+    }
+    expect(await eventStepProblems(large.userId)).toEqual([]);
+  }, SLOW);
+
+  it('builds an event’s page in under 3 s cold and 800 ms warm, and the Events page, for a large career', async () => {
+    clearCareerTimelineCache(large.userId);
+    const cold = await timedAsync(() => getEventLegacy(large.userId, 'event-0'));
+    const warm = await timedAsync(() => getEventLegacy(large.userId, 'event-0'));
+    const index = await timedAsync(() => getEventsIndex(large.userId));
+    const realPage = await timedAsync(() => getEventLegacy(real.userId, 'event-0'));
+    expect(cold.result).not.toBeNull();
+    expect(index.result.events.length).toBeGreaterThan(30);
+    expect(cold.ms).toBeLessThan(3_000);
+    expect(warm.ms).toBeLessThan(800);
+    expect(index.ms).toBeLessThan(3_000);
+    expect(realPage.ms).toBeLessThan(500);
   }, SLOW);
 
   it('deletes a stint from the last month in under 1 s for a real career and 2 s for a large one', async () => {

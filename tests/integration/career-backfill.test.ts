@@ -4,10 +4,10 @@
  * A career recorded before 0.4.0 has what 0.4.0 needs only in its stints: no
  * credited time on its races, no dates on its milestones, none of the new
  * rungs, and perhaps a race whose runtime was shortened after it was watched.
- * The backfill brings it up to date in phases — P1 the races, P3 the
- * milestones — each chunk in its own transaction together with the marker
- * that records it, so a start that runs out of time loses nothing and the
- * next one carries on.
+ * The backfill brings it up to date in phases — P1 the races, P2 the
+ * recurring events, P3 the milestones — each chunk in its own transaction
+ * together with the marker that records it, so a start that runs out of time
+ * loses nothing and the next one carries on.
  *
  * The careers here are logged through the real engine and then put back the
  * way 0.3.2 would have left them (`asRecordedBy032`), so the backfill's dates
@@ -26,8 +26,9 @@ import {
   type CareerBackfillSummary, deadlineClock, describeCareerBackfill, describeLeftovers, isCareerBackfillApplied,
   markCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
+import { MASTERY_CONFIG } from '@/lib/config';
 import {
-  addRace, createCareerUser, H, insertLegacyShortenedRace, ledgerProblems, logStint,
+  addRace, createCareerUser, eventStepProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
 
 const DATED = '00000000-0000-4000-8000-0000000004b1';
@@ -41,9 +42,10 @@ const NEVER_SERVED = '00000000-0000-4000-8000-0000000004b8';
 const EARLIER_BUILD = '00000000-0000-4000-8000-0000000004b9';
 const LEFTOVERS = '00000000-0000-4000-8000-0000000004ba';
 const SOMEONE_ELSE = '00000000-0000-4000-8000-0000000004bb';
+const EVENTS = '00000000-0000-4000-8000-0000000004bc';
 const USERS = [
   DATED, REPLAY_LATER, RACES, INTERRUPTED, UNINTERRUPTED, SERVED_RECENTLY, SERVED_LONG_AGO, NEVER_SERVED,
-  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE,
+  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS,
 ];
 
 /** The first start after the update. */
@@ -312,6 +314,86 @@ describe('P1: races', () => {
   });
 });
 
+describe('P2: events', () => {
+  /** The steps 0.4.0 appended to every event tree, and the names 0.3.2 gave the six it renamed. */
+  const APPENDED = MASTERY_CONFIG.raceEventNodes.slice(8).map((node) => node.key);
+  const NAMES_032: Record<string, string> = {
+    edition_1: 'First Edition', edition_3: 'Three Editions', edition_5: 'Five Editions', edition_10: 'A Decade of Editions',
+    consecutive_3: 'Three in a Row', consecutive_5: 'Five in a Row',
+  };
+
+  /**
+   * Put the account's events back the way 0.3.2 left them, on top of
+   * `asRecordedBy032`: event trees without the appended steps (nor anything
+   * they paid), the old names, and no credits.
+   */
+  async function eventsAsRecordedBy032(userId: string): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+      const db = tx as Tx;
+      const keys = (await db.xPTransaction.findMany({
+        where: { userId, dedupeKey: { startsWith: 'mastery:event:' } },
+        select: { dedupeKey: true },
+      })).flatMap((row) => (APPENDED.some((node) => row.dedupeKey?.endsWith(`:${node}`)) ? [row.dedupeKey!] : []));
+      await settleLedger(db, userId, [await revokeXpByDedupeKeys(db, userId, keys)]);
+      await db.masteryNode.deleteMany({ where: { key: { in: APPENDED }, tree: { userId, kind: 'RACE_EVENT' } } });
+      for (const [key, name] of Object.entries(NAMES_032)) {
+        await db.masteryNode.updateMany({ where: { key, tree: { userId, kind: 'RACE_EVENT' } }, data: { name } });
+      }
+      await db.eventStepCredit.deleteMany({ where: { userId } });
+    });
+    await asRecordedBy032(userId);
+  }
+
+  it('credits every step an event had reached and pays the new steps it had passed, once, then dates them', async () => {
+    await createCareerUser(EVENTS, 'CareerBackfillTest Events');
+    const races: string[] = [];
+    for (const [index, year] of [2023, 2024, 2025].entries()) {
+      const raceId = await addRace(EVENTS, { name: `${year} Backfill Classic`, hours: 1, iconicKey: 'backfill-classic', raceDate: new Date(Date.UTC(year, 5, 1)) });
+      const at = new Date(2025, 8, 1 + index, 20, 0);
+      // The first is watched whole; the other two for a quarter of an hour, which is enough to have experienced them.
+      await logStint(EVENTS, raceId, { from: 0, to: index === 0 ? H : 15 * 60, watchedAt: at, now: at });
+      races.push(raceId);
+    }
+    await eventsAsRecordedBy032(EVENTS);
+    // A build before this one had already run the race and milestone phases.
+    await prisma.configOverride.create({
+      data: { userId: EVENTS, key: CAREER_BACKFILL_KEY, value: { version: '0.4.0', done: ['P1', 'P3'], cursors: {}, lastRunAt: null } },
+    });
+    expect(await prisma.masteryNode.count({ where: { tree: { userId: EVENTS, kind: 'RACE_EVENT' } } })).toBe(8);
+
+    const summary = await runCareerBackfillFor(EVENTS, { now: STARTED, clock: PLENTY_OF_TIME });
+    // Only the new phase ran: the first experienced edition (recorded, no XP) and three experienced editions (300).
+    expect(summary).toMatchObject({ completed: true, racesCredited: 0, eventStepsUnlocked: 2, eventStepXp: 300, milestonesCreated: 0 });
+    // Credits: the complete edition for First Complete Edition, and all three for each experienced step.
+    expect(summary.creditsWritten).toBe(1 + 3 + 3);
+    expect(describeCareerBackfill(summary, 'Events')).toContain('2 event steps (+300 XP), 7 credits;');
+
+    const tree = await prisma.masteryTree.findFirstOrThrow({
+      where: { userId: EVENTS, key: 'event:backfill-classic' },
+      select: { nodes: { select: { key: true, name: true, progress: { select: { unlockedAt: true, achievedPrecision: true, achievedSessionId: true } } } } },
+    });
+    const byKey = new Map(tree.nodes.map((node) => [node.key, node]));
+    expect(tree.nodes).toHaveLength(17);
+    expect(byKey.get('edition_1')?.name).toBe('First Complete Edition');
+    // The steps it unlocked are dated from history here, since the milestone phase will not run again.
+    const third = await prisma.raceViewingSession.findFirstOrThrow({ where: { raceId: races[2] } });
+    expect(byKey.get('experienced_3')?.progress[0]).toMatchObject({ achievedPrecision: 'STINT', achievedSessionId: third.id });
+    expect(byKey.get('experienced_1')?.progress[0]?.achievedPrecision).toBe('STINT');
+
+    const paid = await prisma.xPTransaction.findMany({ where: { userId: EVENTS, dedupeKey: 'mastery:event:backfill-classic:experienced_3' } });
+    expect(paid).toHaveLength(1);
+    expect(paid[0]).toMatchObject({ amount: 300, seasonAmount: 0 });
+    expect(await ledgerProblems(EVENTS)).toEqual([]);
+    expect(await eventStepProblems(EVENTS)).toEqual([]);
+
+    // Forced again: nothing more.
+    const before = await ledger(EVENTS);
+    const again = await runCareerBackfillFor(EVENTS, { now: STARTED, clock: PLENTY_OF_TIME, force: true });
+    expect(again).toMatchObject({ eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0 });
+    expect(await ledger(EVENTS)).toEqual(before);
+  });
+});
+
 describe('the start-up budget', () => {
   /** Two long races, one with a Story Complete bonus a runtime edit skipped, and 1,100 races never watched. */
   async function career(userId: string, name: string): Promise<void> {
@@ -363,25 +445,28 @@ describe('the start-up budget', () => {
       if (summary.completed) break;
     }
 
-    // Three chunks of races (500 at a time), then the milestones.
-    const starts = Math.ceil(raceCount / 500) + 1;
+    // Three chunks of races (500 at a time), then the events, then the milestones.
+    const starts = Math.ceil(raceCount / 500) + 2;
     expect(summaries).toHaveLength(starts);
     expect(new Set(markers).size).toBe(starts);
-    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P3', null]);
+    expect(summaries.map((summary) => summary.pausedBefore?.phase ?? null)).toEqual(['P1', 'P1', 'P2', 'P3', null]);
     expect(summaries[0]?.pausedBefore?.cursor).toEqual(expect.any(String));
     expect(summaries[2]?.pausedBefore?.cursor).toBeNull();
-    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0]);
+    expect(summaries[3]?.pausedBefore?.cursor).toBeNull();
+    expect(summaries.map((summary) => summary.racesCredited)).toEqual([500, 500, 103, 0, 0]);
     expect(summaries.reduce((sum, summary) => sum + summary.storyBonusesAwarded, 0)).toBe(1);
-    expect(summaries[3]).toMatchObject({ completed: true, pausedBefore: null });
+    expect(summaries[4]).toMatchObject({ completed: true, pausedBefore: null });
     expect(await isCareerBackfillApplied(INTERRUPTED)).toBe(true);
 
     // What a paused start says in the log.
     expect(describeCareerBackfill(summaries[0]!, 'Interrupted')).toBe(
       `[career-backfill] Interrupted (${INTERRUPTED}): credited 500 races, 0 legacy races repaired, story bonuses +${summaries[0]!.storyBonusesAwarded}/−0; `
+        + '0 event steps (+0 XP), 0 credits; '
         + `0 new milestones (+0 XP), 0 dates filled, 0 recorded only; paused before P1 (after race ${summaries[0]!.pausedBefore!.cursor}); `
         + 'continues on the next start',
     );
-    expect(describeCareerBackfill(summaries[2]!, 'Interrupted')).toMatch(/; paused before P3; continues on the next start$/);
+    expect(describeCareerBackfill(summaries[2]!, 'Interrupted')).toMatch(/; paused before P2; continues on the next start$/);
+    expect(describeCareerBackfill(summaries[3]!, 'Interrupted')).toMatch(/; paused before P3; continues on the next start$/);
 
     const whole = await runCareerBackfillFor(UNINTERRUPTED, { now: STARTED, clock: PLENTY_OF_TIME });
     expect(whole).toMatchObject({ completed: true, racesCredited: 1_103, storyBonusesAwarded: 1 });

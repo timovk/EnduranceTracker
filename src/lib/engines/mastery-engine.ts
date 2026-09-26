@@ -38,6 +38,12 @@
  *      real time is credited the way XP credits it (`creditedSeconds`), so a
  *      stint logged at 0.1× cannot make ten hours out of one.
  *
+ * Event steps (0.4.0) add one more rule: EVERY RACE HELPS PAY EACH KIND OF
+ * EVENT STEP ONCE, in whichever event it was. A race's credit for a step
+ * (`EventStepCredit`) is written as soon as the race helps reach it, so a
+ * race moved, merged or deleted and added again can never pay that step a
+ * second time (`writeMissingEventStepCredits`).
+ *
  * The write paths (`ensureMasteryTrees`, `syncMastery`,
  * `recomputeRaceMasteries`) take the caller's transaction client so that one
  * logged session remains one atomic write. The two view functions are
@@ -47,7 +53,9 @@
 import { EVENT_SHAPE, MAJOR_EVENT_SUGGESTIONS, MASTERY_CONFIG, MASTERY_SHAPE } from '@/lib/config';
 import { createManySkippingDuplicates, prisma, type Tx } from '@/lib/db/client';
 import { isRaceExperienced } from '@/lib/domain/career-timeline';
-import { editionIdentityOf, editionYear, longestConsecutiveRun } from '@/lib/domain/edition';
+import {
+  editionFingerprint, editionIdentityOf, editionYear, fingerprintMatches, longestConsecutiveRun,
+} from '@/lib/domain/edition';
 import { RARITY_ORDER, type MasteryKind, type Rarity, type RaceStatus } from '@/lib/domain/types';
 import type { MasteryUnlock } from '@/lib/engines/contracts';
 import { awardXp, type XpAward } from '@/lib/engines/xp-ledger';
@@ -72,8 +80,10 @@ function championshipTreeKey(championshipId: string): string {
   return `championship:${championshipId}`;
 }
 
+const EVENT_TREE_PREFIX = 'event:';
+
 function eventTreeKey(iconicKey: string): string {
-  return `event:${iconicKey}`;
+  return `${EVENT_TREE_PREFIX}${iconicKey}`;
 }
 
 const GLOBAL_TREE_NAME = 'Endurance Career';
@@ -147,8 +157,8 @@ export interface MasteryRaceInput {
   completed: boolean;
   /**
    * Experienced rather than glimpsed (`isRaceExperienced`). Optional so a
-   * fixture can leave it out; it then follows `storyComplete`, since a
-   * complete story has certainly been experienced.
+   * fixture can leave it out; it then follows `storyComplete`, as for a story
+   * watched in full at an ordinary speed.
    */
   experienced?: boolean;
   /** The race's name, for the event pages. */
@@ -394,7 +404,10 @@ function toRaceInput(row: RaceRow, seasonYears: ReadonlyMap<string, number>): Ma
     isMajorEvent: row.isMajorEvent,
     storyComplete,
     completed: storyComplete || row.status === 'COMPLETED',
-    experienced: storyComplete || isRaceExperienced({
+    // The one definition (§3.1), with no exception for a complete story: one
+    // rushed through at 8× in under ten credited minutes was glimpsed, and the
+    // Event Legacy page, the milestones and the replay say the same.
+    experienced: isRaceExperienced({
       coverageSec: Math.min(row.coverageSec, row.runtimeSec),
       runtimeSec: row.runtimeSec,
       creditedSec,
@@ -460,6 +473,8 @@ interface MasteryScopes {
   global: MasteryMetrics;
   byChampionship: Map<string, MasteryMetrics>;
   byEvent: Map<string, MasteryMetrics>;
+  /** Each event's editions, by key: the races an event step is measured over. */
+  eventMembers: Map<string, MasteryRaceInput[]>;
 }
 
 /**
@@ -501,6 +516,7 @@ function computeScopes(inputs: MasteryInputs): MasteryScopes {
     global: computeMetrics(inputs.races, inputs.seasons),
     byChampionship,
     byEvent,
+    eventMembers: racesByEvent,
   };
 }
 
@@ -967,6 +983,10 @@ interface PendingUnlock {
   description: string;
   rarity: Rarity;
   xpReward: number;
+  metric: string;
+  threshold: number;
+  /** The event's key when this is an event step, which is paid under the credit rule. */
+  eventKey: string | null;
 }
 
 /**
@@ -986,9 +1006,16 @@ interface PendingUnlock {
  * and `unlockedAt` stays exactly where it was — the unlock happened, and an
  * edit to the library afterwards does not unhappen it. There is deliberately
  * no branch below that writes `unlockedAt: null` over a date.
+ *
+ * Event steps (0.4.0) are paid under the credit rule. Before anything is paid,
+ * every step already unlocked is credited to the races that reach it now
+ * (`writeMissingEventStepCredits`), so an edition added after a step was
+ * reached is recorded against it too. A step that newly unlocks pays only if
+ * the races that have not yet helped pay that kind of step reach it on their
+ * own; otherwise it is unlocked XP-free. Either way its races are credited.
  */
 export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()): Promise<MasteryUnlock[]> {
-  const [trees, inputs] = await Promise.all([
+  const [trees, inputs, creditRows] = await Promise.all([
     tx.masteryTree.findMany({
       where: { userId },
       select: {
@@ -1003,9 +1030,24 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
       },
     }),
     loadMasteryInputs(tx, userId),
+    loadEventStepCredits(tx, userId),
   ]);
 
   const scopes = computeScopes(inputs);
+  const credits = indexEventStepCredits(creditRows, new Set(inputs.races.map((race) => race.id)));
+
+  // Steps reached before this run are credited first, before anything is
+  // paid, so no step below can be paid with an edition that already helped
+  // reach the same kind of step somewhere else.
+  const reached: CreditableStep[] = [];
+  for (const tree of trees) {
+    if (tree.kind !== 'RACE_EVENT' || tree.iconicKey === null) continue;
+    for (const node of tree.nodes) {
+      if ((node.progress[0]?.unlockedAt ?? null) === null) continue;
+      reached.push({ nodeKey: node.key, metric: node.metric, eventKey: tree.iconicKey });
+    }
+  }
+  await creditSteps(tx, userId, reached, scopes.eventMembers, credits);
 
   const creates: { userId: string; nodeId: string; value: number; target: number; unlockedAt: Date | null }[] = [];
   const updates: { id: string; value: number; target: number; unlockedAt: Date | null }[] = [];
@@ -1037,6 +1079,9 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
           description: node.description,
           rarity: node.rarity,
           xpReward: node.xpReward,
+          metric: node.metric,
+          threshold: node.threshold,
+          eventKey: tree.kind === 'RACE_EVENT' ? tree.iconicKey : null,
         });
       }
 
@@ -1081,7 +1126,20 @@ export async function syncMastery(tx: Tx, userId: string, now: Date = new Date()
 
   for (const unlock of pending) {
     // A node worth nothing is recorded as unlocked and writes no ledger row.
-    const payment = masteryUnlockAward(unlock);
+    let payment = masteryUnlockAward(unlock);
+    if (unlock.eventKey !== null) {
+      // An event step pays only on editions that have not helped pay this
+      // kind of step before, anywhere; otherwise it is recorded XP-free. Its
+      // races are credited either way, so it can never be paid again.
+      const members = scopes.eventMembers.get(unlock.eventKey) ?? [];
+      const step = { key: unlock.nodeKey, metric: unlock.metric, threshold: unlock.threshold, xpReward: unlock.xpReward };
+      if (payment !== null && !eventStepPays(step, members, credits)) payment = null;
+      await creditSteps(
+        tx, userId,
+        [{ nodeKey: unlock.nodeKey, metric: unlock.metric, eventKey: unlock.eventKey }],
+        scopes.eventMembers, credits,
+      );
+    }
     const award = payment === null ? { granted: 0 } : await awardXp(tx, userId, payment);
 
     // Several nodes of one tree can land in a single stint, so tree progress
@@ -1132,6 +1190,331 @@ export function masteryUnlockAward(unlock: {
     // across re-balances, and the reason re-running this engine is safe.
     dedupeKey: `mastery:${unlock.treeKey}:${unlock.nodeKey}`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Event-step credits (0.4.0)
+//
+// Every race can help pay each kind of event step (each node key) once, in
+// any event. The credit is the record of that: written for every race that
+// helps reach a step, whether the step paid or was reached already, and
+// whichever event the race was in at the time. When a race is deleted its
+// credits keep its edition's fingerprint (a tombstone), so the same edition
+// added again is recognised and cannot pay again either.
+// ---------------------------------------------------------------------------
+
+/** One event-step credit, as the engine reads it. */
+export interface EventStepCreditRow {
+  nodeKey: string;
+  raceId: string;
+  /** The deleted race's edition fingerprint; null while the race exists. */
+  fingerprint: string | null;
+}
+
+/**
+ * An account's credits, indexed for "has this race already helped pay this
+ * kind of step?". Built once per sync and kept up to date as the sync writes
+ * more, so a later step in the same run sees what an earlier one credited.
+ */
+export interface EventStepCreditIndex {
+  /** The races credited, per node key. */
+  races: Map<string, Set<string>>;
+  /** The fingerprints of credited races no longer in the library, per node key. */
+  tombstones: Map<string, string[]>;
+}
+
+/** Every credit of an account: one indexed read. */
+export async function loadEventStepCredits(db: Tx, userId: string): Promise<EventStepCreditRow[]> {
+  return db.eventStepCredit.findMany({
+    where: { userId },
+    select: { nodeKey: true, raceId: true, fingerprint: true },
+  });
+}
+
+/** Index credits by node key. A credit whose race is gone is kept as a tombstone when it has a fingerprint. */
+export function indexEventStepCredits(
+  rows: readonly EventStepCreditRow[],
+  currentRaceIds: ReadonlySet<string>,
+): EventStepCreditIndex {
+  const index: EventStepCreditIndex = { races: new Map(), tombstones: new Map() };
+  for (const row of rows) {
+    addCredit(index, row.nodeKey, row.raceId);
+    if (!currentRaceIds.has(row.raceId) && row.fingerprint !== null) push(index.tombstones, row.nodeKey, row.fingerprint);
+  }
+  return index;
+}
+
+function addCredit(index: EventStepCreditIndex, nodeKey: string, raceId: string): void {
+  const races = index.races.get(nodeKey);
+  if (races) races.add(raceId);
+  else index.races.set(nodeKey, new Set([raceId]));
+}
+
+/**
+ * Whether a race has already helped pay this kind of step: it holds a credit
+ * for it, or it is an edition that did so before it was deleted and added
+ * again (its fingerprint matches a tombstone: the same year and rounded
+ * length, and the same circuit or name).
+ */
+export function isCreditedFor(index: EventStepCreditIndex, nodeKey: string, race: MasteryRaceInput): boolean {
+  if (index.races.get(nodeKey)?.has(race.id)) return true;
+  const tombstones = index.tombstones.get(nodeKey);
+  if (tombstones === undefined || tombstones.length === 0) return false;
+  const fingerprint = editionFingerprint({
+    editionYear: race.year, circuitSlug: race.circuitSlug, name: race.name ?? '', runtimeSec: race.runtimeSec,
+  });
+  return tombstones.some((stored) => fingerprintMatches(stored, fingerprint));
+}
+
+/**
+ * The races that reach a step of an event: the Story Complete editions for
+ * the complete steps, the experienced ones for the experienced steps, the
+ * Story Complete races of the longest run for the run steps, and every race
+ * with credited time for the hours steps.
+ */
+export function eventStepContributors(metric: string, members: readonly MasteryRaceInput[]): MasteryRaceInput[] {
+  switch (metric) {
+    case 'editionsStoryComplete':
+      return members.filter((race) => race.storyComplete);
+    case 'editionsExperienced':
+      return members.filter((race) => race.experienced ?? race.storyComplete);
+    case 'consecutiveEditions': {
+      const complete = members.filter((race) => race.storyComplete);
+      const run = longestConsecutiveRun(complete.flatMap((race) => (race.year === null ? [] : [race.year])));
+      if (run === null) return [];
+      return complete.filter((race) => race.year !== null && race.year >= run.fromYear && race.year <= run.toYear);
+    }
+    case 'realHours':
+      return members.filter((race) => race.realViewingSec > 0);
+    default:
+      return [];
+  }
+}
+
+/**
+ * Whether a step that has just been reached pays: it has a reward, and the
+ * editions that have NOT already helped pay this kind of step reach its
+ * threshold on their own.
+ */
+export function eventStepPays(
+  node: { key: string; metric: string; threshold: number; xpReward: number },
+  members: readonly MasteryRaceInput[],
+  index: EventStepCreditIndex,
+): boolean {
+  if (!(node.xpReward > 0)) return false;
+  const payable = computeEventMetrics(members.filter((race) => !isCreditedFor(index, node.key, race)));
+  return metricValue(payable, node.metric) >= node.threshold;
+}
+
+interface CreditableStep {
+  nodeKey: string;
+  metric: string;
+  eventKey: string;
+}
+
+/** Credit every race that reaches these steps now and holds no credit for them yet. */
+async function creditSteps(
+  tx: Tx,
+  userId: string,
+  steps: readonly CreditableStep[],
+  eventMembers: ReadonlyMap<string, MasteryRaceInput[]>,
+  index: EventStepCreditIndex,
+): Promise<number> {
+  const rows: { userId: string; nodeKey: string; raceId: string; eventKey: string }[] = [];
+  for (const step of steps) {
+    const credited = index.races.get(step.nodeKey);
+    for (const race of eventStepContributors(step.metric, eventMembers.get(step.eventKey) ?? [])) {
+      if (credited?.has(race.id)) continue;
+      rows.push({ userId, nodeKey: step.nodeKey, raceId: race.id, eventKey: step.eventKey });
+    }
+  }
+  if (rows.length === 0) return 0;
+
+  const written = await createManySkippingDuplicates(tx.eventStepCredit, rows, {
+    keyOf: (row) => `${row.nodeKey}|${row.raceId}`,
+    // Everything this account already holds is in the index, so the steady
+    // state sends nothing and no insert can fail.
+    findExisting: (candidates) => candidates
+      .filter((row) => index.races.get(row.nodeKey)?.has(row.raceId) ?? false)
+      .map((row) => `${row.nodeKey}|${row.raceId}`),
+  });
+  for (const row of rows) addCredit(index, row.nodeKey, row.raceId);
+  return written;
+}
+
+/**
+ * Credit every race that reaches an unlocked event step now, for that step,
+ * where it holds no credit yet — paid and XP-free steps alike.
+ *
+ * Called before anything moves a race between events (link, unlink, merge,
+ * the race form, deleting a race), so the steps a race helped its current
+ * event reach are on record before it leaves, and by `syncMastery` before it
+ * pays anything. `loaded` is a credit index the caller already holds; it is
+ * kept up to date with what is written here. Returns the credits written:
+ * nothing in the steady state.
+ */
+export async function writeMissingEventStepCredits(
+  tx: Tx,
+  userId: string,
+  loaded?: EventStepCreditIndex,
+): Promise<number> {
+  const [steps, inputs, rows] = await Promise.all([
+    tx.masteryProgress.findMany({
+      where: { userId, unlockedAt: { not: null }, node: { tree: { kind: 'RACE_EVENT' } } },
+      select: { node: { select: { key: true, metric: true, tree: { select: { iconicKey: true } } } } },
+    }),
+    loadMasteryInputs(tx, userId),
+    loaded === undefined ? loadEventStepCredits(tx, userId) : Promise.resolve([]),
+  ]);
+  if (steps.length === 0) return 0;
+
+  const index = loaded ?? indexEventStepCredits(rows, new Set(inputs.races.map((race) => race.id)));
+  const eventMembers = computeScopes(inputs).eventMembers;
+  const creditable: CreditableStep[] = [];
+  for (const step of steps) {
+    const eventKey = step.node.tree.iconicKey;
+    if (eventKey !== null) creditable.push({ nodeKey: step.node.key, metric: step.node.metric, eventKey });
+  }
+  return creditSteps(tx, userId, creditable, eventMembers, index);
+}
+
+/**
+ * Carry an event's unlocked steps over to the event it is merged into, for
+ * every step unlocked in `fromKey`'s tree and not yet in `intoKey`'s.
+ *
+ * The step's dates are copied — when it unlocked, and when history says it
+ * was reached — and NO ledger row is written: the step was paid, if at all,
+ * in the event it was reached in, and the next `syncMastery` finds it already
+ * unlocked and pays nothing for it. A date already held is never written
+ * over. Both trees must exist (`ensureMasteryTrees`). Returns the number of
+ * steps carried.
+ */
+export async function carryOverEventSteps(tx: Tx, userId: string, fromKey: string, intoKey: string): Promise<number> {
+  const trees = await tx.masteryTree.findMany({
+    where: { userId, key: { in: [eventTreeKey(fromKey), eventTreeKey(intoKey)] } },
+    select: {
+      key: true,
+      nodes: {
+        select: {
+          id: true, key: true, threshold: true,
+          progress: {
+            where: { userId },
+            select: {
+              id: true, value: true, unlockedAt: true, achievedAt: true, achievedPrecision: true, achievedSessionId: true,
+            },
+          },
+        },
+      },
+    },
+  });
+  const from = trees.find((tree) => tree.key === eventTreeKey(fromKey));
+  const into = trees.find((tree) => tree.key === eventTreeKey(intoKey));
+  if (from === undefined || into === undefined) return 0;
+
+  const intoNodes = new Map(into.nodes.map((node) => [node.key, node]));
+  let carried = 0;
+  for (const node of from.nodes) {
+    const reached = node.progress[0];
+    if (reached === undefined || reached.unlockedAt === null) continue;
+    const target = intoNodes.get(node.key);
+    if (target === undefined) continue;
+    const existing = target.progress[0];
+    const dates = {
+      unlockedAt: reached.unlockedAt,
+      achievedAt: reached.achievedAt,
+      achievedPrecision: reached.achievedPrecision,
+      achievedSessionId: reached.achievedSessionId,
+    };
+
+    if (existing === undefined) {
+      carried += await createManySkippingDuplicates(tx.masteryProgress, [
+        { userId, nodeId: target.id, value: reached.value, target: target.threshold, ...dates },
+      ]);
+      continue;
+    }
+    if (existing.unlockedAt !== null) continue;
+    // Only a row that holds neither an unlock nor a date is written (R11).
+    const written = await tx.masteryProgress.updateMany({
+      where: { id: existing.id, userId, unlockedAt: null, achievedPrecision: null },
+      data: dates,
+    });
+    carried += written.count;
+  }
+  return carried;
+}
+
+/** One unlocked mastery progress row, as a list of past unlocks reads it. */
+export interface UnlockedStepRow {
+  treeKey: string;
+  nodeKey: string;
+  unlockedAt: Date;
+}
+
+/**
+ * Which of these unlocks are copies a merge carried over, as
+ * `<treeKey>:<nodeKey>`.
+ *
+ * A merge copies the merged event's steps into the surviving event with their
+ * dates (`carryOverEventSteps`), so the survivor's history reads right. The
+ * copies are not moments of their own: a list of what happened when — a
+ * reopened stint summary, the dashboard's recent unlocks — shows the step
+ * once, where it was reached (the row that paid, if it paid), and leaves the
+ * copies out. Nothing marks a copy, so it is told apart by what the merge
+ * wrote: the same step, unlocked at the very same instant, in an event of the
+ * same merged family that was merged away before this one (a merge copies out
+ * of the event it archives, so the original is the one that left first). A
+ * row that paid XP is never a copy, since a copy is written without a ledger
+ * row.
+ */
+export async function carriedEventStepCopies(
+  db: Tx,
+  userId: string,
+  rows: readonly UnlockedStepRow[],
+): Promise<Set<string>> {
+  const copies = new Set<string>();
+  const candidates = rows.filter((row) => row.treeKey.startsWith(EVENT_TREE_PREFIX));
+  if (candidates.length === 0) return copies;
+  const events = await db.raceMastery.findMany({
+    where: { userId },
+    select: { id: true, key: true, mergedIntoId: true, archivedAt: true },
+  });
+  if (!events.some((event) => event.mergedIntoId !== null)) return copies;
+
+  const survivorOf = eventKeyResolver(events);
+  // A merged event was archived by its merge; an event still active left last.
+  const leftAt = new Map(events.map((event) => [event.key, event.archivedAt?.getTime() ?? Number.POSITIVE_INFINITY]));
+  const left = (key: string) => leftAt.get(key) ?? Number.POSITIVE_INFINITY;
+
+  const peers = await db.masteryProgress.findMany({
+    where: {
+      userId,
+      unlockedAt: { in: [...new Set(candidates.map((row) => row.unlockedAt.getTime()))].map((ms) => new Date(ms)) },
+      node: { key: { in: [...new Set(candidates.map((row) => row.nodeKey))] }, tree: { kind: 'RACE_EVENT' } },
+    },
+    select: { unlockedAt: true, node: { select: { key: true, tree: { select: { key: true } } } } },
+  });
+  const heldBy = new Map<string, string[]>();
+  for (const peer of peers) {
+    if (peer.unlockedAt === null) continue;
+    push(heldBy, `${peer.node.key}@${peer.unlockedAt.getTime()}`, peer.node.tree.key.slice(EVENT_TREE_PREFIX.length));
+  }
+
+  const likely = candidates.filter((row) => {
+    const key = row.treeKey.slice(EVENT_TREE_PREFIX.length);
+    const family = survivorOf(key);
+    return (heldBy.get(`${row.nodeKey}@${row.unlockedAt.getTime()}`) ?? []).some((other) =>
+      other !== key && survivorOf(other) === family && left(other) < left(key));
+  });
+  if (likely.length === 0) return copies;
+
+  const paid = new Set((await db.xPTransaction.findMany({
+    where: { userId, dedupeKey: { in: likely.map((row) => `mastery:${row.treeKey}:${row.nodeKey}`) } },
+    select: { dedupeKey: true },
+  })).map((row) => row.dedupeKey));
+  for (const row of likely) {
+    if (!paid.has(`mastery:${row.treeKey}:${row.nodeKey}`)) copies.add(`${row.treeKey}:${row.nodeKey}`);
+  }
+  return copies;
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,6 +1571,13 @@ export interface MasteryTreeView {
   /** Career XP still sitting in the tree. Waiting, never owed. */
   xpWaiting: number;
   headline: string;
+  /** An event tree's Event Legacy page, once the event exists; null for every other tree. */
+  eventHref: string | null;
+}
+
+/** The Event Legacy page of an event. Keys are free text from 0.3.x, so they are always encoded. */
+export function eventHref(key: string): string {
+  return `/events/${encodeURIComponent(key)}`;
 }
 
 /**
@@ -1200,9 +1590,13 @@ export interface MasteryTreeView {
  * passed its target but whose unlock has not been written yet therefore shows
  * a full bar and no unlock, which is exactly what is true until the next stint
  * runs `syncMastery`.
+ *
+ * The tree of an event merged into another is left out (0.4.0): its races
+ * and its steps now live in the event it was merged into, and its own unlocks
+ * stay recorded where they are. An event tree links to its Events page.
  */
 async function buildTreeViews(userId: string, championshipId?: string): Promise<MasteryTreeView[]> {
-  const [trees, inputs] = await Promise.all([
+  const [trees, inputs, events] = await Promise.all([
     prisma.masteryTree.findMany({
       where: { userId, ...(championshipId === undefined ? {} : { championshipId }) },
       select: {
@@ -1219,11 +1613,18 @@ async function buildTreeViews(userId: string, championshipId?: string): Promise<
       },
     }),
     loadMasteryInputs(prisma, userId),
+    championshipId === undefined
+      ? prisma.raceMastery.findMany({ where: { userId }, select: { key: true, mergedIntoId: true } })
+      : Promise.resolve([]),
   ]);
 
   const scopes = computeScopes(inputs);
+  const mergedKeys = new Set(events.filter((event) => event.mergedIntoId !== null).map((event) => event.key));
+  const eventKeys = new Set(events.map((event) => event.key));
+  const shown = trees.filter((tree) =>
+    !(tree.kind === 'RACE_EVENT' && tree.iconicKey !== null && mergedKeys.has(tree.iconicKey)));
 
-  const views = trees.map((tree) => {
+  const views = shown.map((tree) => {
     const metrics = metricsForTree(scopes, tree);
     const nodes: MasteryNodeView[] = [...tree.nodes].sort(compareNodes).map((node) => {
       const unlockedAt = node.progress[0]?.unlockedAt ?? null;
@@ -1276,6 +1677,9 @@ async function buildTreeViews(userId: string, championshipId?: string): Promise<
       xpEarned: nodes.reduce((sum, node) => sum + (node.unlocked ? node.xpReward : 0), 0),
       xpWaiting: nodes.reduce((sum, node) => sum + (node.unlocked ? 0 : node.xpReward), 0),
       headline: treeHeadline(unlockedCount, nodes.length),
+      eventHref: tree.kind === 'RACE_EVENT' && tree.iconicKey !== null && eventKeys.has(tree.iconicKey)
+        ? eventHref(tree.iconicKey)
+        : null,
     };
     return { view, sortKey: treeSortKey(tree) };
   });

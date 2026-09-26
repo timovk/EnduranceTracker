@@ -7,13 +7,17 @@
  * gaps still to watch, the full session history, and the form for logging the
  * next stint. A long race additionally gets the 24-hour clock, because a
  * 24-hour race is an expedition and should look like one.
+ *
+ * A race that is an edition of a recurring event says so, and links to the
+ * event's page; one that looks like an edition of an event it is not in yet
+ * offers the link in one line, and never links it without a click.
  */
 
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
-  CalendarDays, ExternalLink, Flag, MapPin, Pencil, Play, Star, Trash2, Zap,
+  CalendarDays, ExternalLink, Flag, MapPin, Pencil, Play, Repeat, Star, Trash2, Zap,
 } from 'lucide-react';
 import type { RaceDetail } from '@/lib/server/races';
 import type { SessionOutcome } from '@/lib/engines/contracts';
@@ -27,16 +31,19 @@ import { LogSessionForm } from './log-session-form';
 import type { StintEntryMode } from '@/lib/domain/race-clock';
 import { StintSummary } from './stint-summary';
 import { deleteRaceAction, deleteSessionAction, logSessionAction } from '@/lib/server/actions';
+import { dismissEventSuggestionAction, linkRacesToEventAction } from '@/lib/server/career-actions';
 import { formatDate, formatNumber } from '@/lib/utils';
 
 export function RaceDetailView({
-  race, longHaulThresholdSec, outcome: initialOutcome, defaultEntryMode = 'RANGE',
+  race, longHaulThresholdSec, outcome: initialOutcome, defaultEntryMode = 'RANGE', eventSuggestion = null,
 }: {
   race: RaceDetail;
   longHaulThresholdSec: number;
   outcome?: SessionOutcome | null;
   /** How this account last entered a stint. */
   defaultEntryMode?: StintEntryMode;
+  /** The event this race strongly looks like an edition of, when it is in none. */
+  eventSuggestion?: { name: string; key: string; suggestionId: string } | null;
 }) {
   const router = useRouter();
   const [logging, setLogging] = React.useState(false);
@@ -46,6 +53,17 @@ export function RaceDetailView({
 
   const accent = race.championship?.accentColor ?? 'var(--accent)';
   const isLongHaul = race.runtimeSec >= longHaulThresholdSec;
+
+  function answerSuggestion(link: boolean) {
+    if (eventSuggestion === null) return;
+    startTransition(async () => {
+      const result = link
+        ? await linkRacesToEventAction(eventSuggestion.key, [race.id])
+        : await dismissEventSuggestionAction(eventSuggestion.suggestionId);
+      if (!result.ok) setNotice(result.message ?? 'That could not be saved.');
+      router.refresh();
+    });
+  }
 
   function onLogSession(formData: FormData) {
     startTransition(async () => {
@@ -81,6 +99,14 @@ export function RaceDetailView({
               <span className="inline-flex items-center gap-1 text-[var(--accent)]">
                 <Star size={10} fill="currentColor" /> Major event
               </span>
+            ) : null}
+            {race.event ? (
+              <Link href={race.event.href} className="inline-flex items-center gap-1 hover:text-ink-muted">
+                <Repeat size={10} />
+                {race.event.editionYear !== null
+                  ? `Edition ${race.event.editionYear} of ${race.event.name}`
+                  : `An edition of ${race.event.name}`}
+              </Link>
             ) : null}
           </div>
 
@@ -124,6 +150,15 @@ export function RaceDetailView({
 
       {notice ? (
         <p className="rounded-md border border-hairline-strong bg-panel-2 px-3 py-2 text-sm text-ink-muted">{notice}</p>
+      ) : null}
+
+      {race.event === null && eventSuggestion !== null ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-hairline bg-panel-2 px-3 py-2 text-sm text-ink-muted">
+          <Repeat size={13} className="shrink-0 text-ink-dim" />
+          <span className="min-w-0 flex-1">Looks like an edition of {eventSuggestion.name}</span>
+          <Button size="sm" variant="primary" disabled={pending} onClick={() => answerSuggestion(true)}>Link</Button>
+          <Button size="sm" variant="ghost" disabled={pending} onClick={() => answerSuggestion(false)}>Not this one</Button>
+        </div>
       ) : null}
 
       {outcome ? (

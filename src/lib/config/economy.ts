@@ -376,16 +376,58 @@ export const MASTERY_CONFIG = {
     { key: 'circuits_10', name: 'Ten Circuits', description: 'Complete races at ten different circuits.', metric: 'circuits', threshold: 10, xpReward: 5_000, tier: 5, rarity: 'RARE' },
   ],
 
-  /** Nodes instantiated for a recurring event (Race Mastery). */
+  /**
+   * Nodes instantiated for a recurring event (Race Mastery), shown as the
+   * event's legacy steps on its Events page.
+   *
+   * The first eight are the 0.3.x steps, unchanged but for the names of the
+   * Story Complete ones, which say "Complete" so they read differently from
+   * the experienced steps below. A name is not paid, so renaming one changes
+   * nothing a career has earned.
+   *
+   * The rest were appended in 0.4.0 (Event Legacy). Appended, never inserted:
+   * a node's `sortOrder` is its index here, so the existing nodes keep theirs
+   * and `ensureMasteryTrees` only adds the new ones to trees that exist. They
+   * are smaller extras on purpose ("a little, never twice", owner decision
+   * D2): at most 14,300 XP per event over a lifetime, against the 85,000 of
+   * the steps above.
+   *
+   *   - Experienced editions count a tenth of the race (or an hour of a long
+   *     one) and ten credited minutes, so a glimpse counts for nothing. The
+   *     first pays 0: a single race placed in an event of its own would
+   *     otherwise earn a step for a few clicks. It is shown and dated all
+   *     the same.
+   *   - 3 / 5 / 10 / 25 experienced editions pay 100 XP an edition, what
+   *     under four minutes of viewing pays, against at least ten minutes
+   *     each edition took to count.
+   *   - Ten complete in a row extends the existing three and five, at the
+   *     same step up in rarity.
+   *   - 25 / 100 / 250 hours sit around the existing 50 and 150, at about a
+   *     hundredth of the viewing XP those hours pay (25 h is 45,000).
+   *
+   * Every event step is paid once per race, in any event: a race's credit for
+   * a step is written as soon as it helps reach it (`EventStepCredit`), so
+   * moving, merging or re-creating races never pays one twice.
+   */
   raceEventNodes: [
-    { key: 'edition_1', name: 'First Edition', description: 'Story Complete one edition.', metric: 'editionsStoryComplete', threshold: 1, xpReward: 1_000, tier: 1, rarity: 'UNCOMMON' },
-    { key: 'edition_3', name: 'Three Editions', description: 'Story Complete three editions.', metric: 'editionsStoryComplete', threshold: 3, xpReward: 4_000, tier: 2, rarity: 'RARE' },
-    { key: 'edition_5', name: 'Five Editions', description: 'Story Complete five editions.', metric: 'editionsStoryComplete', threshold: 5, xpReward: 9_000, tier: 3, rarity: 'EPIC' },
-    { key: 'edition_10', name: 'A Decade of Editions', description: 'Story Complete ten editions.', metric: 'editionsStoryComplete', threshold: 10, xpReward: 25_000, tier: 4, rarity: 'LEGENDARY' },
-    { key: 'consecutive_3', name: 'Three in a Row', description: 'Story Complete three consecutive editions.', metric: 'consecutiveEditions', threshold: 3, xpReward: 6_000, tier: 3, rarity: 'EPIC' },
-    { key: 'consecutive_5', name: 'Five in a Row', description: 'Story Complete five consecutive editions.', metric: 'consecutiveEditions', threshold: 5, xpReward: 15_000, tier: 5, rarity: 'LEGENDARY' },
+    { key: 'edition_1', name: 'First Complete Edition', description: 'Story Complete one edition.', metric: 'editionsStoryComplete', threshold: 1, xpReward: 1_000, tier: 1, rarity: 'UNCOMMON' },
+    { key: 'edition_3', name: 'Three Complete Editions', description: 'Story Complete three editions.', metric: 'editionsStoryComplete', threshold: 3, xpReward: 4_000, tier: 2, rarity: 'RARE' },
+    { key: 'edition_5', name: 'Five Complete Editions', description: 'Story Complete five editions.', metric: 'editionsStoryComplete', threshold: 5, xpReward: 9_000, tier: 3, rarity: 'EPIC' },
+    { key: 'edition_10', name: 'Ten Complete Editions', description: 'Story Complete ten editions.', metric: 'editionsStoryComplete', threshold: 10, xpReward: 25_000, tier: 4, rarity: 'LEGENDARY' },
+    { key: 'consecutive_3', name: 'Three Complete in a Row', description: 'Story Complete three consecutive editions.', metric: 'consecutiveEditions', threshold: 3, xpReward: 6_000, tier: 3, rarity: 'EPIC' },
+    { key: 'consecutive_5', name: 'Five Complete in a Row', description: 'Story Complete five consecutive editions.', metric: 'consecutiveEditions', threshold: 5, xpReward: 15_000, tier: 5, rarity: 'LEGENDARY' },
     { key: 'event_hours_50', name: '50 Hours Here', description: 'Spend 50 real hours on this event.', metric: 'realHours', threshold: 50, xpReward: 5_000, tier: 4, rarity: 'RARE' },
     { key: 'event_hours_150', name: '150 Hours Here', description: 'Spend 150 real hours on this event.', metric: 'realHours', threshold: 150, xpReward: 20_000, tier: 6, rarity: 'MYTHIC' },
+    // -- Appended in 0.4.0 (Event Legacy) --------------------------------
+    { key: 'experienced_1', name: 'First Edition Experienced', description: 'Experience any edition (a tenth of it, or an hour).', metric: 'editionsExperienced', threshold: 1, xpReward: 0, tier: 1, rarity: 'COMMON' },
+    { key: 'experienced_3', name: 'Three Editions Experienced', description: 'Experience three editions.', metric: 'editionsExperienced', threshold: 3, xpReward: 300, tier: 2, rarity: 'COMMON' },
+    { key: 'experienced_5', name: 'Five Editions Experienced', description: 'Experience five editions.', metric: 'editionsExperienced', threshold: 5, xpReward: 500, tier: 3, rarity: 'UNCOMMON' },
+    { key: 'experienced_10', name: 'Ten Editions Experienced', description: 'Experience ten editions.', metric: 'editionsExperienced', threshold: 10, xpReward: 1_000, tier: 4, rarity: 'RARE' },
+    { key: 'experienced_25', name: 'Twenty-Five Editions Experienced', description: 'Experience twenty-five editions.', metric: 'editionsExperienced', threshold: 25, xpReward: 2_500, tier: 6, rarity: 'EPIC' },
+    { key: 'consecutive_10', name: 'Ten Complete in a Row', description: 'Story Complete ten consecutive editions.', metric: 'consecutiveEditions', threshold: 10, xpReward: 5_000, tier: 6, rarity: 'MYTHIC' },
+    { key: 'event_hours_25', name: '25 Hours Here', description: 'Spend 25 real hours on this event.', metric: 'realHours', threshold: 25, xpReward: 500, tier: 2, rarity: 'COMMON' },
+    { key: 'event_hours_100', name: '100 Hours Here', description: 'Spend 100 real hours on this event.', metric: 'realHours', threshold: 100, xpReward: 1_500, tier: 5, rarity: 'EPIC' },
+    { key: 'event_hours_250', name: '250 Hours Here', description: 'Spend 250 real hours on this event.', metric: 'realHours', threshold: 250, xpReward: 3_000, tier: 7, rarity: 'LEGENDARY' },
   ],
 
   /** The single cross-championship tree. */

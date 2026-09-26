@@ -7,10 +7,14 @@
  * progression is visible at a glance. Every node shows its progress whether it
  * is unlocked or not, because seeing that you are 38 of 50 hours into a tier is
  * most of the pleasure of a tree like this.
+ *
+ * A recurring event's tree links to its Events page, where the same steps are
+ * shown with the event's whole history around them.
  */
 
 import * as React from 'react';
-import { Check, Globe, Layers, Repeat } from 'lucide-react';
+import Link from 'next/link';
+import { ArrowUpRight, Check, Globe, Layers, Repeat } from 'lucide-react';
 import type { MasteryTreeView } from '@/lib/engines/mastery-engine';
 import type { MasteryKind } from '@/lib/domain/types';
 import { Panel, PanelBody, PanelHeader, RarityBadge, rarityColor, TimingBar } from '@/components/ui/primitives';
@@ -68,6 +72,14 @@ function Tree({ tree }: { tree: MasteryTreeView }) {
               <span className="uppercase tracking-[0.1em] text-[var(--accent)]">complete</span>
             ) : null}
             <span className="timing text-ink-faint">{tree.unlockedCount}/{tree.nodeCount}</span>
+            {tree.eventHref ? (
+              <Link
+                href={tree.eventHref}
+                className="inline-flex items-center gap-0.5 text-ink-dim transition-colors hover:text-[var(--accent)]"
+              >
+                Event page <ArrowUpRight size={11} />
+              </Link>
+            ) : null}
           </span>
         }
       />

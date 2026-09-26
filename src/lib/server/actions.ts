@@ -81,11 +81,44 @@ function raceFormToObject(form: FormData) {
     excitement: formValue(form, 'excitement') ?? '3',
     status: formValue(form, 'status') ?? 'UNWATCHED',
     isMajorEvent: form.get('isMajorEvent') === 'on' || form.get('isMajorEvent') === 'true',
+    eventKey: formValue(form, 'eventKey'),
+    newEventName: formValue(form, 'newEventName'),
     iconicKey: formValue(form, 'iconicKey'),
     notes: formValue(form, 'notes'),
     replayUrl: formValue(form, 'replayUrl') ?? '',
     posterUrl: formValue(form, 'posterUrl') ?? '',
   };
+}
+
+/**
+ * The interactive transaction for an edit that re-syncs progression: the
+ * default five seconds is far too short for mastery, metrics and achievements
+ * on a long career. The same generous limits as logging a stint.
+ */
+const EDIT_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
+
+/**
+ * Whether the form says which event the race belongs to. The race forms
+ * always do — "None" is a choice — and a caller that sends none of the event
+ * fields leaves the race where it is: saving with "Major event" off no longer
+ * takes a race out of its event (0.4.0).
+ */
+function formChoosesEvent(form: FormData): boolean {
+  return form.has('eventKey') || form.has('newEventName') || form.has('iconicKey');
+}
+
+/**
+ * "New event…" chosen and no name typed. Refused rather than read as "None",
+ * which would quietly take the race out of its event and still say "Saved.".
+ */
+function unnamedNewEvent(form: FormData): ActionResult<{ id: string }> | null {
+  if (!form.has('newEventName') || formValue(form, 'newEventName') !== undefined) return null;
+  return { ok: false, message: 'A couple of fields need a second look.', errors: { newEventName: 'Give the new event a name.' } };
+}
+
+/** The event fields as the event engine reads them; the 0.3.x `iconicKey` stands in for a missing `eventKey`. */
+function eventInput(input: { eventKey?: string; newEventName?: string; iconicKey?: string }) {
+  return { eventKey: input.eventKey ?? input.iconicKey, newEventName: input.newEventName };
 }
 
 export async function createRaceAction(form: FormData): Promise<ActionResult<{ id: string }>> {
@@ -96,10 +129,18 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
     return { ok: false, message: 'A couple of fields need a second look.', errors: fieldErrors(parsed.error.issues) };
   }
 
+  const unnamed = unnamedNewEvent(form);
+  if (unnamed !== null) return unnamed;
+
   const input = parsed.data;
+  const now = new Date();
+  const { resolveEventForRaceInput } = await import('@/lib/engines/event-legacy-engine');
   const race = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
     const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, userId, input);
+    // The event the form chose, or named: an event already going by a typed
+    // name is reused rather than duplicated.
+    const event = await resolveEventForRaceInput(db, userId, eventInput(input), now);
 
     return db.race.create({
       data: {
@@ -120,28 +161,24 @@ export async function createRaceAction(form: FormData): Promise<ActionResult<{ i
         excitement: input.excitement,
         status: input.status,
         isMajorEvent: input.isMajorEvent,
-        iconicKey: input.iconicKey ?? null,
+        iconicKey: event?.key ?? null,
+        raceMasteryId: event?.id ?? null,
         notes: input.notes ?? null,
         replayUrl: input.replayUrl ?? null,
         posterUrl: input.posterUrl ?? null,
       },
       select: { id: true },
     });
-  });
+  }, EDIT_TRANSACTION);
 
   clearCareerTimelineCache(userId);
   revalidatePath('/races');
   revalidatePath('/');
   revalidatePath('/collections');
+  revalidatePath('/events');
+  revalidatePath('/mastery');
   return { ok: true, data: { id: race.id }, message: `${input.name} is in the library.` };
 }
-
-/**
- * The interactive transaction for an edit that re-syncs progression: the
- * default five seconds is far too short for mastery, metrics and achievements
- * on a long career. The same generous limits as logging a stint.
- */
-const EDIT_TRANSACTION = { maxWait: 15_000, timeout: 60_000 } as const;
 
 export async function updateRaceAction(form: FormData): Promise<ActionResult<{ id: string }>> {
   const userId = await requireUserId();
@@ -153,20 +190,40 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
     return { ok: false, message: 'A couple of fields need a second look.', errors: fieldErrors(parsed.error.issues) };
   }
 
+  const unnamed = unnamedNewEvent(form);
+  if (unnamed !== null) return unnamed;
+
   const input = parsed.data;
   const now = new Date();
+  const choosesEvent = formChoosesEvent(form);
   const { resyncAfterRaceEdit } = await import('@/lib/engines/progression-resync');
+  const { resolveEventForRaceInput } = await import('@/lib/engines/event-legacy-engine');
+  const { writeMissingEventStepCredits } = await import('@/lib/engines/mastery-engine');
   const updated = await prisma.$transaction(async (tx) => {
     const db = tx as Tx;
 
     // The race id came from the form. Ownership is established inside the same
     // transaction as the write, so there is no window in which it could change
     // between the two.
-    const owned = await db.race.findFirst({ where: { id: input.id, userId }, select: { id: true, runtimeSec: true } });
+    const owned = await db.race.findFirst({
+      where: { id: input.id, userId },
+      select: { id: true, runtimeSec: true, iconicKey: true, raceMasteryId: true },
+    });
     if (owned === null) return null;
 
     const { championshipId, seasonId } = await resolveChampionshipAndSeason(db, userId, input);
     const runtimeSec = input.actualDuration ?? input.scheduledDuration;
+
+    // The race's event. When it changes, the steps the race helped its
+    // current event reach are credited to it first, so moving it can never
+    // pay them again (§4.2.5).
+    const event = choosesEvent
+      ? await resolveEventForRaceInput(db, userId, eventInput(input), now)
+      : undefined;
+    const link = event === undefined
+      ? { iconicKey: owned.iconicKey, raceMasteryId: owned.raceMasteryId }
+      : { iconicKey: event?.key ?? null, raceMasteryId: event?.id ?? null };
+    if (link.iconicKey !== owned.iconicKey) await writeMissingEventStepCredits(db, userId);
 
     await db.race.update({
       where: { id: input.id },
@@ -185,7 +242,7 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
         priority: input.priority,
         excitement: input.excitement,
         isMajorEvent: input.isMajorEvent,
-        iconicKey: input.iconicKey ?? null,
+        ...link,
         notes: input.notes ?? null,
         replayUrl: input.replayUrl ?? null,
         posterUrl: input.posterUrl ?? null,

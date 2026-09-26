@@ -21,7 +21,7 @@ import {
   CAREER_BACKFILL_PHASES, deadlineClock, isCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill,
   runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
-import { ledgerProblems } from '../helpers/career-db';
+import { eventStepProblems, ledgerProblems } from '../helpers/career-db';
 import type { FixtureCopy } from '../helpers/fixture-db';
 import { FIXTURE_GENERATED_AT, FIXTURE_USER_ID, pointPrismaAtFixture } from '../helpers/fixture-db';
 
@@ -162,7 +162,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
 
   /** Everything the backfill writes, for comparing one run with the next. */
   async function written() {
-    const [ledger, milestones, steps, races] = await Promise.all([
+    const [ledger, milestones, steps, races, credits] = await Promise.all([
       prisma.xPTransaction.findMany({
         where: { userId: FIXTURE_USER_ID },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -175,8 +175,9 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
         select: { id: true, unlockedAt: true, achievedAt: true, achievedPrecision: true, achievedSessionId: true },
       }),
       prisma.race.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' }, select: { id: true, creditedViewingSec: true } }),
+      prisma.eventStepCredit.findMany({ where: { userId: FIXTURE_USER_ID }, orderBy: { id: 'asc' } }),
     ]);
-    return { ledger, milestones, steps, races };
+    return { ledger, milestones, steps, races, credits };
   }
 
   let before: ReturnType<typeof untouchable>;
@@ -283,6 +284,56 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(sixHours[0]).toMatchObject({ source: 'MILESTONE', amount: 500, seasonAmount: 0 });
   });
 
+  it('brings the fixture’s recurring event up to 0.4.0: its new steps, once, and a credit for every step it reached', async () => {
+    const tree = await prisma.masteryTree.findFirstOrThrow({
+      where: { userId: FIXTURE_USER_ID, key: 'event:fort-aurelia-24' },
+      select: {
+        name: true,
+        nodes: {
+          select: {
+            key: true, name: true, xpReward: true,
+            progress: { where: { userId: FIXTURE_USER_ID }, select: { unlockedAt: true, achievedPrecision: true } },
+          },
+        },
+      },
+    });
+    const byKey = new Map(tree.nodes.map((node) => [node.key, node]));
+    // Every step 0.4.0 knows, under its 0.4.0 name.
+    expect(tree.nodes).toHaveLength(17);
+    expect(byKey.get('edition_1')?.name).toBe('First Complete Edition');
+    expect(byKey.get('experienced_1')?.name).toBe('First Edition Experienced');
+
+    // The fixture follows Fort Aurelia over two years, 2025 complete and 2026 experienced, 28 credited hours in all.
+    const reached = tree.nodes.filter((node) => node.progress[0]?.unlockedAt != null).map((node) => node.key).sort();
+    expect(reached).toEqual(['edition_1', 'event_hours_25', 'experienced_1']);
+    for (const key of reached) expect(byKey.get(key)?.progress[0]?.achievedPrecision, key).not.toBeNull();
+
+    // Of the new steps it had passed, 25 Hours Here pays, once, as career XP; the first experienced edition pays nothing.
+    const paid = await prisma.xPTransaction.findMany({
+      where: { userId: FIXTURE_USER_ID, dedupeKey: { startsWith: 'mastery:event:fort-aurelia-24:' } },
+      select: { dedupeKey: true, amount: true, seasonAmount: true },
+      orderBy: { dedupeKey: 'asc' },
+    });
+    expect(paid).toEqual([
+      { dedupeKey: 'mastery:event:fort-aurelia-24:edition_1', amount: 1_000, seasonAmount: 0 },
+      { dedupeKey: 'mastery:event:fort-aurelia-24:event_hours_25', amount: 500, seasonAmount: 0 },
+    ]);
+
+    // Every step it reached is credited to the races that reached it, for this event.
+    const races = await prisma.race.findMany({
+      where: { userId: FIXTURE_USER_ID, iconicKey: 'fort-aurelia-24' },
+      select: { id: true, storyCompletedAt: true },
+    });
+    const complete = races.filter((race) => race.storyCompletedAt !== null).map((race) => race.id);
+    const credits = await prisma.eventStepCredit.findMany({ where: { userId: FIXTURE_USER_ID } });
+    const creditedFor = (nodeKey: string) => credits.filter((credit) => credit.nodeKey === nodeKey).map((credit) => credit.raceId).sort();
+    expect(creditedFor('edition_1')).toEqual(complete);
+    expect(creditedFor('experienced_1')).toEqual(races.map((race) => race.id).sort());
+    expect(creditedFor('event_hours_25')).toEqual(races.map((race) => race.id).sort());
+    expect(credits.every((credit) => credit.eventKey === 'fort-aurelia-24' && credit.fingerprint === null)).toBe(true);
+    expect(await eventStepProblems(FIXTURE_USER_ID)).toEqual([]);
+  });
+
   it('keeps the ledger whole: every dedupe key once, and every running total right', async () => {
     const keys = await prisma.xPTransaction.groupBy({
       by: ['dedupeKey'],
@@ -300,6 +351,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     const forced = await runCareerBackfillFor(FIXTURE_USER_ID, { now: new Date(STARTED.getTime() + 86_400_000), clock: PLENTY_OF_TIME, force: true });
     expect(forced).toMatchObject({
       completed: true, racesCredited: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
+      eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
       milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
     });
     const again = await written();
@@ -307,5 +359,6 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(again.milestones).toEqual(settled.milestones);
     expect(again.steps).toEqual(settled.steps);
     expect(again.races).toEqual(settled.races);
+    expect(again.credits).toEqual(settled.credits);
   });
 });

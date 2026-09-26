@@ -14,7 +14,7 @@ import { storyCompleteBonus } from '@/lib/domain/progression';
 import { recomputeCareer } from '@/lib/server/recompute';
 import { isCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
 import {
-  addRace, createCareerUser, H, insertLegacyShortenedRace, ledgerProblems, logStint,
+  addRace, createCareerUser, eventStepProblems, H, insertLegacyShortenedRace, ledgerProblems, logStint,
 } from '../helpers/career-db';
 
 const USER = '00000000-0000-4000-8000-0000000002e1';
@@ -257,6 +257,34 @@ describe('recompute', () => {
     const again = await recomputeCareer(USER, { now: NOW, rebuildMilestoneDates: true });
     expect(again.milestoneDatesRebuilt).toBe(0);
     expect(await prisma.milestoneProgress.findMany({ where: { userId: USER }, orderBy: { id: 'asc' } })).toEqual(settled);
+  });
+
+  it('credits every reached event step to the races that reach it, once', async () => {
+    const first = await addRace(USER, { name: '2024 Recompute Classic', iconicKey: 'recompute-classic', raceDate: new Date(Date.UTC(2024, 5, 1)) });
+    const second = await addRace(USER, { name: '2025 Recompute Classic', iconicKey: 'recompute-classic', raceDate: new Date(Date.UTC(2025, 5, 1)) });
+    await logStint(USER, first, { from: 0, to: 6 * H, watchedAt: new Date(2026, 3, 1, 20, 0), now: NOW });
+    await logStint(USER, second, { from: 0, to: H, watchedAt: new Date(2026, 3, 2, 20, 0), now: NOW });
+    // As 0.3.2 left it: the steps reached, and no record of which races reached them.
+    await prisma.eventStepCredit.deleteMany({ where: { userId: USER } });
+
+    await recomputeCareer(USER, { now: NOW });
+    const credits = await prisma.eventStepCredit.findMany({
+      where: { userId: USER },
+      orderBy: [{ nodeKey: 'asc' }, { raceId: 'asc' }],
+      select: { id: true, nodeKey: true, raceId: true, eventKey: true },
+    });
+    const pairs = (nodeKey: string) => credits.filter((credit) => credit.nodeKey === nodeKey).map((credit) => credit.raceId).sort();
+    expect(pairs('edition_1')).toEqual([first]);
+    expect(pairs('experienced_1')).toEqual([first, second].sort());
+    expect(credits.every((credit) => credit.eventKey === 'recompute-classic')).toBe(true);
+    expect(await eventStepProblems(USER)).toEqual([]);
+
+    await recomputeCareer(USER, { now: NOW });
+    expect(await prisma.eventStepCredit.findMany({
+      where: { userId: USER },
+      orderBy: [{ nodeKey: 'asc' }, { raceId: 'asc' }],
+      select: { id: true, nodeKey: true, raceId: true, eventKey: true },
+    })).toEqual(credits);
   });
 
   it('a rebuild counts only the dates it moves, not the ones the same run has just filled', async () => {

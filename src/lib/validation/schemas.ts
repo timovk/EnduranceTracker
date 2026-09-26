@@ -106,7 +106,15 @@ export const raceInputSchema = z
     status: z.enum(RACE_STATUSES).default('UNWATCHED'),
 
     isMajorEvent: z.coerce.boolean().default(false),
-    /** Groups recurring editions for Race Mastery. Entirely user-defined. */
+    /**
+     * The recurring event the race is an edition of, by key: one of the
+     * account's events, chosen from the form's list. Independent of "Major
+     * event" (0.4.0).
+     */
+    eventKey: optionalText(80),
+    /** A new event, named on the form. Wins over `eventKey`; an event already going by the name is reused. */
+    newEventName: optionalText(80),
+    /** The 0.3.x field for `eventKey`, still read when `eventKey` is absent. */
     iconicKey: optionalText(80),
 
     notes: optionalText(4000),
@@ -124,6 +132,24 @@ export type RaceInput = z.infer<typeof raceInputSchema>;
 
 export const raceUpdateSchema = raceInputSchema.safeExtend({ id: z.string().uuid() });
 export type RaceUpdateInput = z.infer<typeof raceUpdateSchema>;
+
+// ---------------------------------------------------------------------------
+// Recurring events (0.4.0)
+// ---------------------------------------------------------------------------
+
+/** An event's name, as the user types it. */
+export const eventNameSchema = z.string().trim()
+  .min(1, 'Give the event a name.')
+  .max(80, 'Keep the name to 80 characters.');
+
+/** An event's key, as a page or a form sends it back. Keys are free text from 0.3.x. */
+export const eventKeySchema = z.string().trim().min(1).max(80);
+
+/** Races picked on a page, by id. */
+export const raceIdsSchema = z.array(z.string().uuid()).min(1).max(1_000);
+
+/** A suggestion id, as the Events page sends it back. */
+export const eventSuggestionIdSchema = z.string().trim().min(1).max(300);
 
 // ---------------------------------------------------------------------------
 // Viewing sessions

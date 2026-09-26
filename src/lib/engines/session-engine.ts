@@ -15,6 +15,7 @@
 import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
 import { STORY_CONFIG, TIMELINE_SHAPE, XP_CONFIG, TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
+import { editionFingerprint, editionYear, serialiseFingerprint } from '@/lib/domain/edition';
 import { addInterval, clampIntervals, coverageSeconds, fromRows } from '@/lib/domain/intervals';
 import { clampSpeed, realSecondsFor, timelineSecondsFor } from '@/lib/domain/playback';
 import { storyCompleteBonus, xpForSession } from '@/lib/domain/progression';
@@ -52,7 +53,9 @@ import {
 } from './season-pass-engine';
 import { evaluateChallenges } from './challenge-engine';
 import { syncAchievements, syncMilestones } from './achievement-engine';
-import { ensureMasteryTrees, syncMastery, recomputeRaceMasteries, getMasteryForChampionship } from './mastery-engine';
+import {
+  ensureMasteryTrees, syncMastery, recomputeRaceMasteries, getMasteryForChampionship, writeMissingEventStepCredits,
+} from './mastery-engine';
 import { ensureSeasonCollections, syncCollections } from './collection-engine';
 import { syncAwards } from './awards-engine';
 import { recordedHoursInRange, getBudgetSnapshot } from './budget-engine';
@@ -643,7 +646,9 @@ async function unchangedLedger(db: Tx, userId: string): Promise<LedgerRebuild> {
  *
  * Landmarks stay: achievements, milestones, mastery nodes and trophies are
  * untouched, and a Hall of Fame plaque keeps its place with its link to the
- * race cleared. Nothing it helped reach is taken back.
+ * race cleared. Nothing it helped reach is taken back — and the event steps
+ * it helped reach are remembered by its edition (a tombstone credit), so the
+ * same edition added again cannot pay them twice.
  *
  * Returns null when the race is not in this account's library.
  */
@@ -654,7 +659,12 @@ export async function deleteRace(
 ): Promise<RaceRemoval | null> {
   return prisma.$transaction(async (tx) => {
     const db = tx as Tx;
-    const race = await db.race.findFirst({ where: { id: raceId, userId }, select: { id: true, name: true } });
+    const race = await db.race.findFirst({
+      where: { id: raceId, userId },
+      select: {
+        id: true, name: true, runtimeSec: true, raceDate: true, circuitSlug: true, season: { select: { year: true } },
+      },
+    });
     if (race === null) return null;
 
     const sessions = await db.raceViewingSession.findMany({
@@ -666,6 +676,23 @@ export async function deleteRace(
     const viewing = await revokeSessionsXp(db, userId, sessions.map((session) => session.id));
     const orphaned = await revokeRaceViewingXp(db, userId, race.id);
     const storyBonus = await revokeXpByDedupeKeys(db, userId, [storyBonusKey(race.id)]);
+
+    // The event steps the race helped reach are credited to it first, and its
+    // credits keep its edition's fingerprint once it is gone (a tombstone), so
+    // the same edition added again cannot pay those steps a second time, in
+    // this event or any other.
+    await writeMissingEventStepCredits(db, userId);
+    await db.eventStepCredit.updateMany({
+      where: { userId, raceId: race.id },
+      data: {
+        fingerprint: serialiseFingerprint(editionFingerprint({
+          editionYear: editionYear({ raceDate: race.raceDate, seasonYear: race.season?.year ?? null }),
+          circuitSlug: race.circuitSlug,
+          name: race.name,
+          runtimeSec: race.runtimeSec,
+        })),
+      },
+    });
 
     // Scoped by account as well as id, so the delete is safe on its own. It
     // cascades to the stints, their intervals and the collection cards; the

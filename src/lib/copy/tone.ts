@@ -13,6 +13,7 @@
  */
 
 import { TIMELINE_SHAPE } from '@/lib/config';
+import { formatDuration } from '@/lib/domain/time';
 import type { MilestonePrecision } from '@/lib/domain/types';
 
 /** Words this application does not say to its user. */
@@ -241,6 +242,42 @@ export function yearToDateFact(year: number, creditedSeconds: number): string {
   const shown = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
   const figure = shown.toLocaleString('en-GB');
   return `${year} so far: ${figure} ${shown === 1 ? 'hour' : 'hours'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Event Legacy (0.4.0)
+// ---------------------------------------------------------------------------
+//
+// An event's headline is its history in one line, from what was actually
+// watched — never a count of what was not.
+
+/**
+ * "24 Hours of Le Mans — 9 editions experienced — 181h 42m watched — 8
+ * complete race stories". Each figure appears once there is something to
+ * say; an event nothing has been watched of yet says where its story starts.
+ */
+export function eventLegacyHeadline(stats: {
+  name: string;
+  editionsExperienced: number;
+  creditedSeconds: number;
+  storyCompleteRaces: number;
+}): string {
+  const parts = [stats.name];
+  if (stats.editionsExperienced > 0) {
+    parts.push(`${count(stats.editionsExperienced)} ${stats.editionsExperienced === 1 ? 'edition' : 'editions'} experienced`);
+  }
+  if (stats.creditedSeconds >= 60) parts.push(`${formatDuration(stats.creditedSeconds)} watched`);
+  if (stats.storyCompleteRaces > 0) {
+    parts.push(
+      `${count(stats.storyCompleteRaces)} complete race ${stats.storyCompleteRaces === 1 ? 'story' : 'stories'}`,
+    );
+  }
+  if (parts.length === 1) return `${stats.name} — its story starts with the first edition you watch`;
+  return parts.join(' — ');
+}
+
+function count(value: number): string {
+  return value.toLocaleString('en-GB');
 }
 
 /** Recommendation framing. Suggestions, never instructions. */

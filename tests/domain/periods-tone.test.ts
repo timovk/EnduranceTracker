@@ -15,7 +15,7 @@ import {
   weeksRemainingInYear, wholeWeeksRemainingInYear, yearPeriod, yearProgress,
 } from '@/lib/domain/periods';
 import {
-  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, EXPIRED_CHALLENGE_NOTE,
+  ARCHIVED_PASS_NOTE, backlogFraming, budgetProjectionNote, celebratedBy, eventLegacyHeadline, EXPIRED_CHALLENGE_NOTE,
   FORBIDDEN_TONE_WORDS, momentumNote, precisionLabel, raceRemovedNotice, RECOMMENDATION_FOOTNOTE,
   seasonClosedStintNote, seasonalChallengesClosedNote, seasonPassClosedHeadline, seasonPassClosedNote,
   seasonPassClosedShortNote, stillAheadNote, stillToComeEmptyNote, stillToComeNote, stintHeading, welcomeBack,
@@ -206,6 +206,11 @@ function everyUserFacingString(): string[] {
   for (const [value, target] of [[0, 1], [0.4, 100], [212.7, 250], [9, 10]] as const) {
     strings.push(stillAheadNote(value, target, 'hours'), stillAheadNote(value, target, 'count'));
   }
+  for (const [editionsExperienced, creditedSeconds, storyCompleteRaces] of [
+    [0, 0, 0], [0, 45, 0], [0, 1_500, 0], [1, 3_600, 0], [1, 3_600, 1], [9, 654_120, 8], [1_200, 360_000_000, 1_000],
+  ] as const) {
+    strings.push(eventLegacyHeadline({ name: '24 Hours of Le Mans', editionsExperienced, creditedSeconds, storyCompleteRaces }));
+  }
   return strings;
 }
 
@@ -320,6 +325,24 @@ describe('tone', () => {
       'Celebrated by the first rung, the second and the third.',
     );
     expect(celebratedBy([])).toBe('');
+  });
+
+  it('sums up an event in one line from what was watched, never from what was not', () => {
+    const headline = (editionsExperienced: number, creditedSeconds: number, storyCompleteRaces: number) =>
+      eventLegacyHeadline({ name: '24 Hours of Le Mans', editionsExperienced, creditedSeconds, storyCompleteRaces });
+    expect(headline(9, 181 * 3_600 + 42 * 60, 8)).toBe(
+      '24 Hours of Le Mans — 9 editions experienced — 181h 42m watched — 8 complete race stories',
+    );
+    expect(headline(1, 3_600, 1)).toBe('24 Hours of Le Mans — 1 edition experienced — 1h 00m watched — 1 complete race story');
+    // A glimpse is time watched, not an edition experienced.
+    expect(headline(0, 25 * 60, 0)).toBe('24 Hours of Le Mans — 25m watched');
+    expect(headline(1_200, 3_600, 0)).toBe('24 Hours of Le Mans — 1,200 editions experienced — 1h 00m watched');
+    expect(headline(0, 0, 0)).toBe('24 Hours of Le Mans — its story starts with the first edition you watch');
+    // Under a minute is not yet worth a figure.
+    expect(headline(0, 45, 0)).toBe(headline(0, 0, 0));
+    for (const [editions, seconds, stories] of [[0, 0, 0], [3, 7_200, 0]] as const) {
+      expect(headline(editions, seconds, stories)).not.toMatch(/missed|not completed|incomplete|only|still to|left/i);
+    }
   });
 
   it('shows a milestone still ahead as where the career stands, never rounded up to it', () => {

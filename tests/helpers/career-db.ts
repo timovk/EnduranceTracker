@@ -12,12 +12,15 @@
  *     past its new end.
  *
  * `ledgerProblems` checks invariant I2 (career XP is the sum of the ledger,
- * and every row's running total is right) and says what is wrong in words.
+ * and every row's running total is right) and says what is wrong in words;
+ * `eventStepProblems` checks I6 (no race helped pay an event step twice).
  */
 
 import { prisma } from '@/lib/db/client';
+import { editionIdentityOf, editionYear, longestConsecutiveRun } from '@/lib/domain/edition';
 import { levelFromXp } from '@/lib/domain/progression';
 import type { SessionOutcome } from '@/lib/engines/contracts';
+import { circuitSlug } from '@/lib/engines/race-engine';
 import { logViewingSession } from '@/lib/engines/session-engine';
 import { awardXp } from '@/lib/engines/xp-ledger';
 import type { Tx } from '@/lib/db/client';
@@ -41,6 +44,8 @@ export interface RaceOptions {
   seasonId?: string | null;
   /** The race day, stored the way the form stores it: UTC midnight. */
   raceDate?: Date | null;
+  /** The circuit's name; its slug is derived the way the form derives it. */
+  circuit?: string | null;
 }
 
 /** A race in the library, the way the Add Race form writes one. */
@@ -58,6 +63,8 @@ export async function addRace(userId: string, options: RaceOptions = {}): Promis
       championshipId: options.championshipId ?? null,
       seasonId: options.seasonId ?? null,
       raceDate: options.raceDate ?? null,
+      circuit: options.circuit ?? null,
+      circuitSlug: circuitSlug(options.circuit),
     },
     select: { id: true },
   });
@@ -118,6 +125,83 @@ export async function ledgerProblems(userId: string): Promise<string[]> {
   }
   if (profile.level !== levelFromXp(running).level) {
     problems.push(`the profile is level ${profile.level}, the ledger says ${levelFromXp(running).level}`);
+  }
+  return problems;
+}
+
+/**
+ * What is wrong with an account's event steps, if anything (invariant I6: no
+ * race has helped pay an event step twice).
+ *
+ * Every step paid in an event must have been paid by the races credited to
+ * THAT event for it — the races that had not helped pay that kind of step
+ * anywhere before — and those races alone must reach the step: enough
+ * distinct editions, a long enough run of years, or enough hours. A step paid
+ * on editions that had already paid it somewhere else has no such races,
+ * because a race holds one credit per kind of step, and is reported. Races
+ * deleted since count as one edition each and are not measured in years or
+ * hours. An empty list means every paid step was paid once.
+ */
+export async function eventStepProblems(userId: string): Promise<string[]> {
+  const [paid, credits, races, nodes] = await Promise.all([
+    prisma.xPTransaction.findMany({
+      where: { userId, source: 'MASTERY_NODE', dedupeKey: { startsWith: 'mastery:event:' } },
+      select: { dedupeKey: true },
+    }),
+    prisma.eventStepCredit.findMany({ where: { userId }, select: { nodeKey: true, raceId: true, eventKey: true } }),
+    prisma.race.findMany({
+      where: { userId },
+      select: { id: true, raceDate: true, creditedViewingSec: true, realViewingSec: true, season: { select: { year: true } } },
+    }),
+    prisma.masteryNode.findMany({
+      where: { tree: { userId, kind: 'RACE_EVENT' } },
+      select: { key: true, metric: true, threshold: true, tree: { select: { key: true } } },
+    }),
+  ]);
+  const racesById = new Map(races.map((race) => [race.id, race]));
+  const problems: string[] = [];
+
+  for (const row of paid) {
+    const dedupeKey = row.dedupeKey ?? '';
+    const node = nodes.find((candidate) => dedupeKey === `mastery:${candidate.tree.key}:${candidate.key}`);
+    if (node === undefined) {
+      problems.push(`${dedupeKey} was paid for a step that is not in any event tree`);
+      continue;
+    }
+    const eventKey = node.tree.key.slice('event:'.length);
+    const credited = credits.filter((credit) => credit.nodeKey === node.key && credit.eventKey === eventKey);
+    const present = credited.flatMap((credit) => {
+      const race = racesById.get(credit.raceId);
+      return race === undefined ? [] : [race];
+    });
+    const gone = credited.length - present.length;
+    const yearOf = (race: (typeof present)[number]) =>
+      editionYear({ raceDate: race.raceDate, seasonYear: race.season?.year ?? null });
+
+    let reach: number;
+    switch (node.metric) {
+      case 'editionsStoryComplete':
+      case 'editionsExperienced':
+        reach = new Set(present.map((race) => editionIdentityOf(race.id, yearOf(race)))).size + gone;
+        break;
+      case 'consecutiveEditions':
+        reach = gone > 0 ? node.threshold : (longestConsecutiveRun(present.flatMap((race) => {
+          const year = yearOf(race);
+          return year === null ? [] : [year];
+        }))?.length ?? 0);
+        break;
+      case 'realHours':
+        // Recognised from hours rounded to one place, as the engine does.
+        reach = gone > 0
+          ? node.threshold
+          : Math.round(present.reduce((sum, race) => sum + (race.creditedViewingSec ?? race.realViewingSec), 0) / 360) / 10;
+        break;
+      default:
+        reach = 0;
+    }
+    if (reach < node.threshold) {
+      problems.push(`${dedupeKey} was paid, but the races credited to ${eventKey} for it reach only ${reach} of ${node.threshold}`);
+    }
   }
   return problems;
 }

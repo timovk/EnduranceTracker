@@ -50,6 +50,13 @@ import {
   clearCareerTimelineCache, getCareerTimeline, timelineFingerprint,
 } from '@/lib/engines/career-timeline-engine';
 import { getRaceDetail, listRaces } from '@/lib/server/races';
+import { getEventLegacy, getEventsIndex, resolveEventForRaceInput } from '@/lib/engines/event-legacy-engine';
+import { recomputeRaceMasteries } from '@/lib/engines/mastery-engine';
+import {
+  createEventAction, findRacesToLinkAction, linkRacesToEventAction, mergeEventsAction, renameEventAction,
+  setEventArchivedAction, unlinkRaceFromEventAction,
+} from '@/lib/server/career-actions';
+import type { Tx } from '@/lib/db/client';
 import {
   createChampionshipAction,
   createRaceAction,
@@ -282,6 +289,70 @@ describe('a career replay belongs to one account', () => {
 
     await as(sam, () => logSessionAction(stintForm(samRace)));
     expect(await timelineFingerprint(sam)).not.toBe(samBefore);
+  });
+});
+
+describe('an event belongs to the account that follows it', () => {
+  async function alexEvent(): Promise<{ key: string; raceId: string }> {
+    const created = await as(alex, () => createEventAction(form({ name: 'Alex’s Classic' })));
+    expect(created.ok, created.message).toBe(true);
+    const key = created.data!.event!.key;
+    const raceId = await createRace(alex, { name: '2025 Alex’s Classic', eventKey: key });
+    return { key, raceId };
+  }
+
+  it('an event cannot be renamed, merged, linked or read from the other account', async () => {
+    const { key, raceId } = await alexEvent();
+    const samRace = await createRace(sam, { name: 'Sam’s Race' });
+    const samEvent = await as(sam, () => createEventAction(form({ name: 'Sam’s Event' })));
+    const samKey = samEvent.data!.event!.key;
+
+    const gone = { ok: false, message: 'That event is no longer in your list.' };
+    expect(await as(sam, () => renameEventAction(form({ key, name: 'Taken Over' })))).toEqual(gone);
+    expect(await as(sam, () => mergeEventsAction(key, samKey))).toEqual(gone);
+    expect(await as(sam, () => mergeEventsAction(samKey, key))).toEqual(gone);
+    expect(await as(sam, () => setEventArchivedAction(key, true))).toEqual(gone);
+    expect(await as(sam, () => linkRacesToEventAction(key, [samRace]))).toEqual(gone);
+    // Sam's own event, with Alex's race: the race reads as gone.
+    expect(await as(sam, () => linkRacesToEventAction(samKey, [raceId])))
+      .toEqual({ ok: false, message: 'Those races are no longer in the library.' });
+    expect(await as(sam, () => unlinkRaceFromEventAction(raceId)))
+      .toEqual({ ok: false, message: 'That race is no longer in the library.' });
+    expect(await as(sam, () => findRacesToLinkAction(key, ''))).toEqual([]);
+    expect(await getEventLegacy(sam, key)).toBeNull();
+    expect((await getEventsIndex(sam)).events.map((event) => event.key)).toEqual([samKey]);
+
+    // Nothing of Alex's moved.
+    const event = await prisma.raceMastery.findFirstOrThrow({ where: { userId: alex, key } });
+    expect(event).toMatchObject({ displayName: 'Alex’s Classic', archivedAt: null, mergedIntoId: null });
+    expect((await prisma.race.findUniqueOrThrow({ where: { id: raceId } })).iconicKey).toBe(key);
+    expect((await prisma.race.findUniqueOrThrow({ where: { id: samRace } })).iconicKey).toBeNull();
+  });
+
+  it('a merge chain never follows into the other account', async () => {
+    const { key: alexKey } = await alexEvent();
+    const alexRow = await prisma.raceMastery.findFirstOrThrow({ where: { userId: alex, key: alexKey } });
+    // A merged event of Sam's whose pointer names Alex's event: a row the
+    // application would never write, planted to test that nothing follows it.
+    await prisma.raceMastery.create({
+      data: { userId: sam, key: 'planted', name: 'Planted', archivedAt: new Date(), mergedIntoId: alexRow.id },
+    });
+    const samRace = await createRace(sam, { name: 'Sam Planted Race' });
+    await prisma.race.update({ where: { id: samRace }, data: { iconicKey: 'planted' } });
+
+    // The page does not lead into Alex's career…
+    const page = await getEventLegacy(sam, 'planted');
+    expect(page).not.toBeNull();
+    expect(page && 'redirectTo' in page).toBe(false);
+    // …the race form does not resolve into it…
+    const resolved = await prisma.$transaction((tx) => resolveEventForRaceInput(tx as Tx, sam, { eventKey: 'planted' }, new Date()));
+    expect(resolved).toBeNull();
+    // …and recomputing Sam's events leaves the race where it is.
+    await prisma.$transaction((tx) => recomputeRaceMasteries(tx as Tx, sam, new Date()));
+    const race = await prisma.race.findUniqueOrThrow({ where: { id: samRace } });
+    expect(race.iconicKey).toBe('planted');
+    expect(race.raceMasteryId).not.toBe(alexRow.id);
+    expect(await prisma.race.count({ where: { raceMasteryId: alexRow.id, userId: sam } })).toBe(0);
   });
 });
 

@@ -28,8 +28,8 @@ const H = 3600;
 
 /**
  * The Event Legacy steps 0.4.0 appends to `MASTERY_CONFIG.raceEventNodes`,
- * found by key. Until they are in the configuration there is nothing to
- * find, and the model counts nothing for them.
+ * found by key, so the model counts exactly the steps that exist (a test
+ * below checks they are all there).
  */
 const NEW_EVENT_NODE_KEYS = new Set([
   'experienced_1', 'experienced_3', 'experienced_5', 'experienced_10', 'experienced_25',
@@ -239,6 +239,16 @@ describe('ordinary watching is the main source of XP', () => {
       const c = career(hours);
       expect((c.careerMilestones + c.eventLegacyNew) / c.viewing, `at ${hours}h`).toBeLessThan(0.02);
     }
+  });
+
+  it('models every Event Legacy step the configuration holds', () => {
+    const configured = MASTERY_CONFIG.raceEventNodes.filter((node) => NEW_EVENT_NODE_KEYS.has(node.key));
+    expect(configured.map((node) => node.key).sort()).toEqual([...NEW_EVENT_NODE_KEYS].sort());
+    // …and a career that follows events for years is paid something for them, a little. A first
+    // year holds one edition of each, and the first experienced edition pays nothing.
+    expect(career(336).eventLegacyNew).toBe(0);
+    expect(career(672).eventLegacyNew).toBeGreaterThan(0);
+    expect(career(3360).eventLegacyNew).toBeGreaterThan(career(672).eventLegacyNew);
   });
 });
 

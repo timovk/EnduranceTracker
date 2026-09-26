@@ -44,6 +44,7 @@ import type { MilestonePrecision } from '@/lib/domain/types';
 import { milestoneXpFor } from './achievement-engine';
 import type { TimelineInputs } from './career-timeline-engine';
 import type { CareerMilestoneUnlock } from './contracts';
+import { eventHref } from './mastery-engine';
 import { computeCareerMetricsWithHistory, type CareerMetrics } from './metrics';
 import { stintUnlockWindowFor } from './stint-unlocks';
 import { awardXp } from './xp-ledger';
@@ -533,12 +534,13 @@ function ladderXp(def: CareerMilestoneDef): number {
  *
  * Built from the milestone rows, the live metrics (progress is measured with
  * the same figures recognition uses), the career history those metrics were
- * read with (race and event names, and the current year's hours), and the Hall
+ * read with (race names and the current year's hours), the account's events
+ * (a milestone reached in one names it and links to its page), and the Hall
  * of Fame plaques a milestone links to. No query is made per item.
  */
 export async function getCareerMilestonesView(userId: string, now: Date): Promise<CareerMilestonesView> {
   const hallOfFameKeys = [...new Set(CAREER_MILESTONES.flatMap((def) => def.hallOfFameKeys))];
-  const [rows, { metrics, history }, plaques] = await Promise.all([
+  const [rows, { metrics, history }, plaques, events] = await Promise.all([
     prisma.milestoneProgress.findMany({
       where: { userId, reachedAt: { not: null } },
       select: {
@@ -551,13 +553,12 @@ export async function getCareerMilestonesView(userId: string, now: Date): Promis
       where: { userId, key: { in: hallOfFameKeys } },
       select: { key: true, title: true },
     }),
+    prisma.raceMastery.findMany({ where: { userId }, select: { id: true, key: true, name: true, displayName: true } }),
   ]);
 
   const racesById = new Map(history.races.map((race) => [race.id, race]));
-  const eventNames = new Map<string, string>();
-  for (const race of history.races) {
-    if (race.eventId !== null && race.eventName !== null) eventNames.set(race.eventId, race.eventName);
-  }
+  // An event is named, and linked to its page, even once it has no races.
+  const eventsById = new Map(events.map((event) => [event.id, event]));
   const plaqueByKey = new Map(plaques.map((plaque) => [plaque.key, plaque]));
 
   type Row = (typeof rows)[number];
@@ -572,9 +573,10 @@ export async function getCareerMilestonesView(userId: string, now: Date): Promis
 
   const subjectOf = (def: CareerMilestoneDef, row: Row): CareerMilestoneItem['subject'] => {
     if (def.metric === 'eventEditions' || row.eventId !== null) {
-      const name = (row.eventId !== null ? eventNames.get(row.eventId) : undefined) ?? row.subjectName;
-      // Events get pages of their own with Event Legacy; until then the name is enough.
-      return name === null ? null : { kind: 'event', href: null, name };
+      const event = row.eventId !== null ? eventsById.get(row.eventId) : undefined;
+      const name = event !== undefined ? (event.displayName ?? event.name) : row.subjectName;
+      if (name === null) return null;
+      return { kind: 'event', href: event === undefined ? null : eventHref(event.key), name };
     }
     if (row.raceId === null) return row.subjectName === null ? null : { kind: 'race', href: null, name: row.subjectName };
     const race = racesById.get(row.raceId);

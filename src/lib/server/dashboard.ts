@@ -10,6 +10,7 @@
 import { prisma } from '@/lib/db/client';
 import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { listRecentCareerMilestones } from '@/lib/engines/career-milestone-engine';
+import { carriedEventStepCopies } from '@/lib/engines/mastery-engine';
 import { getBudgetSnapshot } from '@/lib/engines/budget-engine';
 import { getStrategist } from '@/lib/engines/strategist-engine';
 import { getMomentum, getStreak } from '@/lib/engines/momentum-engine';
@@ -153,6 +154,33 @@ export async function getDashboard(userId: string, now: Date = new Date()): Prom
 }
 
 /**
+ * The most recent mastery unlocks, without the copies a merge carried into
+ * the surviving event (0.4.0): each step shows once, where it was reached.
+ * Read a page at a time, so copies never crowd older unlocks off the shelf.
+ */
+async function recentMasteryUnlocks(userId: string, limit: number) {
+  const pageAt = (skip: number) => prisma.masteryProgress.findMany({
+    where: { userId, unlockedAt: { not: null } },
+    orderBy: [{ unlockedAt: 'desc' }, { id: 'asc' }],
+    skip,
+    take: limit,
+    select: {
+      unlockedAt: true,
+      node: { select: { key: true, name: true, rarity: true, tree: { select: { key: true, name: true } } } },
+    },
+  });
+  const kept: Awaited<ReturnType<typeof pageAt>> = [];
+  for (let skip = 0; kept.length < limit; skip += limit) {
+    const page = await pageAt(skip);
+    const carried = await carriedEventStepCopies(prisma, userId, page.flatMap((row) =>
+      row.unlockedAt === null ? [] : [{ treeKey: row.node.tree.key, nodeKey: row.node.key, unlockedAt: row.unlockedAt }]));
+    kept.push(...page.filter((row) => !carried.has(`${row.node.tree.key}:${row.node.key}`)));
+    if (page.length < limit) break;
+  }
+  return kept.slice(0, limit);
+}
+
+/**
  * The most recent things to unlock, across every system.
  *
  * A shelf rather than a feed: it celebrates what happened, and says nothing at
@@ -166,15 +194,7 @@ async function recentUnlocks(userId: string, limit = 8): Promise<UnlockRowData[]
       take: limit,
       select: { achievement: { select: { key: true, name: true, description: true, rarity: true } }, unlockedAt: true },
     }),
-    prisma.masteryProgress.findMany({
-      where: { userId, unlockedAt: { not: null } },
-      orderBy: { unlockedAt: 'desc' },
-      take: limit,
-      select: {
-        unlockedAt: true,
-        node: { select: { key: true, name: true, rarity: true, tree: { select: { key: true, name: true } } } },
-      },
-    }),
+    recentMasteryUnlocks(userId, limit),
     prisma.trophy.findMany({
       where: { userId },
       orderBy: { awardedAt: 'desc' },

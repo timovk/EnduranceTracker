@@ -8,9 +8,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  computeChampionshipMetrics, computeEventMetrics, masteryUnlockAward,
+  computeChampionshipMetrics, computeEventMetrics, eventStepContributors, eventStepPays, indexEventStepCredits,
+  isCreditedFor, masteryUnlockAward,
   type MasteryRaceInput, type MasterySeasonInput,
 } from '@/lib/engines/mastery-engine';
+import { editionFingerprint, serialiseFingerprint } from '@/lib/domain/edition';
 import { MASTERY_CONFIG } from '@/lib/config';
 import { longestRun } from '@/lib/engines/metrics';
 
@@ -301,6 +303,105 @@ describe('paying for an unlocked node', () => {
 
   it('writes no ledger row for a node worth nothing', () => {
     expect(masteryUnlockAward({ ...unlock, xpReward: 0 })).toBeNull();
+  });
+});
+
+describe('the event steps', () => {
+  const nodes = MASTERY_CONFIG.raceEventNodes;
+  const APPENDED = [
+    'experienced_1', 'experienced_3', 'experienced_5', 'experienced_10', 'experienced_25',
+    'consecutive_10', 'event_hours_25', 'event_hours_100', 'event_hours_250',
+  ];
+
+  it('appends the 0.4.0 steps after the original eight, so every original step keeps its place', () => {
+    expect(nodes.map((node) => node.key)).toEqual([
+      'edition_1', 'edition_3', 'edition_5', 'edition_10', 'consecutive_3', 'consecutive_5', 'event_hours_50', 'event_hours_150',
+      ...APPENDED,
+    ]);
+  });
+
+  it('names the Story Complete steps apart from the experienced ones, and changes nothing they pay', () => {
+    const byKey = new Map<string, (typeof nodes)[number]>(nodes.map((node) => [node.key, node]));
+    expect(['edition_1', 'edition_3', 'edition_5', 'edition_10', 'consecutive_3', 'consecutive_5']
+      .map((key) => [byKey.get(key)?.name, byKey.get(key)?.xpReward])).toEqual([
+      ['First Complete Edition', 1_000], ['Three Complete Editions', 4_000], ['Five Complete Editions', 9_000],
+      ['Ten Complete Editions', 25_000], ['Three Complete in a Row', 6_000], ['Five Complete in a Row', 15_000],
+    ]);
+    expect(byKey.get('experienced_1')).toMatchObject({ name: 'First Edition Experienced', metric: 'editionsExperienced', xpReward: 0 });
+  });
+
+  it('keeps the new steps small: 14,300 XP an event over a lifetime, against 85,000', () => {
+    const sum = (keys: (key: string) => boolean) => nodes.filter((node) => keys(node.key)).reduce((total, node) => total + node.xpReward, 0);
+    expect(sum((key) => APPENDED.includes(key))).toBe(14_300);
+    expect(sum((key) => !APPENDED.includes(key))).toBe(85_000);
+  });
+});
+
+describe('event-step credits — every race helps pay each kind of step once', () => {
+  const edition = (overrides: Partial<MasteryRaceInput>): MasteryRaceInput =>
+    masteryRace({ iconicKey: 'le-mans-24', name: '24 Hours of Le Mans', circuitSlug: 'la-sarthe', runtimeSec: 24 * H, ...overrides });
+  const node = (key: string, metric: string, threshold: number, xpReward = 1_000) => ({ key, metric, threshold, xpReward });
+
+  it('names the races that reach each kind of step', () => {
+    const members = [
+      edition({ id: 'a', year: 2021 }),
+      edition({ id: 'b', year: 2022 }),
+      edition({ id: 'c', year: 2024 }),
+      edition({ id: 'd', year: 2025, storyComplete: false, experienced: true }),
+      edition({ id: 'e', year: 2026, storyComplete: false, experienced: false, realViewingSec: 0 }),
+    ];
+    const ids = (metric: string) => eventStepContributors(metric, members).map((race) => race.id);
+    expect(ids('editionsStoryComplete')).toEqual(['a', 'b', 'c']);
+    expect(ids('editionsExperienced')).toEqual(['a', 'b', 'c', 'd']);
+    // Only the Story Complete races of the longest run: 2021–2022, the earlier of two equal runs.
+    expect(ids('consecutiveEditions')).toEqual(['a', 'b']);
+    expect(ids('realHours')).toEqual(['a', 'b', 'c', 'd']);
+    expect(ids('storyCompletes')).toEqual([]);
+  });
+
+  it('pays a step only on editions that have not helped pay that kind of step before', () => {
+    const members = [edition({ id: 'a', year: 2024 }), edition({ id: 'b', year: 2025 }), edition({ id: 'c', year: 2026 })];
+    const current = new Set(['a', 'b', 'c']);
+    const none = indexEventStepCredits([], current);
+    expect(eventStepPays(node('edition_3', 'editionsStoryComplete', 3), members, none)).toBe(true);
+
+    // One of the three already helped pay Three Complete Editions in another event.
+    const one = indexEventStepCredits([{ nodeKey: 'edition_3', raceId: 'b', fingerprint: null }], current);
+    expect(isCreditedFor(one, 'edition_3', members[1]!)).toBe(true);
+    expect(isCreditedFor(one, 'edition_1', members[1]!)).toBe(false);
+    expect(eventStepPays(node('edition_3', 'editionsStoryComplete', 3), members, one)).toBe(false);
+    // A kind of step it never helped pay still pays.
+    expect(eventStepPays(node('edition_1', 'editionsStoryComplete', 1), members, one)).toBe(true);
+  });
+
+  it('never pays a step worth nothing', () => {
+    const members = [edition({ id: 'a', year: 2024 })];
+    expect(eventStepPays(node('experienced_1', 'editionsExperienced', 1, 0), members, indexEventStepCredits([], new Set(['a'])))).toBe(false);
+  });
+
+  it('recognises a deleted edition added again, by year, rounded length, and circuit or name', () => {
+    const deleted = serialiseFingerprint(editionFingerprint({
+      editionYear: 2025, circuitSlug: 'la-sarthe', name: '2025 24 Hours of Le Mans', runtimeSec: 24 * H,
+    }));
+    const credits = indexEventStepCredits([{ nodeKey: 'edition_1', raceId: 'gone', fingerprint: deleted }], new Set(['new']));
+    const again = (overrides: Partial<MasteryRaceInput>) => edition({ id: 'new', year: 2025, ...overrides });
+
+    expect(isCreditedFor(credits, 'edition_1', again({ runtimeSec: 24 * H + 5 }))).toBe(true);
+    expect(isCreditedFor(credits, 'edition_1', again({ circuitSlug: 'elsewhere' }))).toBe(true);
+    expect(isCreditedFor(credits, 'edition_1', again({ name: 'Something else entirely' }))).toBe(true);
+    expect(isCreditedFor(credits, 'edition_1', again({ circuitSlug: 'elsewhere', name: 'Something else entirely' }))).toBe(false);
+    expect(isCreditedFor(credits, 'edition_1', again({ year: 2026 }))).toBe(false);
+    expect(isCreditedFor(credits, 'edition_1', again({ runtimeSec: 12 * H }))).toBe(false);
+    expect(eventStepPays(node('edition_1', 'editionsStoryComplete', 1), [again({})], credits)).toBe(false);
+  });
+
+  it('reads a fingerprint as a tombstone only once its race is gone', () => {
+    const fingerprint = serialiseFingerprint(editionFingerprint({
+      editionYear: 2025, circuitSlug: 'la-sarthe', name: '24 Hours of Le Mans', runtimeSec: 24 * H,
+    }));
+    const stillHere = indexEventStepCredits([{ nodeKey: 'edition_1', raceId: 'a', fingerprint }], new Set(['a']));
+    expect(stillHere.tombstones.size).toBe(0);
+    expect(isCreditedFor(stillHere, 'edition_1', edition({ id: 'twin', year: 2025 }))).toBe(false);
   });
 });
 

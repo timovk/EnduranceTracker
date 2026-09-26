@@ -17,7 +17,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   Award, BarChart3, BookOpen, CalendarClock, Gauge, Landmark, Layers,
-  ListChecks, Settings, Ticket, Trophy, Waypoints, Target,
+  ListChecks, Repeat, Settings, Ticket, Trophy, Waypoints, Target,
 } from 'lucide-react';
 import { AccountMenu, type AccountChip } from '@/components/accounts/account-menu';
 import { cn } from '@/lib/utils';
@@ -30,6 +30,7 @@ const NAV = [
   { href: '/challenges', label: 'Challenges', icon: ListChecks },
   { href: '/season-pass', label: 'Season Pass', icon: Ticket },
   { href: '/career', label: 'Career', icon: Target },
+  { href: '/events', label: 'Events', icon: Repeat },
   { href: '/mastery', label: 'Mastery', icon: Layers },
   { href: '/collections', label: 'Collections', icon: Layers },
   { href: '/achievements', label: 'Achievements', icon: Award },
