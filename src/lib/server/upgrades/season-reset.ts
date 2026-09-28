@@ -41,9 +41,9 @@
  * Nothing that survives is recomputed but the career totals. Every pass the
  * reset reaches is deleted outright, and the only season XP it removes is
  * dated inside those passes' quarters, so no surviving pass's total changes.
- * (`rebuildSeasonXpFromLedger` is deliberately NOT called: it sums the
- * ledger's unboosted `seasonAmount`, and would strip a Q4 pass of the momentum
- * bonus `addSeasonXp` added on top.)
+ * (No pass is rebuilt from the ledger's sum: the ledger holds the unboosted
+ * `seasonAmount`, and a rebuild would strip a Q4 pass of the momentum bonus
+ * `addSeasonXp` added on top.)
  *
  * Everything is DELETED and then REBUILT — no negative XP is written, exactly
  * as deleting a stint works. The desktop shell takes a pre-update snapshot of

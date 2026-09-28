@@ -32,6 +32,7 @@ import { circuitSlug, rebuildRaceIntervals, recomputeRaceAggregates } from '@/li
 import { clearCareerTimelineCache } from '@/lib/engines/career-timeline-engine';
 import type { RaceEditResync } from '@/lib/engines/progression-resync';
 import { raceRemovedNotice } from '@/lib/copy/tone';
+import { isExpedition } from '@/lib/domain/expedition';
 import { formatTimestamp } from '@/lib/domain/time';
 import { formatNumber } from '@/lib/utils';
 import { championshipSlug, ensureCareer, ensureChampionshipPresets } from './bootstrap';
@@ -214,7 +215,9 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
     // between the two.
     const owned = await db.race.findFirst({
       where: { id: input.id, userId },
-      select: { id: true, runtimeSec: true, iconicKey: true, raceMasteryId: true },
+      select: {
+        id: true, runtimeSec: true, scheduledDurationSec: true, expeditionMode: true, iconicKey: true, raceMasteryId: true,
+      },
     });
     if (owned === null) return null;
 
@@ -264,8 +267,12 @@ export async function updateRaceAction(form: FormData): Promise<ActionResult<{ i
     await recomputeRaceAggregates(db, input.id, now);
 
     // Then progression: balances follow the edit at once, landmarks only when
-    // the runtime did not change (`resyncAfterRaceEdit`).
-    const resync = await resyncAfterRaceEdit(db, userId, input.id, now, { runtimeChanged });
+    // the runtime did not change, and new checkpoints only for a race that
+    // was an Expedition before the edit (`resyncAfterRaceEdit`).
+    const resync = await resyncAfterRaceEdit(db, userId, input.id, now, {
+      runtimeChanged,
+      wasExpedition: isExpedition(owned),
+    });
     return { runtimeSec, runtimeChanged, resync };
   }, EDIT_TRANSACTION);
 
@@ -308,6 +315,12 @@ function raceSavedMessage(saved: { runtimeSec: number; runtimeChanged: boolean; 
   }
   if (checkpoints.awarded > 0) {
     sentences.push(`Its coverage now reaches more Expedition checkpoints: +${formatNumber(checkpoints.awarded)} XP.`);
+  }
+  if (checkpoints.waiting > 0) {
+    sentences.push(
+      `It is an Expedition now. The checkpoints its viewing already reaches, worth ${formatNumber(checkpoints.waiting)} XP, ` +
+        'are paid with its next stint, or at once if you switch Expedition Mode on.',
+    );
   }
   const unlocked = resync.xpAwarded - resync.storyBonus.awarded - checkpoints.awarded - checkpoints.resized.toXp;
   if (unlocked > 0) sentences.push(`The change also earned ${formatNumber(unlocked)} XP.`);

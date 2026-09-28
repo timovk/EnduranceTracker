@@ -53,9 +53,7 @@ import { loadRaceTimelineInputs, loadTimelineInputs, type TimelineInputs } from 
 import { eventHref, getMasteryForChampionship } from './mastery-engine';
 import { storyBonusKey } from './progression-resync';
 import { reconstructStintUnlocks } from './stint-unlocks';
-import { awardXp, revokeXpByDedupeKeys, settleLedger, type XpRevocation } from './xp-ledger';
-
-const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0, earliest: null };
+import { awardXp, NOTHING_REVOKED, revokeXpByDedupeKeys, settleLedger, type XpRevocation } from './xp-ledger';
 
 /** Ids per `IN (…)` list, well inside SQLite's limit on bound parameters. */
 const ID_CHUNK = 500;
@@ -79,12 +77,22 @@ export interface ExpeditionReconcile {
   /** The replay's coverage, clamped to the runtime, and the runtime it was measured against. */
   coverageSec: number;
   runtimeSec: number;
-  /** Checkpoints paid now; `sessionId` is the stint being logged, or null for a retroactive one. */
+  /**
+   * Checkpoints paid now; `sessionId` is the stint being logged, null for a
+   * retroactive one, or the stint that first paid a checkpoint an earlier
+   * edit took away and this one gives back (`edit`).
+   */
   awarded: { percent: number; xp: number; sessionId: string | null }[];
   /** Checkpoints taken back because the coverage no longer reaches them. */
   revoked: { percent: number; xp: number }[];
   /** Held checkpoints re-sized to the schedule of a changed runtime (`resize` only). */
   resized: { percent: number; fromXp: number; toXp: number }[];
+  /**
+   * Checkpoints an Expedition's coverage reaches that this call left unpaid
+   * because it was asked not to pay (`award: false`): the next stint, the
+   * mode switch or recompute pays them.
+   */
+  waiting: { percent: number; xp: number }[];
   /** Everything removed from the ledger, the old rows of re-sized checkpoints included. Settle with it. */
   revocation: XpRevocation;
   /** Story Complete by the replay. */
@@ -99,9 +107,74 @@ export interface ExpeditionReconcile {
 
 function nothingToReconcile(): ExpeditionReconcile {
   return {
-    isExpedition: false, coverageSec: 0, runtimeSec: 0, awarded: [], revoked: [], resized: [],
+    isExpedition: false, coverageSec: 0, runtimeSec: 0, awarded: [], revoked: [], resized: [], waiting: [],
     revocation: NOTHING_REVOKED, storyCompleted: false, began: false, nextCheckpoint: null, history: null,
   };
+}
+
+/**
+ * The `ConfigOverride` key, per race, of the checkpoints race edits took off
+ * and a later edit may give back (`reconcileExpedition` step 4).
+ */
+export function checkpointsTakenByEditsKey(raceId: string): string {
+  return `expeditionRevokedByEdit:${raceId}`;
+}
+
+/** What an edit took off: the stint that paid each checkpoint, and its amount then. */
+type CheckpointsTakenByEdits = ReadonlyMap<number, { sessionId: string | null; xp: number }>;
+
+function parseCheckpointsTakenByEdits(value: unknown): Map<number, { sessionId: string | null; xp: number }> {
+  const taken = new Map<number, { sessionId: string | null; xp: number }>();
+  const list = typeof value === 'object' && value !== null ? (value as { checkpoints?: unknown }).checkpoints : undefined;
+  if (!Array.isArray(list)) return taken;
+  for (const entry of list as unknown[]) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { percent, sessionId, xp } = entry as { percent?: unknown; sessionId?: unknown; xp?: unknown };
+    if (typeof percent !== 'number' || !Number.isInteger(percent) || percent <= 0) continue;
+    taken.set(percent, {
+      sessionId: typeof sessionId === 'string' ? sessionId : null,
+      xp: typeof xp === 'number' && Number.isFinite(xp) ? Math.max(0, Math.round(xp)) : 0,
+    });
+  }
+  return taken;
+}
+
+async function readCheckpointsTakenByEdits(tx: Tx, userId: string, raceId: string): Promise<CheckpointsTakenByEdits> {
+  const row = await tx.configOverride.findUnique({
+    where: { userId_key: { userId, key: checkpointsTakenByEditsKey(raceId) } },
+    select: { value: true },
+  });
+  return parseCheckpointsTakenByEdits(row?.value);
+}
+
+/** Store what is still remembered, writing only when it changed; nothing remembered removes the row. */
+async function writeCheckpointsTakenByEdits(
+  tx: Tx,
+  userId: string,
+  raceId: string,
+  before: CheckpointsTakenByEdits,
+  after: CheckpointsTakenByEdits,
+): Promise<void> {
+  const serialise = (taken: CheckpointsTakenByEdits) => [...taken]
+    .sort((a, b) => a[0] - b[0])
+    .map(([percent, checkpoint]) => ({ percent, sessionId: checkpoint.sessionId, xp: checkpoint.xp }));
+  const next = serialise(after);
+  if (JSON.stringify(next) === JSON.stringify(serialise(before))) return;
+  const key = checkpointsTakenByEditsKey(raceId);
+  if (next.length === 0) {
+    await tx.configOverride.deleteMany({ where: { userId, key } });
+    return;
+  }
+  await tx.configOverride.upsert({
+    where: { userId_key: { userId, key } },
+    create: { userId, key, value: { checkpoints: next } },
+    update: { value: { checkpoints: next } },
+  });
+}
+
+/** Forget what edits took off a race: it is being deleted. */
+export async function forgetCheckpointsTakenByEdits(tx: Tx, userId: string, raceId: string): Promise<void> {
+  await tx.configOverride.deleteMany({ where: { userId, key: checkpointsTakenByEditsKey(raceId) } });
 }
 
 /** The ledger's description of a checkpoint. */
@@ -128,24 +201,35 @@ function checkpointDescription(raceName: string, percent: number): string {
  *      configuration leaves amounts already paid exactly as they were; and a
  *      checkpoint the schedule no longer lists has no amount to be re-sized
  *      to, so it keeps its own.
- *   4. While the race is an Expedition of six hours or more, every reached
+ *   4. On a race edit (`edit`), what steps 2 and 3 took off is remembered
+ *      (`checkpointsTakenByEditsKey`), and whatever an earlier edit took off is
+ *      given back — same key, same stint, the current schedule's amount — once
+ *      the coverage reaches it again under a runtime that pays, in every mode.
+ *      So a corrected typo in the race's length restores exactly the
+ *      checkpoints the typo took, even on a race whose mode is switched off,
+ *      where step 5 pays nothing. Only a checkpoint the race held can come
+ *      back this way, and each key is still held at most once.
+ *   5. While the race is an Expedition of six hours or more, every reached
  *      checkpoint not held is paid, career XP only. On the stint path it names
  *      the stint being logged (`crossingSessionId`), which is the stint that
  *      paid it, so its summary shows the XP the same live and reopened; every
  *      other award is retroactive and names no stint, so an older stint's
- *      summary never shows XP granted since. `award: false` skips this step:
- *      deleting a stint reaches nothing new, and a checkpoint an unfinished
- *      upgrade has not paid yet is the upgrade's to pay, not the deletion's.
+ *      summary never shows XP granted since. `award: false` skips this step
+ *      and lists what it would have paid in `waiting`: deleting a stint
+ *      reaches nothing new, and a checkpoint an unfinished upgrade has not
+ *      paid yet is the upgrade's to pay, not the deletion's; and a race edit
+ *      pays only a race that was already an Expedition before it
+ *      (`resyncAfterRaceEdit`).
  *
  * Switching the mode off changes neither the coverage nor the runtime, so it
- * revokes nothing; it only stops step 4. The caller settles the ledger with
+ * revokes nothing; it only stops step 5. The caller settles the ledger with
  * `revocation` after its last award (R13).
  */
 export async function reconcileExpedition(
   tx: Tx,
   userId: string,
   raceId: string,
-  options: { crossingSessionId?: string; resize?: boolean; history?: RaceHistory; award?: boolean } = {},
+  options: { crossingSessionId?: string; resize?: boolean; history?: RaceHistory; award?: boolean; edit?: boolean } = {},
 ): Promise<ExpeditionReconcile> {
   let history = options.history;
   if (history === undefined) {
@@ -199,12 +283,59 @@ export async function reconcileExpedition(
     });
   }
 
-  const expedition = isExpedition(race);
   const awarded: ExpeditionReconcile['awarded'] = [];
-  if (options.award !== false && expedition && checkpointsPayXp(runtimeSec)) {
+  if (options.edit) {
+    const taken = await readCheckpointsTakenByEdits(tx, userId, raceId);
+    const remembered = new Map(taken);
+    for (const row of unsupported) remembered.set(row.percent, { sessionId: row.sessionId, xp: row.amount });
+    for (const row of toResize) {
+      if ((schedule.get(row.percent) ?? 0) <= 0) remembered.set(row.percent, { sessionId: row.sessionId, xp: row.amount });
+    }
+
+    for (const [percent, checkpoint] of [...remembered].sort((a, b) => a[0] - b[0])) {
+      // Held again, by a stint or the switch since: nothing left to give back.
+      if (holding.has(percent)) {
+        remembered.delete(percent);
+        continue;
+      }
+      if (!checkpointsPayXp(runtimeSec) || !coverageReaches(coverageSec, runtimeSec, percent)) continue;
+      // The current schedule's amount, as a re-size would give it; a
+      // checkpoint the schedule no longer lists keeps its own.
+      const xp = schedule.get(percent) ?? checkpoint.xp;
+      if (xp <= 0) continue;
+      // The stint that first paid it, unless it has been deleted since.
+      const sessionId = checkpoint.sessionId === null
+        ? null
+        : (await tx.raceViewingSession.findFirst({
+          where: { id: checkpoint.sessionId, userId, raceId },
+          select: { id: true },
+        }))?.id ?? null;
+      const award = await awardXp(tx, userId, {
+        source: 'EXPEDITION',
+        amount: xp,
+        description: checkpointDescription(race.name, percent),
+        sourceRef: raceId,
+        sessionId: sessionId ?? undefined,
+        dedupeKey: expeditionDedupeKey(raceId, percent),
+      });
+      remembered.delete(percent);
+      holding.add(percent);
+      if (award.granted > 0) awarded.push({ percent, xp: award.granted, sessionId });
+    }
+
+    await writeCheckpointsTakenByEdits(tx, userId, raceId, taken, remembered);
+  }
+
+  const expedition = isExpedition(race);
+  const waiting: ExpeditionReconcile['waiting'] = [];
+  if (expedition && checkpointsPayXp(runtimeSec)) {
     for (const percent of [...satisfied].sort((a, b) => a - b)) {
       const xp = schedule.get(percent) ?? 0;
       if (holding.has(percent) || xp <= 0) continue;
+      if (options.award === false) {
+        waiting.push({ percent, xp });
+        continue;
+      }
       const sessionId = options.crossingSessionId ?? null;
       const award = await awardXp(tx, userId, {
         source: 'EXPEDITION',
@@ -217,6 +348,7 @@ export async function reconcileExpedition(
       if (award.granted > 0) awarded.push({ percent, xp: award.granted, sessionId });
     }
   }
+  awarded.sort((a, b) => a.percent - b.percent);
 
   return {
     isExpedition: expedition,
@@ -225,6 +357,7 @@ export async function reconcileExpedition(
     awarded,
     revoked: unsupported.map((row) => ({ percent: row.percent, xp: row.amount })).sort((a, b) => a.percent - b.percent),
     resized,
+    waiting,
     revocation,
     storyCompleted: history.storyCompletedAt !== null,
     began: expedition && options.crossingSessionId !== undefined && history.stints[0]?.sessionId === options.crossingSessionId,

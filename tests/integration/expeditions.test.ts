@@ -470,12 +470,19 @@ describe('the Expedition Summary', () => {
     const completing = await stint(race, 0, 9, at(13, 20));
     expect(await prisma.expeditionSummary.count({ where: { userId: USER } })).toBe(0);
 
-    // Advertised as ten hours, run for nine: an Expedition now, its story already complete.
+    // Advertised as ten hours, run for nine: an Expedition now, its story
+    // already complete. The edit pays no checkpoint — it could be a typo, and
+    // the milestones it syncs must not be reached on the strength of one — and
+    // says who will.
     const edit = await updateRaceAction(raceForm({
       id: race, name: '9 Hours of Later', championshipId: championship.id, scheduledDuration: '10:00:00', actualDuration: '09:00:00',
     }));
     expect(edit.ok, edit.message).toBe(true);
-    expect(edit.message).toContain('Its coverage now reaches more Expedition checkpoints: +1,200 XP.');
+    expect(edit.message).toContain(
+      'It is an Expedition now. The checkpoints its viewing already reaches, worth 1,200 XP, '
+        + 'are paid with its next stint, or at once if you switch Expedition Mode on.',
+    );
+    expect(await held(race)).toEqual([]);
     expect(await prisma.expeditionSummary.count({ where: { userId: USER } })).toBe(0);
 
     expect(await prisma.race.findUniqueOrThrow({ where: { id: race }, select: { championshipId: true } }))
@@ -483,6 +490,10 @@ describe('the Expedition Summary', () => {
 
     const rewatch = await stint(race, 8, 9, at(14, 20));
     expect(rewatch.expedition?.completed).toBe(false);
+    // The next stint pays them, and names itself as the stint that did.
+    expect((await held(race)).map((row) => [row.percent, row.amount, row.sessionId])).toEqual(
+      [[10, 120], [25, 180], [50, 300], [75, 300], [90, 300]].map(([percent, amount]) => [percent, amount, rewatch.sessionId]),
+    );
     const [row] = await prisma.expeditionSummary.findMany({ where: { userId: USER } });
     expect(row).toMatchObject({ raceId: race, retrospective: true, completedAt: at(13, 20) });
     const snapshot = expeditionSummarySnapshotSchema.parse(row!.snapshot);

@@ -42,13 +42,14 @@ import type { Tx } from '@/lib/db/client';
 import { createManySkippingDuplicates, prisma } from '@/lib/db/client';
 import type { RewardDef } from '@/lib/config';
 import {
-  MILESTONE_REWARDS, SEASON_PASS_CONFIG, SEASON_PASS_SHAPE, STANDARD_REWARDS, THEME_ROTATION,
+  MILESTONE_REWARDS, MOMENTUM_CONFIG, SEASON_PASS_CONFIG, SEASON_PASS_SHAPE, STANDARD_REWARDS, THEME_ROTATION,
 } from '@/lib/config';
 import { ARCHIVED_PASS_NOTE } from '@/lib/copy/tone';
 import { quarterBounds, quarterOf } from '@/lib/domain/periods';
 import { isSeasonClosed, reopeningSeason, seasonReopensAt } from '@/lib/domain/season-closure';
 import type { Rarity, RewardType } from '@/lib/domain/types';
 import type { SeasonClosureNotice, SeasonPassTierUnlock } from './contracts';
+import { buildMomentumState } from './momentum-engine';
 import { awardXp } from './xp-ledger';
 
 const MS_PER_DAY = 86_400_000;
@@ -771,43 +772,90 @@ export async function addSeasonXp(
 // ---------------------------------------------------------------------------
 
 /**
- * Rebuild every pass's `seasonXp` from the ledger.
+ * A ledger row being taken back that carried season XP: when it was written,
+ * which decides the quarter it counted in, and how much it carried.
+ */
+export interface SeasonXpRemoval {
+  createdAt: Date;
+  seasonAmount: number;
+}
+
+/**
+ * The largest share momentum can ever add on top of season XP, in basis
+ * points: the bonus of the highest tier the momentum ceiling reaches (7.5% for
+ * Ironman). Held as a whole number so the take-back below is exact integer
+ * arithmetic, not a product of floating-point fractions.
+ */
+const MAX_MOMENTUM_BONUS_BASIS_POINTS = Math.round(buildMomentumState(MOMENTUM_CONFIG.ceiling).seasonXpBonus * 10_000);
+
+/**
+ * What removing `seasonAmount` of season XP takes off a pass: the amount
+ * boosted by the largest momentum bonus there is, rounded up.
+ */
+export function seasonXpToTakeBack(seasonAmount: number): number {
+  const amount = Math.max(0, Math.round(seasonAmount));
+  return amount + Math.ceil((amount * MAX_MOMENTUM_BONUS_BASIS_POINTS) / 10_000);
+}
+
+/**
+ * Take season XP back from the passes that hold it, after ledger rows that
+ * carried some were removed (`settleLedger`).
  *
- * Season XP is a running total in the same way career XP is, and it drifts for
- * the same reason: a transaction that no longer exists has already been added
- * to it. Each pass owns a quarter, and `seasonAmount` on the transactions
- * inside that window is what the pass is worth — so the window is the join.
+ * A stint adds its season XP to the pass with the momentum bonus of the moment
+ * on top (`session-engine.ts`), while its ledger rows keep the unboosted
+ * `seasonAmount`: a pass is worth a little more than the ledger's sum, and that
+ * little more is recorded nowhere row by row. So each pass loses exactly the
+ * removed rows dated inside its quarter, boosted by the LARGEST bonus momentum
+ * can give (`seasonXpToTakeBack`):
+ *
+ *   * every other stint of the quarter keeps its momentum bonus. Rebuilding the
+ *     pass from the ledger's sum would take it off all of them;
+ *   * the removed rows can never leave any of their own bonus behind, so
+ *     logging a stint and deleting it again can never gain season XP. Rows
+ *     paid at a lower momentum take a little more than they added, at most the
+ *     top bonus on their own season XP.
  *
  * Tiers already stamped with `unlockedAt` are deliberately left alone. A
- * rebuilt total can be lower than the tier someone reached, and that is the
+ * lowered total can sit below the tier someone reached, and that is the
  * correct outcome: the currency follows the data, the reward stays earned.
  * Nothing in this application takes back something it has already given.
  *
- * Returns the number of passes whose total had to be corrected.
+ * Returns the number of passes whose total went down.
  */
-export async function rebuildSeasonXpFromLedger(tx: Tx, userId: string): Promise<number> {
+export async function takeBackSeasonXp(
+  tx: Tx,
+  userId: string,
+  removals: readonly SeasonXpRemoval[],
+): Promise<number> {
+  const carried = removals.filter((removal) => removal.seasonAmount > 0);
+  if (carried.length === 0) return 0;
+
   const passes = await tx.seasonPass.findMany({
     where: { userId },
     select: { id: true, startsAt: true, endsAt: true, seasonXp: true },
   });
 
-  let corrected = 0;
+  let lowered = 0;
   for (const pass of passes) {
-    const agg = await tx.xPTransaction.aggregate({
-      where: { userId, createdAt: { gte: pass.startsAt, lt: pass.endsAt } },
-      _sum: { seasonAmount: true },
-    });
-    const total = Math.max(0, agg._sum.seasonAmount ?? 0);
-    if (total === pass.seasonXp) continue;
+    // The quarter a row counted in is its window, as it always was.
+    const removed = carried.reduce(
+      (sum, removal) => (removal.createdAt >= pass.startsAt && removal.createdAt < pass.endsAt
+        ? sum + removal.seasonAmount
+        : sum),
+      0,
+    );
+    if (removed === 0) continue;
 
+    const seasonXp = Math.max(0, pass.seasonXp - seasonXpToTakeBack(removed));
+    if (seasonXp === pass.seasonXp) continue;
     await tx.seasonPass.update({
       where: { id: pass.id },
-      data: { seasonXp: total, tier: tierForXp(total).tier },
+      data: { seasonXp, tier: tierForXp(seasonXp).tier },
     });
-    corrected += 1;
+    lowered += 1;
   }
 
-  return corrected;
+  return lowered;
 }
 
 /**

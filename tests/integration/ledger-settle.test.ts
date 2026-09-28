@@ -10,15 +10,16 @@
  * taken back.
  */
 
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { levelFromXp } from '@/lib/domain/progression';
 import { resyncAfterRaceEdit } from '@/lib/engines/progression-resync';
 import { rebuildRaceIntervals, recomputeRaceAggregates } from '@/lib/engines/race-engine';
 import { deleteRace, deleteViewingSession, repairXpLedger } from '@/lib/engines/session-engine';
 import { buildOutcomeForSession } from '@/lib/server/session-summary';
+import { seasonXpToTakeBack, tierForXp } from '@/lib/engines/season-pass-engine';
 import {
-  awardXp, rebuildCareerTotals, revokeSessionsXp, revokeXpByDedupeKeys, settleLedger,
+  awardXp, NOTHING_REVOKED, rebuildCareerTotals, revokeSessionsXp, revokeXpByDedupeKeys, settleLedger,
 } from '@/lib/engines/xp-ledger';
 import {
   addRace, createCareerUser, H, insertLegacyShortenedRace, ledgerProblems, logStint,
@@ -212,45 +213,130 @@ describe('settling', () => {
   it('does nothing when nothing was removed', async () => {
     await seedUnstampedLedger(3);
     const result = await prisma.$transaction((tx) =>
-      settleLedger(tx as Tx, USER, [{ transactions: 0, careerXp: 0, seasonXp: 0, earliest: null }]),
+      settleLedger(tx as Tx, USER, [NOTHING_REVOKED]),
     );
     expect(result).toBeNull();
     // The wrong totals are still there: settling is for removals only.
     expect(await ledgerProblems(USER)).not.toEqual([]);
   });
 
-  it('rebuilds season XP only when a removed row carried season XP', async () => {
+  it('takes back only the removed rows’ season XP, and leaves the momentum bonus on the rest', async () => {
     const now = new Date();
     const pass = await prisma.seasonPass.create({
       data: {
         userId: USER, year: now.getFullYear(), quarter: 1,
         startsAt: new Date(now.getTime() - 86_400_000), endsAt: new Date(now.getTime() + 86_400_000),
-        // 1,000 season XP in the ledger, boosted by momentum to 1,100.
-        seasonXp: 1_100, tier: 1,
+        // Two stints' season XP, boosted by momentum: 1,000 at Ironman
+        // (+7.5%) is 1,075, and 400 at In the Window (+3%) is 412.
+        seasonXp: 1_487, tier: tierForXp(1_487).tier,
       },
       select: { id: true },
     });
-    const { awardXp } = await import('@/lib/engines/xp-ledger');
+    // A pass of another quarter, which none of these rows counted in.
+    const earlier = await prisma.seasonPass.create({
+      data: {
+        userId: USER, year: now.getFullYear() - 1, quarter: 4,
+        startsAt: new Date(now.getTime() - 200 * 86_400_000), endsAt: new Date(now.getTime() - 100 * 86_400_000),
+        seasonXp: 500, tier: tierForXp(500).tier,
+      },
+      select: { id: true },
+    });
     await prisma.$transaction(async (tx) => {
       await awardXp(tx as Tx, USER, { source: 'ACHIEVEMENT', amount: 100, description: 'career only', dedupeKey: 'career-only' });
       await awardXp(tx as Tx, USER, {
-        source: 'CHALLENGE', amount: 200, seasonAmount: 1_000, description: 'with season XP', dedupeKey: 'with-season',
+        source: 'CHALLENGE', amount: 200, seasonAmount: 1_000, description: 'at Ironman', dedupeKey: 'at-ironman',
+      });
+      await awardXp(tx as Tx, USER, {
+        source: 'CHALLENGE', amount: 80, seasonAmount: 400, description: 'in the window', dedupeKey: 'in-the-window',
       });
     });
-
-    await prisma.$transaction(async (tx) => {
-      const revocation = await revokeXpByDedupeKeys(tx as Tx, USER, ['career-only']);
+    const passXp = async () => (await prisma.seasonPass.findUniqueOrThrow({ where: { id: pass.id } }));
+    const take = (keys: string[]) => prisma.$transaction(async (tx) => {
+      const revocation = await revokeXpByDedupeKeys(tx as Tx, USER, keys);
       await settleLedger(tx as Tx, USER, [revocation]);
+      return revocation;
     });
-    // The momentum boost is not the ledger's, so a career-only removal leaves it be.
-    expect((await prisma.seasonPass.findUniqueOrThrow({ where: { id: pass.id } })).seasonXp).toBe(1_100);
 
-    await prisma.$transaction(async (tx) => {
-      const revocation = await revokeXpByDedupeKeys(tx as Tx, USER, ['with-season']);
-      expect(revocation.seasonXp).toBe(1_000);
-      await settleLedger(tx as Tx, USER, [revocation]);
-    });
-    expect((await prisma.seasonPass.findUniqueOrThrow({ where: { id: pass.id } })).seasonXp).toBe(0);
+    // A career-only removal leaves the pass be.
+    await take(['career-only']);
+    expect((await passXp()).seasonXp).toBe(1_487);
+
+    // The 400: it comes off with the largest momentum bonus there is (430),
+    // and the 1,000 keeps its own — rebuilding from the ledger would have
+    // left 1,000.
+    expect(seasonXpToTakeBack(400)).toBe(430);
+    const revocation = await take(['in-the-window']);
+    expect(revocation).toMatchObject({ seasonXp: 400, seasonRows: [{ seasonAmount: 400 }] });
+    expect(await passXp()).toMatchObject({ seasonXp: 1_057, tier: tierForXp(1_057).tier });
+
+    // The last of it: nothing is left, and nothing is below nothing.
+    await take(['at-ironman']);
+    expect(await passXp()).toMatchObject({ seasonXp: 0, tier: 0 });
+    expect((await prisma.seasonPass.findUniqueOrThrow({ where: { id: earlier.id } })).seasonXp).toBe(500);
+    expect(await ledgerProblems(USER)).toEqual([]);
+  });
+
+  it('never takes back less than a stint added, whatever its momentum', () => {
+    for (const bonus of [0, 0.015, 0.03, 0.045, 0.06, 0.075]) {
+      for (let seasonXp = 0; seasonXp <= 5_000; seasonXp += 7) {
+        // What the stint path adds to the pass (`session-engine.ts`).
+        const added = Math.round(seasonXp * (1 + bonus));
+        expect(seasonXpToTakeBack(seasonXp)).toBeGreaterThanOrEqual(added);
+        expect(seasonXpToTakeBack(seasonXp)).toBeLessThanOrEqual(Math.ceil(seasonXp * 1.075) + 1);
+      }
+    }
+  });
+});
+
+describe('season XP taken back, with the season open', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('deleting a stint or a race takes back only its own season XP, and every other stint keeps its momentum', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    // After the season reopened on 1 October 2026.
+    const at = (day: number, hour: number, minute = 0) => {
+      const instant = new Date(2026, 9, day, hour, minute);
+      vi.setSystemTime(instant);
+      return instant;
+    };
+    const pass = async () => (await prisma.seasonPass.findFirstOrThrow({
+      where: { userId: USER, year: 2026, quarter: 4 }, select: { seasonXp: true },
+    })).seasonXp;
+    const ledgerSeasonXp = async () => (await prisma.xPTransaction.aggregate({
+      where: { userId: USER }, _sum: { seasonAmount: true },
+    }))._sum.seasonAmount ?? 0;
+
+    // Five evenings of two and a half hours take momentum up the ladder.
+    const builder = await addRace(USER, { name: 'Momentum', hours: 24 });
+    for (let day = 0; day < 5; day += 1) {
+      const evening = at(10 + day, 22);
+      await logStint(USER, builder, { from: day * 2.5 * H, to: (day + 1) * 2.5 * H, watchedAt: evening, now: evening });
+    }
+    expect(await pass()).toBeGreaterThan(await ledgerSeasonXp());
+
+    // A stint deleted: the pass loses that stint's season XP and no more
+    // than the top momentum bonus on it — not every other stint's bonus.
+    const short = await addRace(USER, { name: 'Short', hours: 1 });
+    let evening = at(15, 20);
+    const stint = await logStint(USER, short, { from: 0, to: 600, watchedAt: evening, now: evening });
+    const beforeStint = await pass();
+    const stintRemoval = await deleteViewingSession(USER, stint.sessionId, at(15, 20, 5));
+    expect(stintRemoval.seasonXpRemoved).toBeGreaterThan(0);
+    expect(await pass()).toBe(beforeStint - seasonXpToTakeBack(stintRemoval.seasonXpRemoved));
+
+    // A race deleted: the same, for everything the race held.
+    evening = at(15, 21);
+    await logStint(USER, short, { from: 0, to: 600, watchedAt: evening, now: evening });
+    await logStint(USER, short, { from: 600, to: 1_200, watchedAt: at(15, 21, 30), now: at(15, 21, 30) });
+    const beforeRace = await pass();
+    const raceRemoval = await deleteRace(USER, short, at(15, 22));
+    expect(raceRemoval!.seasonXpRemoved).toBeGreaterThan(0);
+    expect(await pass()).toBe(beforeRace - seasonXpToTakeBack(raceRemoval!.seasonXpRemoved));
+
+    // What the builder's evenings earned keeps its momentum bonus.
+    expect(await pass()).toBeGreaterThan(await ledgerSeasonXp());
     expect(await ledgerProblems(USER)).toEqual([]);
   });
 });
@@ -334,7 +420,7 @@ describe('invariant I2 holds after every way XP is taken back', () => {
       await db.race.update({ where: { id: raceId }, data: { scheduledDurationSec: 7 * H, runtimeSec: 7 * H } });
       await rebuildRaceIntervals(db, raceId);
       await recomputeRaceAggregates(db, raceId, NOW);
-      return resyncAfterRaceEdit(db, USER, raceId, NOW, { runtimeChanged: true });
+      return resyncAfterRaceEdit(db, USER, raceId, NOW, { runtimeChanged: true, wasExpedition: false });
     }, { timeout: 60_000 });
 
     expect(resync.storyBonus.revoked).toBeGreaterThan(0);

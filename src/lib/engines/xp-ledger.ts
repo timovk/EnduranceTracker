@@ -17,7 +17,7 @@ import type { Tx } from '@/lib/db/client';
 import { prisma } from '@/lib/db/client';
 import { levelFromXp, prestigeForLevel, titleForLevel } from '@/lib/domain/progression';
 import type { XPSource } from '@/lib/domain/types';
-import { rebuildSeasonXpFromLedger } from './season-pass-engine';
+import { takeBackSeasonXp, type SeasonXpRemoval } from './season-pass-engine';
 
 export interface XpAward {
   source: XPSource;
@@ -205,6 +205,11 @@ export interface XpRevocation {
   careerXp: number;
   seasonXp: number;
   /**
+   * Each removed row that carried season XP, with when it was written: the
+   * quarter it counted in is the pass `settleLedger` takes it back from.
+   */
+  seasonRows: readonly SeasonXpRemoval[];
+  /**
    * The earliest removed row in ledger order (`createdAt`, then `id`), or null
    * when nothing was removed. Every running total from this point on described
    * a career that included the row, so `settleLedger` re-stamps from here.
@@ -218,7 +223,8 @@ export interface LedgerPosition {
   id: string;
 }
 
-const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0, earliest: null };
+/** A revocation that removed nothing. */
+export const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0, seasonRows: [], earliest: null };
 
 /** Ids per `IN (…)` list, well inside SQLite's limit on bound parameters. */
 const ID_CHUNK = 500;
@@ -250,6 +256,7 @@ export function combineRevocations(revocations: readonly XpRevocation[]): XpRevo
       transactions: total.transactions + revocation.transactions,
       careerXp: total.careerXp + revocation.careerXp,
       seasonXp: total.seasonXp + revocation.seasonXp,
+      seasonRows: [...total.seasonRows, ...revocation.seasonRows],
       earliest: earlierOf(total.earliest, revocation.earliest),
     }),
     NOTHING_REVOKED,
@@ -285,6 +292,9 @@ async function removeRows(
     transactions: rows.length,
     careerXp: rows.reduce((sum, row) => sum + row.amount, 0),
     seasonXp: rows.reduce((sum, row) => sum + row.seasonAmount, 0),
+    seasonRows: rows
+      .filter((row) => row.seasonAmount > 0)
+      .map((row) => ({ createdAt: row.createdAt, seasonAmount: row.seasonAmount })),
     earliest,
   };
 }
@@ -547,9 +557,11 @@ async function restampBatch(
  * because each caller remembered to rebuild. The replay starts at the earliest
  * row any of the revocations removed.
  *
- * Season XP is rebuilt only when a removed row carried some. Rebuilding it
- * otherwise would sum the ledger's unboosted `seasonAmount` and quietly take
- * the momentum bonus off a pass (see `season-reset.ts`).
+ * Season XP comes off only when a removed row carried some, and then only the
+ * removed rows' own, from the pass of the quarter each was written in
+ * (`takeBackSeasonXp`). The pass is never rebuilt from the ledger: the ledger
+ * holds season XP without the momentum bonus a stint added on top, so a
+ * rebuild would quietly take that bonus off every other stint of the quarter.
  *
  * Returns null, having done nothing, when nothing was removed.
  */
@@ -562,7 +574,7 @@ export async function settleLedger(
   if (removed.transactions === 0 || removed.earliest === null) return null;
 
   const rebuild = await rebuildCareerTotals(tx, userId, { from: removed.earliest });
-  if (removed.seasonXp > 0) await rebuildSeasonXpFromLedger(tx, userId);
+  if (removed.seasonXp > 0) await takeBackSeasonXp(tx, userId, removed.seasonRows);
   return rebuild;
 }
 

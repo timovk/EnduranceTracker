@@ -309,9 +309,15 @@ Every transaction that deletes an `XPTransaction` row ends with
   the **earliest** removed row, in `(createdAt, id)` order, and updates the
   profile (`rebuildCareerTotals(tx, userId, { from })`). Everything before
   that row is summed in one aggregate and left alone;
-- rebuilds season XP from the ledger only when a removed row carried season
-  XP, because rebuilding it otherwise would drop the momentum boost from a
-  pass.
+- takes season XP back only when a removed row carried some, and then only
+  those rows' own: each pass loses the removed season XP dated inside its
+  quarter, boosted by the largest momentum bonus there is (7.5%) and rounded
+  up (`takeBackSeasonXp`, `seasonXpToTakeBack`). The pass is never rebuilt
+  from the ledger's sum: the ledger holds season XP without the momentum
+  bonus a stint added on top, so a rebuild would take that bonus off every
+  other stint of the quarter. Taking back the top bonus means a removed stint
+  can never leave any of its own bonus behind, so logging a stint and
+  deleting it again never gains season XP.
 
 Changed rows are written 400 at a time (`LEDGER_RESTAMP_BATCH`), one
 `UPDATE … FROM (VALUES (id, careerXpAfter, levelAfter), …)` statement per
@@ -426,14 +432,27 @@ Complete bonus; the README has the table.
 2. with `resize` (a runtime edit, or recompute) re-sizes held checkpoints to
    the current schedule, deleting and re-writing them under the same key, or
    only deleting them when the new amount is 0;
-3. pays every reached checkpoint that is not held, only when the race is an
+3. on a race edit (`edit`), remembers what steps 1 and 2 took off (the
+   `ConfigOverride` key `expeditionRevokedByEdit:<raceId>`, with the stint
+   that paid each), and gives back what an earlier edit took off — same key,
+   same stint, the current schedule's amount — once the coverage reaches it
+   again under a runtime that pays, in every mode. A corrected typo in the
+   race's length therefore restores exactly what the typo took, even with
+   Expedition Mode switched off. Only a checkpoint the race held can come back
+   this way, and `deleteRace` forgets the race's list;
+4. pays every reached checkpoint that is not held, only when the race is an
    Expedition with checkpoint XP. On the stint path the row names the stint
    that crossed it; a retroactive award (switching the mode on, the upgrade,
    recompute) names no stint, so an old stint's summary never shows XP granted
    weeks later.
 
 The caller settles the ledger. `deleteViewingSession` passes `award: false`,
-because nothing new can qualify on that path.
+because nothing new can qualify on that path. A race edit passes `award`
+only when the race was an Expedition **before** the edit: an edit that makes
+a race an Expedition (a scheduled length typed as ten hours) pays no
+checkpoint, so correcting it has nothing to take back, and the landmarks a
+save syncs are never reached on the strength of a typo. Its message says what
+the next stint (or switching the mode on) will pay (`waiting`).
 
 Invariant **I3**: for every race, the held EXPEDITION rows are a subset of the
 checkpoints its replayed coverage reaches under its current runtime, and each
@@ -444,7 +463,9 @@ key is held at most once. `expeditionProblems(userId)` in
 not a change to the data: it stops new checkpoints paying and does nothing
 else. Switching it on again pays only what is not already held, and the dedupe
 keys make on/off/on pay nothing twice. Checkpoint XP comes back off only when
-the viewing or the race behind it is deleted, or the runtime changes.
+the viewing or the race behind it is deleted, or the runtime changes so that
+the coverage no longer reaches it; correcting that runtime gives it back,
+whatever the mode.
 
 **The summary.** An Expedition Summary is written when an Expedition is Story
 Complete by replay and has none: by the completing stint (live), or by the
@@ -737,7 +758,7 @@ another file is given.
 | 18 | Throw-away races and one-race events | Counted races and editions must be experienced; "First Edition Experienced" pays nothing. What is left is small and proportional to the viewing logged. | `a dummy race in its own event pays no event step`; `complete editions rushed through at 8× are not experienced editions`; `each race can help pay an event step once across events`; `a hundred 1-minute races with 1-second stints reach no races-experienced rung` |
 | 19 | Stitch 1-second stints 20 seconds apart | Inherited from Story Complete's gap tolerance; about 4,000 hand-entered stints for a 24-hour race, so documented rather than changed. | `tests/domain/career-timeline.test.ts › replay coverage equals the race page coverage for bridged gaps` |
 | 20 | Reach another account's events, races, years or summaries | Every lookup is scoped by `userId`, fingerprints and merge hops included; caches are per account. | `tests/auth/account-isolation.test.ts` (the event, Expedition, Chronicle, replay-cache and fingerprint cases) |
-| 21 | A runtime typo that briefly completes a race | Balances follow the edit and follow it back; landmarks and summaries wait for the next stint after a runtime change. | `a mistyped runtime that is corrected leaves no summary and no landmark, and the real completion writes the summary` |
+| 21 | A runtime typo that briefly completes a race | Balances follow the edit and follow it back; landmarks and summaries wait for the next stint after a runtime change. Checkpoints an edit took off come back when it is corrected, in every mode; an edit that makes a race an Expedition pays no checkpoint. The one thing a correction does not give back is the season XP of a Story Complete bonus it took off: paid again by an edit, the bonus is career XP only (R3). | `a mistyped runtime that is corrected leaves no summary and no landmark, and the real completion writes the summary`; `with Expedition Mode switched off, correcting the runtime gives back the checkpoints the typo took`; `a length typed short and corrected gives an Expedition back its checkpoints, even through a runtime too short to pay`; `a runtime typo that briefly makes a race an Expedition pays nothing, so correcting it leaves nothing behind`; `a scheduled-length typo that briefly makes a race an Expedition pays nothing, and reaches no landmark`; `checkpoints earned with the mode switched on survive automatic, a rename and a length typo`; `with the season open, a corrected typo keeps the momentum bonus on every other stint of the quarter` |
 | 22 | Re-balance the checkpoints in configuration | Amounts paid are never re-sized except by a runtime edit or recompute; I3 is about coverage, not amounts. | `a checkpoint paid under an older schedule keeps its amount on the stint path and the switch`; `a checkpoint the configuration no longer lists stays held while the coverage reaches it`; `tests/domain/expedition.test.ts › checkpoint keys contain no amount`; `tests/integration/recompute.test.ts › recompute re-sizes checkpoints to the current schedule once` |
 
 Unchanged from before 0.4.0, and outside these systems: moving races to a

@@ -413,7 +413,7 @@ describe('a race edit', () => {
         await rebuildRaceIntervals(db, raceId);
       }
       await recomputeRaceAggregates(db, raceId, now);
-      return resyncAfterRaceEdit(db, EDITED, raceId, now, { runtimeChanged });
+      return resyncAfterRaceEdit(db, EDITED, raceId, now, { runtimeChanged, wasExpedition: false });
     });
 
     const runtimeEdit = await edit(true);

@@ -47,7 +47,8 @@ import {
   highestMilestoneCelebration, levelForMilestone, louderLevel, type MilestoneCelebration,
 } from '@/lib/domain/celebration';
 import {
-  expeditionOutcomeOf, heldExpeditionKeys, reconcileExpedition, writeExpeditionSummary, type ExpeditionSummaryWrite,
+  expeditionOutcomeOf, forgetCheckpointsTakenByEdits, heldExpeditionKeys, reconcileExpedition, writeExpeditionSummary,
+  type ExpeditionSummaryWrite,
 } from './expedition-engine';
 
 import { applyMomentumForSession, updateStreak } from './momentum-engine';
@@ -748,8 +749,10 @@ export async function deleteRace(
     const viewing = await revokeSessionsXp(db, userId, sessions.map((session) => session.id));
     const orphaned = await revokeRaceViewingXp(db, userId, race.id);
     const storyBonus = await revokeXpByDedupeKeys(db, userId, [storyBonusKey(race.id)]);
-    // Every checkpoint the race holds, by its exact key.
+    // Every checkpoint the race holds, by its exact key, and the ones an edit
+    // took off: with the race gone there is nothing to give them back to.
     const expedition = await revokeXpByDedupeKeys(db, userId, await heldExpeditionKeys(db, userId, race.id));
+    await forgetCheckpointsTakenByEdits(db, userId, race.id);
 
     // The event steps the race helped reach are credited to it first, and its
     // credits keep its edition's fingerprint once it is gone (a tombstone), so

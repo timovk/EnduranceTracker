@@ -25,9 +25,7 @@ import { loadRaceTimelineInputs } from './career-timeline-engine';
 import { ensureMasteryTrees, recomputeRaceMasteries, syncMastery } from './mastery-engine';
 import { reconcileExpedition } from './expedition-engine';
 import { computeCareerMetricsWithHistory } from './metrics';
-import { awardXp, revokeXpByDedupeKey, settleLedger, type XpRevocation } from './xp-ledger';
-
-const NOTHING_REVOKED: XpRevocation = { transactions: 0, careerXp: 0, seasonXp: 0, earliest: null };
+import { awardXp, NOTHING_REVOKED, revokeXpByDedupeKey, settleLedger, type XpRevocation } from './xp-ledger';
 
 /** The Story Complete bonus's dedupe key: one per race, whatever completed it. */
 export function storyBonusKey(raceId: string): string {
@@ -109,11 +107,19 @@ export interface RaceEditResync {
   /** The Story Complete bonus's part in both. */
   storyBonus: { awarded: number; revoked: number };
   /**
-   * The Expedition checkpoints' part: XP paid for checkpoints now reached,
-   * XP taken back from checkpoints no longer reached, and the checkpoints
-   * re-sized to a changed runtime (their XP before and after).
+   * The Expedition checkpoints' part: XP paid for checkpoints now reached (or
+   * reached again after an earlier edit took them), XP taken back from
+   * checkpoints no longer reached, and the checkpoints re-sized to a changed
+   * runtime (their XP before and after). `waiting` is the XP of checkpoints a
+   * race that became an Expedition with this edit already reaches: the edit
+   * does not pay them, the next stint (or switching the mode on) does.
    */
-  checkpoints: { awarded: number; revoked: number; resized: { fromXp: number; toXp: number } };
+  checkpoints: {
+    awarded: number;
+    revoked: number;
+    resized: { fromXp: number; toXp: number };
+    waiting: number;
+  };
 }
 
 /**
@@ -121,9 +127,16 @@ export interface RaceEditResync {
  * transaction, after its intervals and aggregates were rebuilt.
  *
  *   1. The Story Complete bonus follows the edit (`reconcileStoryBonus`),
- *      and so do the Expedition checkpoints (`reconcileExpedition`): after a
- *      runtime change the held ones are re-sized to the new length's
- *      schedule, and those its coverage no longer reaches come off. The
+ *      and so do the Expedition checkpoints (`reconcileExpedition`, as an
+ *      `edit`): after a runtime change the held ones are re-sized to the new
+ *      length's schedule, those its coverage no longer reaches come off, and
+ *      those an earlier edit took off come back once the coverage reaches
+ *      them again — in every mode, so correcting a typo restores them even
+ *      with Expedition Mode switched off. New checkpoints are paid only when
+ *      the race was an Expedition before the edit (`wasExpedition`): an edit
+ *      that makes a race an Expedition — a scheduled length typed as ten
+ *      hours — pays none, so correcting it has nothing to take back and no
+ *      landmark is reached on its strength; the next stint pays them. The
  *      ledger is settled at once for whatever came off (`settleLedger`), so
  *      anything paid below is stamped on the career as it now is and
  *      measured against it. No Expedition Summary is ever written here: a
@@ -140,17 +153,28 @@ export interface RaceEditResync {
  *      at step 1, because they can follow the correction back.
  *
  * So nothing permanent is ever written on the strength of a runtime edit
- * alone: a typo corrected a minute later leaves nothing behind.
+ * alone: a typo corrected a minute later leaves nothing behind. One thing it
+ * does not give back: a Story Complete bonus it took off and pays again is
+ * career XP only (R3), so the bonus's season XP, paid by the stint that
+ * completed the race, stays off the season pass.
  */
 export async function resyncAfterRaceEdit(
   tx: Tx,
   userId: string,
   raceId: string,
   now: Date,
-  options: { runtimeChanged: boolean },
+  options: {
+    runtimeChanged: boolean;
+    /** Whether the race was an Expedition before the edit (`isExpedition` of its old row). */
+    wasExpedition: boolean;
+  },
 ): Promise<RaceEditResync> {
   const story = await reconcileStoryBonus(tx, userId, raceId);
-  const expedition = await reconcileExpedition(tx, userId, raceId, { resize: options.runtimeChanged });
+  const expedition = await reconcileExpedition(tx, userId, raceId, {
+    resize: options.runtimeChanged,
+    award: options.wasExpedition,
+    edit: true,
+  });
   await settleLedger(tx, userId, [story.revocation, expedition.revocation]);
   const checkpointsAwarded = expedition.awarded.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
   const checkpointsRevoked = expedition.revoked.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
@@ -178,6 +202,11 @@ export async function resyncAfterRaceEdit(
     xpAwarded,
     xpRevoked: story.revocation.careerXp + expedition.revocation.careerXp,
     storyBonus: { awarded: story.awarded, revoked: story.revocation.careerXp },
-    checkpoints: { awarded: checkpointsAwarded, revoked: checkpointsRevoked, resized },
+    checkpoints: {
+      awarded: checkpointsAwarded,
+      revoked: checkpointsRevoked,
+      resized,
+      waiting: expedition.waiting.reduce((sum, checkpoint) => sum + checkpoint.xp, 0),
+    },
   };
 }

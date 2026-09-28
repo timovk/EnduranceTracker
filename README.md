@@ -533,9 +533,13 @@ XP only and never feeds the season pass.
 - Checkpoint XP **follows the data**, like the Story Complete bonus. Deleting
   the viewing, or the race, that reached a checkpoint takes it back, and
   changing a race's length re-sizes its checkpoints and takes back any that the
-  coverage no longer reaches.
+  coverage no longer reaches. Correct the length again and they come back,
+  even with Expedition Mode switched off.
 - A race already past a checkpoint when it becomes an Expedition — switched on,
-  or read by the 0.4.0 upgrade — receives it then.
+  or read by the 0.4.0 upgrade — receives it then. A race that becomes one
+  because you changed its length receives them with its next stint (or at once
+  if you switch Expedition Mode on), so a length mistyped for a moment pays
+  nothing.
 
 ### Career Statistics and Personal Records
 
