@@ -19,8 +19,12 @@ function heroHours(seconds: number): string {
   return (hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10).toLocaleString('en-GB');
 }
 
-/** What a card is called, and the one figure or name it leads with. */
-function anatomy(card: Card): { label: string; hero: string; unit?: string } {
+/**
+ * What a card is called, and the one figure or name it leads with. A name
+ * (`isName`) is set a step smaller than a figure: at the figure's size a
+ * name as ordinary as "FIA World Endurance Championship" needs three lines.
+ */
+function anatomy(card: Card): { label: string; hero: string; unit?: string; isName?: boolean } {
   switch (card.kind) {
     case 'opening':
       return { label: `Endurance Wrapped · Career Year ${card.careerYear}`, hero: `${card.year}` };
@@ -31,15 +35,15 @@ function anatomy(card: Card): { label: string; hero: string; unit?: string } {
     case 'races':
       return { label: 'Races experienced', hero: formatNumber(card.racesExperienced) };
     case 'championship':
-      return { label: 'Most-watched championship', hero: card.name };
+      return { label: 'Most-watched championship', hero: card.name, isName: true };
     case 'event':
-      return { label: 'Most-watched recurring event', hero: card.name };
+      return { label: 'Most-watched recurring event', hero: card.name, isName: true };
     case 'longest-race':
-      return { label: 'Longest race', hero: card.name };
+      return { label: 'Longest race', hero: card.name, isName: true };
     case 'longest-session':
       return { label: 'Longest session', hero: formatDuration(card.creditedSeconds) };
     case 'circuit':
-      return { label: 'Favourite circuit', hero: card.name };
+      return { label: 'Favourite circuit', hero: card.name, isName: true };
     case 'active':
       return card.month !== null
         ? { label: 'Most active month', hero: card.month.label }
@@ -60,7 +64,7 @@ function anatomy(card: Card): { label: string; hero: string; unit?: string } {
 }
 
 export function WrappedCard({ card, line, chapterHref }: { card: Card; line: string; chapterHref: string }) {
-  const { label, hero, unit } = anatomy(card);
+  const { label, hero, unit, isName = false } = anatomy(card);
   const accent = card.kind === 'championship' && card.accent !== null ? accentVars(card.accent) : undefined;
 
   return (
@@ -77,7 +81,14 @@ export function WrappedCard({ card, line, chapterHref }: { card: Card; line: str
             </span>
           ) : null}
         </div>
-        <p className="timing text-timing-lg line-clamp-2 break-words text-ink">
+        {/* Raw class strings: cn() would drop the text-timing sizes (R10). A name
+            fits two lines at text-timing; the third line is only for a very
+            long custom name, which the sentence below names in full anyway. */}
+        <p
+          className={isName
+            ? 'timing text-timing line-clamp-3 break-words text-balance text-ink'
+            : 'timing text-timing-lg line-clamp-2 break-words text-ink'}
+        >
           {hero}
           {unit !== undefined ? <span className="ml-2 text-lg text-ink-dim">{unit}</span> : null}
         </p>

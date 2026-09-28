@@ -8,7 +8,7 @@
  * scale of what has been done is legible at a glance.
  */
 
-import { formatDuration } from '@/lib/domain/time';
+import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
 import { TWENTY_FOUR_HOUR_CONFIG } from '@/lib/config';
 import type { Interval } from '@/lib/domain/types';
 import { cn } from '@/lib/utils';
@@ -28,6 +28,8 @@ export function TwentyFourHourClock({
   const centre = size / 2;
   const safeRuntime = Math.max(1, runtimeSec);
   const covered = intervals.reduce((sum, iv) => sum + (iv.end - iv.start), 0);
+  // Rounded down, as every coverage figure is: never "100%" while a second is still to watch.
+  const percentText = formatCoveragePercent(covered, safeRuntime);
 
   const toPoint = (seconds: number) => {
     const angle = (seconds / safeRuntime) * Math.PI * 2 - Math.PI / 2;
@@ -51,7 +53,7 @@ export function TwentyFourHourClock({
 
   return (
     <div className={cn('relative inline-grid place-items-center', className)} style={{ width: size, height: size }}>
-      <svg width={size} height={size} role="img" aria-label={`${Math.round((covered / safeRuntime) * 100)}% of the race watched`}>
+      <svg width={size} height={size} role="img" aria-label={`${percentText} of the race watched`}>
         <circle cx={centre} cy={centre} r={radius} fill="none" stroke="#212b36" strokeWidth={stroke} />
 
         {intervals.map((interval, i) => (
@@ -91,7 +93,7 @@ export function TwentyFourHourClock({
 
       <div className="absolute inset-0 grid place-items-center text-center">
         <div>
-          <div className="timing text-2xl text-ink">{Math.round((covered / safeRuntime) * 100)}%</div>
+          <div className="timing text-2xl text-ink">{percentText}</div>
           <div className="mt-0.5 text-[0.6875rem] text-ink-dim">{formatDuration(covered)} watched</div>
         </div>
       </div>

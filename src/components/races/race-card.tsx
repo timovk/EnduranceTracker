@@ -22,7 +22,7 @@
 
 import Link from 'next/link';
 import { Star, Clock } from 'lucide-react';
-import { formatDuration } from '@/lib/domain/time';
+import { coverageTenths, formatDuration } from '@/lib/domain/time';
 import type { Interval, RacePriority, RaceStatus } from '@/lib/domain/types';
 import { cn, formatDate } from '@/lib/utils';
 import { RaceTimeline } from './race-timeline';
@@ -81,8 +81,9 @@ export function RaceCard({
   preview?: boolean;
 }) {
   const accent = variant === 'hyperpole' ? 'var(--accent)' : (race.championshipColor ?? 'var(--color-gold)');
-  const precisePercent = race.runtimeSec > 0 ? Math.min(100, (race.coverageSec / race.runtimeSec) * 100) : 0;
-  const percent = Math.round(precisePercent);
+  // Rounded down, as every coverage figure is: never "100%" while a second is still to watch.
+  const tenths = coverageTenths(race.coverageSec, race.runtimeSec);
+  const percent = Math.floor(tenths / 10);
   const mono = variant === 'timing';
 
   const shell = cn(
@@ -151,7 +152,7 @@ export function RaceCard({
                 variant === 'hyperpole' && 'text-[1rem] font-bold text-[var(--accent)]',
               )}
             >
-              {mono ? `${precisePercent.toFixed(1).padStart(5, '0')}%` : `${percent}%`}
+              {mono ? `${(tenths / 10).toFixed(1).padStart(5, '0')}%` : `${percent}%`}
             </div>
             <div className={cn('mt-0.5 text-[0.625rem]', mono && 'timing', variant === 'hyperpole' ? 'text-white/45' : 'text-ink-faint')}>
               {formatDuration(race.runtimeSec)}

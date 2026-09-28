@@ -88,7 +88,7 @@ import { monthPeriod } from '@/lib/domain/periods';
 import { averagePlaybackSpeed } from '@/lib/domain/playback';
 import { levelFromXp, prestigeForLevel, titleForLevel, totalXpForLevel } from '@/lib/domain/progression';
 import {
-  RECORD_ORDER, careerRecordOptions, computeRecordProgression, currentRecords, recordLabel,
+  PERIOD_RECORD_KINDS, RECORD_ORDER, careerRecordOptions, computeRecordProgression, currentRecords, recordLabel,
   type RecordEvent, type RecordKind,
 } from '@/lib/domain/records';
 import { formatDuration, formatElapsed } from '@/lib/domain/time';
@@ -186,8 +186,21 @@ export interface StatsEventOption {
 export interface StatsRaceOption {
   id: string;
   name: string;
+  /** The year of the edition (race date, else season), when known. */
+  editionYear: number | null;
+  /**
+   * What the Race control shows: "2024 · 24 Hours of Fort Aurelia". The races
+   * of one event usually share a name, and the Race control appears once an
+   * event is chosen, so the year is what tells its editions apart. A name that
+   * already says its year is left as it is.
+   */
+  label: string;
   /** Credited hours inside the chosen year, or the whole career without one. */
   hours: number;
+}
+
+function raceOptionLabel(name: string, year: number | null): string {
+  return year === null || name.includes(String(year)) ? name : `${year} · ${name}`;
 }
 
 export interface StatsLengthOption {
@@ -2068,12 +2081,15 @@ function raceOptions(
   filter: StatsFilter,
 ): StatsRaceOption[] {
   const window = filter.year === undefined ? null : yearWindow(filter.year);
-  const options: { id: string; name: string; seconds: number }[] = [];
+  const options: { id: string; name: string; seconds: number; editionYear: number | null }[] = [];
+  const yearOf = (raceId: string) => timeline.racesById.get(raceId)?.editionYear ?? null;
 
   for (const candidate of candidates) {
     const history = timeline.races.get(candidate.id);
     if (window === null) {
-      options.push({ id: candidate.id, name: candidate.name, seconds: history?.creditedSeconds ?? 0 });
+      options.push({
+        id: candidate.id, name: candidate.name, seconds: history?.creditedSeconds ?? 0, editionYear: yearOf(candidate.id),
+      });
       continue;
     }
     if (history === undefined) continue;
@@ -2084,18 +2100,28 @@ function raceOptions(
       if (part !== null) seconds += stint.creditedSeconds * part.fraction;
       if (isWithin(stint.watchedAt, window)) watched = true;
     }
-    if (watched || seconds > 0) options.push({ id: candidate.id, name: candidate.name, seconds });
+    if (watched || seconds > 0) options.push({ id: candidate.id, name: candidate.name, seconds, editionYear: yearOf(candidate.id) });
   }
 
-  options.sort((a, b) => b.seconds - a.seconds || a.name.localeCompare(b.name) || (a.id < b.id ? -1 : 1));
+  // Equal hours (two editions not yet watched): the newest edition first.
+  options.sort((a, b) => b.seconds - a.seconds || (b.editionYear ?? 0) - (a.editionYear ?? 0)
+    || a.name.localeCompare(b.name) || (a.id < b.id ? -1 : 1));
   const offered = options.slice(0, CAREER_STATS_SHAPE.raceOptionLimit);
   if (filter.raceId !== undefined && !offered.some((option) => option.id === filter.raceId)) {
     const chosen = options.find((option) => option.id === filter.raceId);
     const replayed = timeline.racesById.get(filter.raceId);
     if (chosen !== undefined) offered.push(chosen);
-    else if (replayed !== undefined) offered.push({ id: replayed.id, name: replayed.name, seconds: 0 });
+    else if (replayed !== undefined) {
+      offered.push({ id: replayed.id, name: replayed.name, seconds: 0, editionYear: replayed.editionYear });
+    }
   }
-  return offered.map((option) => ({ id: option.id, name: option.name, hours: toHours(option.seconds) }));
+  return offered.map((option) => ({
+    id: option.id,
+    name: option.name,
+    editionYear: option.editionYear,
+    label: raceOptionLabel(option.name, option.editionYear),
+    hours: toHours(option.seconds),
+  }));
 }
 
 /**
@@ -2886,12 +2912,6 @@ export interface RecordsView {
   loggedTimeNote: string | null;
 }
 
-/** Periods read as themselves; stints and races read as the day they happened. */
-const PERIOD_KINDS = new Set<RecordKind>([
-  'most-in-a-day', 'most-in-seven-days', 'most-in-a-month', 'most-completions-in-a-month',
-  'most-story-completes-in-a-year', 'most-new-coverage-in-a-day',
-]);
-
 /** Records measured from the first stint to the last: they can run to days, so they read as such. */
 const ELAPSED_KINDS = new Set<RecordKind>(['fastest-long-race-completion', 'longest-start-to-finish']);
 
@@ -2915,7 +2935,8 @@ function recordEntry(event: RecordEvent, timeline: CareerTimeline, linkedEvents:
     unit: event.unit,
     valueText: recordValueText(event),
     at: event.at,
-    when: PERIOD_KINDS.has(event.kind) ? event.detail : longDate(event.at),
+    // Periods read as themselves; stints and races read as the day they happened.
+    when: PERIOD_RECORD_KINDS.has(event.kind) ? event.detail : longDate(event.at),
     subject,
     loggedTime: event.basis === 'logged-time',
   };

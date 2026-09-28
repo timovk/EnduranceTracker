@@ -132,10 +132,20 @@ export function hoursToSeconds(hours: number): number {
  * second is covered, and anything short of that reads at most "99.9%".
  */
 export function formatCoveragePercent(coverageSec: number, runtimeSec: number): string {
-  if (!(runtimeSec > 0)) return '0%';
-  if (coverageSec >= runtimeSec) return '100%';
-  const tenths = Math.min(999, Math.floor((Math.max(0, coverageSec) * 1000) / runtimeSec));
+  const tenths = coverageTenths(coverageSec, runtimeSec);
+  if (tenths >= 1000) return '100%';
   return tenths % 10 === 0 ? `${tenths / 10}%` : `${(tenths / 10).toFixed(1)}%`;
+}
+
+/**
+ * The coverage `formatCoveragePercent` shows, in whole tenths of a percent
+ * (0-1000), for a screen that draws it its own way (a whole percent on a
+ * card): rounded down, 1000 only when every second is covered.
+ */
+export function coverageTenths(coverageSec: number, runtimeSec: number): number {
+  if (!(runtimeSec > 0)) return 0;
+  if (coverageSec >= runtimeSec) return 1000;
+  return Math.min(999, Math.floor((Math.max(0, coverageSec) * 1000) / runtimeSec));
 }
 
 /**

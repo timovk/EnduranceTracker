@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  formatCoveragePercent, formatDuration, formatElapsed, formatHoursMinutes, formatTimestamp, hoursToSeconds,
+  coverageTenths, formatCoveragePercent, formatDuration, formatElapsed, formatHoursMinutes, formatTimestamp, hoursToSeconds,
   parseTimestamp, TimeParseError, toHours, tryParseTimestamp,
 } from '@/lib/domain/time';
 import { isStoryComplete } from '@/lib/domain/intervals';
@@ -190,6 +190,29 @@ describe('estimateRemaining', () => {
 
   it('handles a zero-length race without dividing by zero', () => {
     expect(estimateRemaining(0, 0, 1).completionPercent).toBe(0);
+  });
+
+  it('rounds completion down, so a Story Complete race with 30 s still to watch reads 99.9, not 100', () => {
+    // The race page's "Complete" figure: it rounded 99.965 up to 100.0.
+    expect(estimateRemaining(24 * H - 30, 24 * H, 1.5).completionPercent).toBe(99.9);
+    expect(estimateRemaining(24 * H - 120, 24 * H, 1).completionPercent).toBe(99.8);
+    expect(estimateRemaining(6 * H - 10, 6 * H, 1).completionPercent).toBe(99.9);
+    expect(estimateRemaining(24 * H, 24 * H, 1).completionPercent).toBe(100);
+    // It is always what formatCoveragePercent says.
+    for (const covered of [0, 1, 10_051, 12 * H + 17, 24 * H - 43, 24 * H - 1]) {
+      expect(`${estimateRemaining(covered, 24 * H, 1).completionPercent}%`).toBe(formatCoveragePercent(covered, 24 * H));
+    }
+  });
+});
+
+describe('coverageTenths', () => {
+  it('is the coverage formatCoveragePercent shows, in tenths: 1000 only when every second is watched', () => {
+    expect(coverageTenths(24 * H - 30, 24 * H)).toBe(999);
+    expect(coverageTenths(24 * H, 24 * H)).toBe(1000);
+    expect(coverageTenths(25 * H, 24 * H)).toBe(1000);
+    expect(coverageTenths(2, 3)).toBe(666);
+    expect(coverageTenths(-5, 60)).toBe(0);
+    expect(coverageTenths(5, 0)).toBe(0);
   });
 });
 

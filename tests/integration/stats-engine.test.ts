@@ -207,7 +207,34 @@ describe('Career Statistics', () => {
     expect(options.events).toEqual([expect.objectContaining({ key: 'hills-6', hours: 3 })]);
     // An event narrows the library enough to offer its races, most watched first.
     expect(options.races.map((race) => race.id)).toEqual([second, first]);
+    // Their names already say their years, so the year is not said twice.
+    expect(options.races.map((race) => [race.editionYear, race.label])).toEqual([
+      [2027, '2027 Six Hours of the Hills'], [2026, '2026 Six Hours of the Hills'],
+    ]);
     expect((await getFilterOptions(USER)).races).toEqual([]);
+  });
+
+  it('race options under an event tell its editions apart by year', async () => {
+    const name = '24 Hours of Fort Aurelia';
+    const editions = new Map<number, string>();
+    for (const year of [2024, 2025, 2026, 2027]) {
+      editions.set(year, await addRace(USER, {
+        name, hours: 24, iconicKey: 'fort-aurelia-24', raceDate: new Date(Date.UTC(year, 5, 14)),
+      }));
+    }
+    const undated = await addRace(USER, { name, hours: 24, iconicKey: 'fort-aurelia-24' });
+    await watch(USER, editions.get(2025)!, at(2027, 1, 9), 0, 3 * H);
+    await watch(USER, editions.get(2026)!, at(2027, 1, 10), 0, 5 * H);
+
+    const options = await getFilterOptions(USER, { eventKey: 'fort-aurelia-24' });
+    // Most watched first; editions not yet watched (0 h each) newest first, the undated one last.
+    expect(options.races.map((race) => race.id)).toEqual([
+      editions.get(2026), editions.get(2025), editions.get(2027), editions.get(2024), undated,
+    ]);
+    expect(options.races.map((race) => race.label)).toEqual([
+      `2026 · ${name}`, `2025 · ${name}`, `2027 · ${name}`, `2024 · ${name}`, name,
+    ]);
+    expect(options.races.map((race) => race.editionYear)).toEqual([2026, 2025, 2027, 2024, null]);
   });
 
   it('race filter', async () => {

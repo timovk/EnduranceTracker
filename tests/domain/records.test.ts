@@ -7,7 +7,9 @@ import { describe, expect, it } from 'vitest';
 import type { CareerTimeline } from '@/lib/domain/career-timeline';
 import { yearWindow } from '@/lib/domain/calendar';
 import type { RecordEvent, RecordKind, RecordOptions } from '@/lib/domain/records';
-import { beatenAfter, computeRecordProgression, currentRecords, RECORD_ORDER, recordLabel, recordsSetIn } from '@/lib/domain/records';
+import {
+  beatenAfter, computeRecordProgression, currentRecords, PERIOD_RECORD_KINDS, RECORD_ORDER, recordLabel, recordsSetIn, recordWhen,
+} from '@/lib/domain/records';
 import { career, localTime, race, stint } from '../helpers/timeline-fixture';
 import { inTimeZone, ZONES } from '../helpers/time-zone';
 
@@ -314,5 +316,46 @@ describe('the rules', () => {
     expect(recordLabel('most-in-seven-days', 7)).toBe('Most in seven days');
     expect(recordLabel('most-in-seven-days', 14)).toBe('Most in 14 days');
     expect(new Set(RECORD_ORDER.map((kind) => recordLabel(kind))).size).toBe(RECORD_ORDER.length);
+  });
+
+  it('no record\'s name has a comma, so the list of those still to be set reads as one name each', () => {
+    // "fastest long race, start to finish" read as two records in "Still to be set: …, …".
+    for (const kind of RECORD_ORDER) expect(recordLabel(kind), kind).not.toContain(',');
+    expect(recordLabel('fastest-long-race-completion')).toBe('Fastest long race from start to finish');
+  });
+});
+
+describe('when a record was set, in words', () => {
+  it('names the month or the year of a period record, never its first day', () => {
+    const races = ['a', 'b'].map((id) => race(id, { hours: 2 }));
+    const whole = { from: '0:00', to: '2:00' };
+    // The career begins on 21 March: its month and year records are dated 1 March and 1 January.
+    const events = progression(career(races, [stint('a', '2026-03-21T21:00', whole), stint('b', '2026-06-14T21:00', whole)]));
+    const set = (kind: RecordKind) => currentRecords(events).find((event) => event.kind === kind)!;
+    expect(set('most-in-a-month').at).toEqual(localTime('2026-03-01'));
+    expect(recordWhen('most-in-a-month', set('most-in-a-month').at)).toBe('in March 2026');
+    expect(recordWhen('most-completions-in-a-month', set('most-completions-in-a-month').at)).toBe('in March 2026');
+    expect(recordWhen('most-story-completes-in-a-year', set('most-story-completes-in-a-year').at)).toBe('in 2026');
+    expect(recordWhen('most-in-a-day', set('most-in-a-day').at)).toBe('on 21 March 2026');
+    expect(recordWhen('most-in-seven-days', set('most-in-seven-days').at)).toBe('in the seven days to 21 March 2026');
+    expect(recordWhen('longest-session', set('longest-session').at)).toBe('on 21 March 2026');
+    // A snapshot keeps `at` as an ISO string; it reads the same.
+    expect(recordWhen('most-in-a-month', set('most-in-a-month').at.toISOString())).toBe('in March 2026');
+    expect(recordWhen('most-in-seven-days', localTime('2026-04-06'), 14)).toBe('in the 14 days to 6 April 2026');
+  });
+
+  it('every period record is named by its period, the rest by the day they happened', () => {
+    expect([...PERIOD_RECORD_KINDS].sort()).toEqual([
+      'most-completions-in-a-month', 'most-in-a-day', 'most-in-a-month', 'most-in-seven-days',
+      'most-new-coverage-in-a-day', 'most-story-completes-in-a-year',
+    ]);
+    const january = localTime('2026-01-01');
+    for (const kind of RECORD_ORDER) {
+      const when = recordWhen(kind, january);
+      if (kind === 'most-story-completes-in-a-year') expect(when).toBe('in 2026');
+      else if (kind === 'most-in-a-month' || kind === 'most-completions-in-a-month') expect(when).toBe('in January 2026');
+      else if (kind === 'most-in-seven-days') expect(when).toBe('in the seven days to 1 January 2026');
+      else expect(when, kind).toBe('on 1 January 2026');
+    }
   });
 });

@@ -85,24 +85,68 @@ export function careerRecordOptions(weekStartsOn: number): RecordOptions {
 
 const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'] as const;
 
+/** "seven", or "14" past ten: the span of the rolling record. */
+function daysWord(rollingDays: number): string {
+  return rollingDays < NUMBER_WORDS.length ? NUMBER_WORDS[rollingDays] : `${rollingDays}`;
+}
+
 /** What a record is called, on its card and in the list of records still to be set. */
 export function recordLabel(kind: RecordKind, rollingDays: number = CAREER_STATS_SHAPE.recordRollingDays): string {
   switch (kind) {
     case 'longest-session': return 'Longest session';
     case 'most-in-a-day': return 'Most in a day';
-    case 'most-in-seven-days': {
-      const days = rollingDays < NUMBER_WORDS.length ? NUMBER_WORDS[rollingDays] : `${rollingDays}`;
-      return `Most in ${days} days`;
-    }
+    case 'most-in-seven-days': return `Most in ${daysWord(rollingDays)} days`;
     case 'most-in-a-month': return 'Most in a month';
     case 'most-completions-in-a-month': return 'Most Story Completes in a month';
     case 'most-story-completes-in-a-year': return 'Most Story Completes in a year';
     case 'longest-race-story-completed': return 'Longest race completed';
-    case 'fastest-long-race-completion': return 'Fastest long race, start to finish';
+    case 'fastest-long-race-completion': return 'Fastest long race from start to finish';
     case 'longest-start-to-finish': return 'Longest start to finish';
     case 'most-new-coverage-in-a-day': return 'Most new race coverage in a day';
     case 'longest-edition-streak': return 'Longest run of complete editions';
   }
+}
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const;
+
+/** Records of a calendar month: `at` is the month's first day. */
+export const MONTH_RECORD_KINDS: ReadonlySet<RecordKind> = new Set<RecordKind>([
+  'most-in-a-month', 'most-completions-in-a-month',
+]);
+
+/** Records of a calendar year: `at` is 1 January. */
+export const YEAR_RECORD_KINDS: ReadonlySet<RecordKind> = new Set<RecordKind>(['most-story-completes-in-a-year']);
+
+/**
+ * Records of a period rather than of a stint or a race: a day, the rolling
+ * days, a month or a year. Their `at` stands for the period (its start, or
+ * the last of the rolling days), not a moment anything happened, so a page
+ * names the period instead of a date.
+ */
+export const PERIOD_RECORD_KINDS: ReadonlySet<RecordKind> = new Set<RecordKind>([
+  'most-in-a-day', 'most-in-seven-days', 'most-new-coverage-in-a-day', ...MONTH_RECORD_KINDS, ...YEAR_RECORD_KINDS,
+]);
+
+/**
+ * When a record was set, to follow "Set" or "since beaten": "on 9 October
+ * 2022" for a stint, a race or a day, "in June 2024" for a month, "in 2022"
+ * for a year and "in the seven days to 6 April 2026" for the rolling record.
+ * A month or year record is never given its first day as a date, which could
+ * fall before anything was watched. Local time, as the records are kept.
+ */
+export function recordWhen(
+  kind: RecordKind,
+  at: Date | string,
+  rollingDays: number = CAREER_STATS_SHAPE.recordRollingDays,
+): string {
+  const date = typeof at === 'string' ? new Date(at) : at;
+  if (YEAR_RECORD_KINDS.has(kind)) return `in ${date.getFullYear()}`;
+  if (MONTH_RECORD_KINDS.has(kind)) return `in ${MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}`;
+  const day = `${date.getDate()} ${MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}`;
+  return kind === 'most-in-seven-days' ? `in the ${daysWord(rollingDays)} days to ${day}` : `on ${day}`;
 }
 
 /**
@@ -115,11 +159,6 @@ export function recordValueText(record: Pick<RecordEvent, 'unit' | 'value'>): st
   if (record.unit === 'editions') return `${value} ${record.value === 1 ? 'edition' : 'editions'}`;
   return value;
 }
-
-const MONTH_NAMES = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-] as const;
 
 function dayText(dayKey: string): string {
   const date = dayKeyToLocalDate(dayKey);

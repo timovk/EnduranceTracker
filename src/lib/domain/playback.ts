@@ -7,6 +7,8 @@
  * the conversion lives.
  */
 
+import { coverageTenths } from './time';
+
 /** Playback speeds offered in the UI. Any positive value is accepted. */
 export const PLAYBACK_SPEEDS = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3] as const;
 
@@ -52,7 +54,11 @@ export interface RemainingEstimate {
   timelineRemainingSec: number;
   /** Wall-clock seconds that will cost at the given speed. */
   realRemainingSec: number;
-  /** Coverage as a percentage, 0-100, rounded to one decimal. */
+  /**
+   * Coverage as a percentage, 0-100, in whole tenths and rounded down (as
+   * `formatCoveragePercent`): 100 only when every second is covered, so a
+   * Story Complete race with a gap reads at most 99.9, never 100.
+   */
   completionPercent: number;
 }
 
@@ -67,7 +73,7 @@ export function estimateRemaining(
   return {
     timelineRemainingSec,
     realRemainingSec: realSecondsFor(timelineRemainingSec, speed),
-    completionPercent: safeRuntime === 0 ? 0 : Math.round((covered / safeRuntime) * 1000) / 10,
+    completionPercent: coverageTenths(covered, safeRuntime) / 10,
   };
 }
 

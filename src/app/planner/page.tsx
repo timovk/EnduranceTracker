@@ -75,7 +75,7 @@ export default async function PlannerPage(props: PageProps<'/planner'>) {
                           <div className="text-[0.6875rem] text-ink-faint">{rec.championshipName}</div>
                         ) : null}
                       </td>
-                      <td className="timing py-2.5 text-right text-ink-muted">{rec.completionPercent.toFixed(0)}%</td>
+                      <td className="timing py-2.5 text-right text-ink-muted">{Math.floor(rec.completionPercent)}%</td>
                       <td className="timing py-2.5 text-right text-ink-muted">{formatDuration(rec.realSecondsToFinish)}</td>
                       <td className="timing py-2.5 text-right text-ink-muted">
                         {rec.suggestedStintSeconds > 0 ? formatDuration(rec.suggestedStintSeconds) : '—'}

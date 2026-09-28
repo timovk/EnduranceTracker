@@ -147,7 +147,8 @@ function Card({
       <div className="mt-1.5">
         <TimingBar value={card.coveragePercent} height="h-0.5" color={accent} label={card.name} />
         <div className="mt-1 flex justify-between text-[0.5625rem] text-ink-faint">
-          <span className="timing">{card.coveragePercent.toFixed(0)}%</span>
+          {/* Whole percent, rounded down: a race with any second still to watch never reads 100%. */}
+          <span className="timing">{Math.floor(card.coveragePercent)}%</span>
           <span className="timing">{formatDuration(card.runtimeSec)}</span>
         </div>
       </div>

@@ -566,7 +566,7 @@ completion the history can vouch for.
   sentence instead.
 - **Records** shows the personal records you have set — longest session, most
   in a day, in seven days and in a month, most Story Completes in a month and
-  in a year, longest race completed, fastest long race start to finish,
+  in a year, longest race completed, fastest long race from start to finish,
   longest start to finish, most new race coverage in a day, and the longest
   run of complete editions of an event — each with when it was set and every
   time it was improved. With a year chosen it shows your best within that

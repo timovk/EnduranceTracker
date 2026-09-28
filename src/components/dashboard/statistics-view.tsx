@@ -332,7 +332,7 @@ function FilterBar({
           >
             <option value="">All races</option>
             {options.races.map((race) => (
-              <option key={race.id} value={race.id}>{race.name} ({formatHours(race.hours)})</option>
+              <option key={race.id} value={race.id}>{race.label} ({formatHours(race.hours)})</option>
             ))}
           </Select>
         ) : null}

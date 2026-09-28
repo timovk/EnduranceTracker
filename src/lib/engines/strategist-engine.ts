@@ -294,7 +294,8 @@ export function scoreCandidate(
   // 8% still reads as "you started this" rather than "practically untouched".
   if (estimate.started) {
     const continuity = shape.continuityBase + (1 - shape.continuityBase) * estimate.progress;
-    add(weights.continuity, continuity, `${Math.round(estimate.completionPercent)}% through already`);
+    // Whole percent, rounded down: a race still to finish never reads "100% through".
+    add(weights.continuity, continuity, `${Math.floor(estimate.completionPercent)}% through already`);
   }
 
   // -- Progress depth: peaks mid-race --------------------------------------
@@ -582,7 +583,7 @@ function buildHeadline(
   context: StrategistContext,
   estimate: CandidateEstimate,
 ): string {
-  const percent = Math.round(estimate.completionPercent);
+  const percent = Math.floor(estimate.completionPercent);
   const remaining = formatDuration(estimate.realSecondsToFinish);
   const stint = formatDuration(estimate.suggestedStintSeconds);
   const window = formatDuration(context.windowSeconds);

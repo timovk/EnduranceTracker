@@ -276,6 +276,27 @@ export async function checkCareerHistory(page, { step, check, section, go, waitF
     );
   });
 
+  await step('says what a switch did on the race page too, where the switch moves', async () => {
+    // On the race page the switch sits in the Expedition panel while the race
+    // is an Expedition and in the header line while it is not, so each switch
+    // moves it: what it did is said in the page's notice, which stays.
+    await go(page, `/races/${expeditionRaceId}`);
+    await page.click('button[role="switch"]:has-text("Expedition Mode: on")');
+    await page.waitForSelector('button[role="switch"]:has-text("Follow this race as an Expedition")', { timeout });
+    const off = page.locator('[role="status"]:has-text("Expedition Mode is off.")');
+    await off.waitFor({ timeout });
+    await page.waitForTimeout(500);
+    check(await off.isVisible(), 'the race page did not keep saying that Expedition Mode was switched off');
+
+    await page.click('button[role="switch"]:has-text("Follow this race as an Expedition")');
+    await page.waitForSelector('button[role="switch"]:has-text("Expedition Mode: on")', { timeout });
+    const on = page.locator('[role="status"]:has-text("Expedition Mode is on.")');
+    await on.waitFor({ timeout });
+    await page.waitForTimeout(500);
+    check(await on.isVisible(), 'the race page did not keep saying that Expedition Mode was switched on');
+    await go(page, `/races/${expeditionRaceId}/expedition`);
+  });
+
   await step('hands the choice back to the race’s length', async () => {
     await page.click('button:has-text("Reset to automatic")');
     await page.waitForSelector('[role="status"]:has-text("follows the race")', { timeout });

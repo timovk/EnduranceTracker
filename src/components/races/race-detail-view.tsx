@@ -27,7 +27,7 @@ import {
 import { EXPEDITION_SHAPE } from '@/lib/config';
 import type { RaceDetail } from '@/lib/server/races';
 import type { SessionOutcome } from '@/lib/engines/contracts';
-import { formatDuration, formatTimestamp } from '@/lib/domain/time';
+import { formatCoveragePercent, formatDuration, formatTimestamp } from '@/lib/domain/time';
 import { Badge, Panel, PanelBody, PanelHeader, Stat, EmptyState } from '@/components/ui/primitives';
 import { Button } from '@/components/ui/controls';
 import { Dialog } from '@/components/ui/dialog';
@@ -145,6 +145,7 @@ export function RaceDetailView({
                 raceId={race.id}
                 mode={expedition.mode}
                 isExpedition={false}
+                onMessage={setNotice}
                 label={`Follow this race as an Expedition${expedition.checkpointsPayXp
                   ? ''
                   : ` (checkpoints earn XP from ${EXPEDITION_SHAPE.checkpointXpMinimumHours} hours)`}`}
@@ -174,8 +175,10 @@ export function RaceDetailView({
         </div>
       </div>
 
+      {/* The page's one notice. It also carries what an Expedition Mode switch did: the switch moves
+          between the header and the Expedition panel, so a message kept inside it would vanish. */}
       {notice ? (
-        <p className="rounded-md border border-hairline-strong bg-panel-2 px-3 py-2 text-sm text-ink-muted">{notice}</p>
+        <p role="status" className="rounded-md border border-hairline-strong bg-panel-2 px-3 py-2 text-sm text-ink-muted">{notice}</p>
       ) : null}
 
       {race.event === null && eventSuggestion !== null ? (
@@ -220,7 +223,7 @@ export function RaceDetailView({
                   sub={`of ${formatTimestamp(race.runtimeSec)}`}
                   size="md"
                 />
-                <Stat label="Complete" value={`${race.coveragePercent.toFixed(1)}%`} size="md" tone="accent" />
+                <Stat label="Complete" value={formatCoveragePercent(race.coverageSec, race.runtimeSec)} size="md" tone="accent" />
                 <Stat
                   label="Timeline left"
                   value={formatDuration(race.timelineRemainingSec)}
@@ -302,7 +305,7 @@ export function RaceDetailView({
                   ? 'every checkpoint reached, and the story is complete'
                   : 'every checkpoint reached; Story Complete is the last'}
             </p>
-            <ExpeditionModeControl raceId={race.id} mode={expedition.mode} isExpedition />
+            <ExpeditionModeControl raceId={race.id} mode={expedition.mode} isExpedition onMessage={setNotice} />
           </PanelBody>
         </Panel>
       ) : null}

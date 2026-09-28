@@ -43,6 +43,7 @@ import { XP_CONFIG } from '@/lib/config';
 import { prisma, type Tx } from '@/lib/db/client';
 import type { CollectionKind } from '@/lib/domain/types';
 import { isSeasonClosed } from '@/lib/domain/season-closure';
+import { coverageTenths } from '@/lib/domain/time';
 import type { CollectionOutcome } from '@/lib/engines/contracts';
 import { awardXp } from '@/lib/engines/xp-ledger';
 
@@ -329,6 +330,15 @@ function compareByDateThenName(
 function percentOf(value: number, total: number): number {
   if (total <= 0) return 0;
   return Math.min(100, Math.round((value / total) * 1000) / 10);
+}
+
+/**
+ * A race's coverage on the 0-100 scale, in tenths rounded down, as
+ * `formatCoveragePercent` says it: 100 only when every second is covered, so
+ * a Story Complete race with a gap never reads 100.
+ */
+function coveragePercentOf(coverageSec: number, runtimeSec: number): number {
+  return coverageTenths(coverageSec, runtimeSec) / 10;
 }
 
 // ---------------------------------------------------------------------------
@@ -790,7 +800,7 @@ function toCardView(item: ViewItem): CollectionCardView {
     storyComplete: item.storyComplete || (race?.storyCompletedAt ?? null) !== null,
     runtimeSec,
     coverageSec,
-    coveragePercent: percentOf(coverageSec, runtimeSec),
+    coveragePercent: coveragePercentOf(coverageSec, runtimeSec),
     realViewingSec: race?.realViewingSec ?? 0,
     sessionCount: race?.sessionCount ?? 0,
     isMajorEvent: race?.isMajorEvent ?? false,

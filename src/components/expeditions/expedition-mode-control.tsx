@@ -9,6 +9,11 @@
  * Automatic · On · Off control read the same for a ten-hour race whichever of
  * the first two was chosen.) Switching off takes nothing back, and the
  * message after each switch says what it did.
+ *
+ * On the race page a switch moves the control (from the header line into the
+ * Expedition panel, or back), so React mounts a new one and anything it held
+ * is gone: there the page takes the message (`onMessage`) and shows it in its
+ * own notice. On the Expedition page the control stays put and shows it here.
  */
 
 import * as React from 'react';
@@ -21,7 +26,7 @@ import { cn } from '@/lib/utils';
 export type ExpeditionModeValue = 'auto' | 'on' | 'off';
 
 export function ExpeditionModeControl({
-  raceId, mode, isExpedition, label, className,
+  raceId, mode, isExpedition, label, className, onMessage,
 }: {
   raceId: string;
   mode: ExpeditionModeValue;
@@ -30,6 +35,8 @@ export function ExpeditionModeControl({
   /** The switch's words; "Expedition Mode: on" or "…: off" when not given. */
   label?: string;
   className?: string;
+  /** Where the message after a switch goes, when the page shows it; otherwise it is shown under the switch. */
+  onMessage?: (message: string | null) => void;
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
@@ -38,7 +45,8 @@ export function ExpeditionModeControl({
   function choose(next: ExpeditionModeValue) {
     startTransition(async () => {
       const result = await setExpeditionModeAction(raceId, next);
-      setMessage(result.message ?? null);
+      if (onMessage) onMessage(result.message ?? null);
+      else setMessage(result.message ?? null);
       router.refresh();
     });
   }

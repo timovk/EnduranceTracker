@@ -22,11 +22,12 @@ import {
 } from 'lucide-react';
 import type { ChronicleChapterView } from '@/lib/engines/chronicle-engine';
 import type { ChronicleChapterV1 } from '@/lib/domain/chronicle';
+import { recordWhen } from '@/lib/domain/records';
 import { formatCoveragePercent, formatDuration, formatPercentFloor } from '@/lib/domain/time';
 import { chapterBeginning, chapterHeadline, differencePhrase, milestoneLabel, precisionLabel } from '@/lib/copy/tone';
-import { PeriodBars } from '@/components/charts/monthly-bars';
+import { MAX_MARKS, PeriodBars } from '@/components/charts/monthly-bars';
 import { WeekdayBars, type WeekdayPoint } from '@/components/charts/weekday-bars';
-import { CHART_COLORS } from '@/components/charts/chart-theme';
+import { CHART_COLORS, hasEnoughPoints } from '@/components/charts/chart-theme';
 import { ExpeditionSummaryCard } from '@/components/expeditions/expedition-summary-card';
 import { Button } from '@/components/ui/controls';
 import { Dialog } from '@/components/ui/dialog';
@@ -748,9 +749,11 @@ function RecordsSection({
                 <div className="min-w-0">
                   <div className="text-sm text-ink">{record.label}</div>
                   <div className="text-xs text-ink-dim">
-                    Set on {dateOf(record.at)}
+                    {/* A month or year record names its period, never its first day. */}
+                    Set {recordWhen(record.kind, record.at)}
                     {href !== null ? <> · <Link href={href} className="hover:text-ink-muted">the race</Link></> : null}
-                    {since !== null ? <> · since beaten on {dateOf(since)}</> : null}
+                    {/* Only a record of the same kind beats it, so its own kind words the date. */}
+                    {since !== null ? <> · since beaten {recordWhen(record.kind, since)}</> : null}
                   </div>
                 </div>
                 <span className="timing text-sm text-[var(--accent)]">{record.valueText}</span>
@@ -778,7 +781,8 @@ function NotableRaces({ chapter, raceHref }: { chapter: ChronicleChapterV1; race
           {chapter.notableRaces.map((race) => {
             const href = raceHref(race.raceId);
             return (
-              <li key={race.raceId} className="bg-panel px-4 py-3">
+              // An odd last race spans both columns, so no empty cell shows the hairline colour.
+              <li key={race.raceId} className="bg-panel px-4 py-3 sm:odd:last:col-span-2">
                 <div className="truncate text-sm font-medium text-ink">
                   {href !== null ? <Link href={href} className="hover:text-[var(--accent)]">{race.name}</Link> : race.name}
                 </div>
@@ -805,11 +809,16 @@ function MonthlyActivity({ chapter }: { chapter: ChronicleChapterV1 }) {
       : `${month.sessions} ${month.sessions === 1 ? 'session' : 'sessions'}`,
     hours: hours(month.creditedSeconds),
     coverage: hours(month.newCoverageSeconds),
+    storyCompletes: month.storyCompletes,
   }));
   const active = chapter.monthly.filter((month) => month.creditedSeconds > 0);
   const sentence = active.length === 0
     ? `Nothing logged in ${chapter.year} yet.`
     : active.map((month) => `${MONTHS[month.month - 1]}: ${watched(month.creditedSeconds)}`).join('. ') + '.';
+  const completeMonths = chapter.monthly.filter((month) => month.storyCompletes > 0);
+  // With the chart drawn, its own axis carries the dots under each month's
+  // bars; a row of its own beside the chart could never line up with them.
+  const chartDrawn = hasEnoughPoints(active.length);
 
   return (
     <Panel>
@@ -824,19 +833,28 @@ function MonthlyActivity({ chapter }: { chapter: ChronicleChapterV1 }) {
           unit="h"
           points={active.length}
           sentence={sentence}
+          marks={{ count: (month) => month.storyCompletes, title: (month, count) => `${month.full}: ${count} complete` }}
         />
-        <div className="grid grid-cols-12 gap-1" aria-label="Complete race stories by month">
-          {chapter.monthly.map((month) => (
-            <div key={month.month} className="flex flex-col items-center gap-0.5" title={`${MONTHS[month.month - 1]}: ${month.storyCompletes} complete`}>
-              <div className="flex min-h-2 flex-wrap justify-center gap-0.5">
-                {Array.from({ length: Math.min(month.storyCompletes, 6) }, (_, index) => (
-                  <span key={index} className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                ))}
+        {chartDrawn ? (
+          <p className="sr-only">
+            {completeMonths.length === 0
+              ? `No complete race stories in ${chapter.year}.`
+              : `Complete race stories: ${completeMonths.map((month) => `${MONTHS[month.month - 1]} ${month.storyCompletes}`).join(', ')}.`}
+          </p>
+        ) : (
+          <div className="grid grid-cols-12 gap-1" aria-label="Complete race stories by month">
+            {chapter.monthly.map((month) => (
+              <div key={month.month} className="flex flex-col items-center gap-0.5" title={`${MONTHS[month.month - 1]}: ${month.storyCompletes} complete`}>
+                <div className="flex min-h-2 flex-wrap justify-center gap-0.5">
+                  {Array.from({ length: Math.min(month.storyCompletes, MAX_MARKS) }, (_, index) => (
+                    <span key={index} className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+                  ))}
+                </div>
+                <span className="text-[0.625rem] text-ink-faint">{month.label}</span>
               </div>
-              <span className="text-[0.625rem] text-ink-faint">{month.label}</span>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
         <p className="text-xs text-ink-dim">Dots are complete race stories, one for each (up to six a month).</p>
         <Link href={`/stats?year=${chapter.year}`} className="inline-flex items-center gap-1.5 text-xs text-[var(--accent)] hover:underline">
           See {chapter.year} in Career Statistics <ChevronRight size={12} />

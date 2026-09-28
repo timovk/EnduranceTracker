@@ -35,7 +35,9 @@ import ChroniclePage from '@/app/chronicle/page';
 import ChapterPage from '@/app/chronicle/[year]/page';
 import WrappedPage from '@/app/chronicle/[year]/wrapped/page';
 import { ChapterView } from '@/components/chronicle/chapter-view';
+import { WrappedCard } from '@/components/chronicle/wrapped-card';
 import { WrappedDeck } from '@/components/chronicle/wrapped-deck';
+import { wrappedCardLine } from '@/lib/copy/tone';
 import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { buildWrappedCards, upgradeChapterSnapshot, type ChronicleChapterV1 } from '@/lib/domain/chronicle';
 import {
@@ -431,6 +433,131 @@ describe('the chapter page', () => {
     expect(line).toMatchObject({ name: '24 Hours of Le Mans', coverageSeconds: 5 * H, storyComplete: false });
     expect(pageText(finished!)).toContain('|Longest race|24h 00m|24 Hours of Le Mans|20.8% seen by the end of 2026|');
     expect(pageText(next!)).toContain('|Longest race|24h 00m|24 Hours of Le Mans|complete race story|');
+  });
+
+  /** The page's words with React's text separators dropped, one `|` between elements. */
+  function plainText(view: Parameters<typeof ChapterView>[0]['view']): string {
+    return renderToStaticMarkup(createElement(ChapterView, { view }))
+      .replace(/<!-- -->/g, '').replace(/<[^>]+>/g, '|').replace(/\|+/g, '|').replace(/&#x27;/g, "'");
+  }
+
+  /** Two championships: 29 hours of IMSA and 21 of the WEC, in February, March and June 2026. */
+  async function twoChampionships(): Promise<void> {
+    const [imsa, wec] = await Promise.all([
+      prisma.championship.create({ data: { userId: USER, name: 'IMSA SportsCar Championship', slug: 'imsa-test' }, select: { id: true } }),
+      prisma.championship.create({ data: { userId: USER, name: 'FIA World Endurance Championship', slug: 'wec-test' }, select: { id: true } }),
+    ]);
+    const daytona = await addRace(USER, { name: '24 Hours of Daytona', hours: 24, championshipId: imsa.id });
+    const sebring = await addRace(USER, { name: '12 Hours of Sebring', hours: 12, championshipId: imsa.id });
+    const lemans = await addRace(USER, { name: '24 Hours of Le Mans', hours: 24, championshipId: wec.id });
+    await watch(daytona, at(2026, 2, 1, 23), 0, 24 * H);
+    await watch(sebring, at(2026, 3, 21, 23), 0, 5 * H);
+    await watch(lemans, at(2026, 6, 14, 23), 0, 21 * H);
+  }
+
+  it('shows a championship\'s share as Wrapped says it: 29 of 50 hours is 58%, not 57.9%', async () => {
+    await twoChampionships();
+    const view = (await getChronicleChapter(USER, 2026, at(2026, 9, 1)))!;
+    expect(view.chapter.championships.map((row) => [row.name, row.share])).toEqual([
+      ['IMSA SportsCar Championship', 0.58], ['FIA World Endurance Championship', 0.42],
+    ]);
+    const text = plainText(view);
+    // 0.58 * 100 is 57.99999999999999 in floating point; flooring that read "57.9%".
+    expect(text).toContain('|IMSA SportsCar Championship|29h 00m|58%|');
+    expect(text).toContain('|FIA World Endurance Championship|21h 00m|42%|');
+    expect(text).not.toContain('57.9%');
+    const card = buildWrappedCards(view.chapter, { careerYear: view.careerYear, state: view.state })
+      .find((candidate) => candidate.kind === 'championship')!;
+    expect(wrappedCardLine(card)).toContain('58% of your viewing');
+  });
+
+  it('says a month or year record was set in that month or year, never on its first day', async () => {
+    // The career begins on 21 March 2026: a record dated "1 January 2026" or
+    // "1 March 2026" would be dated before anything was watched.
+    const spring = await addRace(USER, { name: 'Spring Two Hours', hours: 2 });
+    const summer = await addRace(USER, { name: 'Summer Six Hours', hours: 6 });
+    await watch(spring, at(2026, 3, 21, 21), 0, 2 * H);
+    await watch(summer, at(2026, 6, 14, 23), 0, 6 * H);
+    // August 2027 beats them all: twelve hours in a day and three Story Completes.
+    const twelve = await addRace(USER, { name: 'Late Twelve Hours', hours: 12 });
+    const [one, two] = await Promise.all([
+      addRace(USER, { name: 'Late Two Hours', hours: 2 }), addRace(USER, { name: 'Later Two Hours', hours: 2 }),
+    ]);
+    await watch(twelve, at(2027, 8, 13, 23), 0, 12 * H);
+    await watch(one, at(2027, 8, 20, 21), 0, 2 * H);
+    await watch(two, at(2027, 8, 21, 21), 0, 2 * H);
+
+    const view = (await getChronicleChapter(USER, 2026, at(2027, 9, 1)))!;
+    const text = plainText(view);
+    expect(text).toContain('|Most in a month|Set in June 2026 · since beaten in August 2027|');
+    expect(text).toContain('|Most Story Completes in a month|Set in March 2026 · since beaten in August 2027|');
+    expect(text).toContain('|Most Story Completes in a year|Set in 2026 · since beaten in 2027|');
+    // A day, and a stint, read as the day they happened.
+    expect(text).toContain('|Most in a day|Set on 14 June 2026 · since beaten on 13 August 2027|');
+    expect(text).toContain('|Most in seven days|Set in the seven days to 14 June 2026 · since beaten in the seven days to 13 August 2027|');
+    expect(text).toContain('|Longest session|Set on 14 June 2026 · |the race| · since beaten on 13 August 2027|');
+    expect(text).not.toMatch(/Set on 1 (January|March|June) 2026/);
+    expect(text).not.toMatch(/beaten on 1 (January|August) 2027/);
+
+    const now = (await getChronicleChapter(USER, 2027, at(2027, 9, 1)))!;
+    const thisYear = plainText(now);
+    expect(thisYear).toContain('|Most Story Completes in a year|Set in 2027|');
+    expect(thisYear).toContain('|Most in a month|Set in August 2027|');
+  });
+
+  it('lets an odd last notable race span the row, so no empty cell is drawn beside it', async () => {
+    await twoChampionships();
+    const view = (await getChronicleChapter(USER, 2026, at(2026, 9, 1)))!;
+    expect(view.chapter.notableRaces.length % 2).toBe(1);
+    const html = renderToStaticMarkup(createElement(ChapterView, { view }));
+    const items = [...html.matchAll(/<li class="([^"]*)"><div class="truncate text-sm font-medium text-ink">/g)].map((match) => match[1]);
+    expect(items).toHaveLength(view.chapter.notableRaces.length);
+    for (const className of items) expect(className).toContain('sm:odd:last:col-span-2');
+  });
+
+  it('puts the Story Complete dots in the chart\'s own axis while there is a chart, and in a row of their own otherwise', async () => {
+    await twoChampionships();
+    // February, March and June: three months, so the chart is drawn.
+    const drawn = (await getChronicleChapter(USER, 2026, at(2026, 9, 1)))!;
+    const html = renderToStaticMarkup(createElement(ChapterView, { view: drawn }));
+    expect(html).not.toContain('aria-label="Complete race stories by month"');
+    expect(plainText(drawn)).toContain('|Complete race stories: February 1.|');
+
+    // One month, so a sentence replaces the chart and the row is the only month axis.
+    const quiet = await addRace(USER, { name: 'Quiet Two Hours', hours: 2 });
+    await watch(quiet, at(2025, 5, 10, 21), 0, 2 * H);
+    const sentence = (await getChronicleChapter(USER, 2025, at(2026, 9, 1)))!;
+    const row = renderToStaticMarkup(createElement(ChapterView, { view: sentence }));
+    expect(row).toContain('aria-label="Complete race stories by month"');
+    expect(row).not.toContain('Complete race stories: May');
+  });
+});
+
+describe('a Wrapped card\'s hero', () => {
+  function heroClass(card: Parameters<typeof WrappedCard>[0]['card']): string {
+    const html = renderToStaticMarkup(createElement(WrappedCard, { card, line: '', chapterHref: '/chronicle/2026' }));
+    return /<p class="(timing [^"]*)">/.exec(html)?.[1] ?? '';
+  }
+
+  it('sets a name a step smaller than a figure, so a preset championship name is never cut short', () => {
+    const championship = heroClass({
+      asOf: null, kind: 'championship', name: 'FIA World Endurance Championship', accent: null, creditedSeconds: 21 * H, share: 0.42,
+    });
+    // At text-timing-lg (68 px, monospaced) the 686 px card fits about 18
+    // characters a line: "FIA World / Endurance…". At text-timing, about 28.
+    expect(championship.split(' ')).toEqual(expect.arrayContaining(['text-timing', 'line-clamp-3', 'text-balance']));
+    expect(championship).not.toContain('text-timing-lg');
+    for (const card of [
+      { asOf: null, kind: 'event', name: 'TotalEnergies 6 Hours of Spa-Francorchamps', key: null, creditedSeconds: H, editionsExperienced: 1 },
+      { asOf: null, kind: 'longest-race', name: 'TotalEnergies 6 Hours of Spa-Francorchamps', runtimeSec: 6 * H, storyComplete: true, coverageSeconds: 6 * H, year: 2026 },
+      { asOf: null, kind: 'circuit', name: 'Weathertech Raceway Laguna Seca', creditedSeconds: H, share: 1 },
+    ] as const) {
+      expect(heroClass(card).split(' '), card.kind).toContain('text-timing');
+    }
+
+    // A figure keeps the large size.
+    const figure = heroClass({ asOf: null, kind: 'xp', xpEarned: 12_500, levelStart: 3, levelEnd: 5, levelsGained: 2 });
+    expect(figure.split(' ')).toEqual(expect.arrayContaining(['text-timing-lg', 'line-clamp-2']));
   });
 });
 
