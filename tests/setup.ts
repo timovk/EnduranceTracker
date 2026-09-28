@@ -9,6 +9,11 @@
  * The database is created and migrated automatically on first run. SQLite
  * makes that possible: there is no server to start and no database to create
  * by hand, so `npm test` works on a fresh clone with no setup at all.
+ *
+ * It is also given the achievement catalogue, which the application writes
+ * when the Achievements page is first opened: without it no achievement can
+ * unlock, and a test file's result would depend on whether a file that seeds
+ * it happened to run first.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -16,6 +21,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import { resolve } from 'node:path';
 import { config } from 'dotenv';
+import { ACHIEVEMENTS } from '@/lib/config/achievements';
 
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
@@ -84,5 +90,35 @@ if (file !== null && needsMigrating(file)) {
     stdio: 'ignore',
     // npm is a .cmd on Windows, which execFile cannot launch directly.
     shell: process.platform === 'win32',
+  });
+}
+
+/**
+ * Whether the database lacks any achievement definition from configuration.
+ *
+ * Keys, not a count, so a catalogue left behind by an older definition list
+ * is completed too. A read of a few dozen keys, where writing them is a child
+ * process.
+ */
+function catalogueIncomplete(path: string): boolean {
+  const database = new Database(path, { readonly: true });
+  try {
+    const present = new Set(
+      (database.prepare('SELECT "key" FROM "achievements"').all() as { key: string }[]).map((row) => row.key),
+    );
+    return ACHIEVEMENTS.some((definition) => !present.has(definition.key));
+  } finally {
+    database.close();
+  }
+}
+
+if (file !== null && catalogueIncomplete(file)) {
+  // The application's own `syncAchievementDefinitions`, in a process of its
+  // own so this one's Prisma client and module cache stay untouched (see the
+  // script's header). `node --import tsx` needs no shell on any platform.
+  execFileSync(process.execPath, ['--import', 'tsx', resolve(root, 'tests', 'helpers', 'seed-achievement-catalogue.ts')], {
+    cwd: root,
+    env: { ...process.env },
+    stdio: ['ignore', 'ignore', 'pipe'],
   });
 }

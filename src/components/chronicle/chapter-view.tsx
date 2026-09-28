@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import type { ChronicleChapterView } from '@/lib/engines/chronicle-engine';
 import type { ChronicleChapterV1 } from '@/lib/domain/chronicle';
-import { formatDuration, formatPercentFloor } from '@/lib/domain/time';
+import { formatCoveragePercent, formatDuration, formatPercentFloor } from '@/lib/domain/time';
 import { chapterBeginning, chapterHeadline, differencePhrase, milestoneLabel, precisionLabel } from '@/lib/copy/tone';
 import { PeriodBars } from '@/components/charts/monthly-bars';
 import { WeekdayBars, type WeekdayPoint } from '@/components/charts/weekday-bars';
@@ -235,6 +235,8 @@ function ViewingStatistics({ chapter, raceHref }: { chapter: ChronicleChapterV1;
   const { summary, viewing } = chapter;
   const longest = viewing.longestSession;
   const longestHref = longest === null ? null : raceHref(longest.raceId);
+  const longestRace = viewing.longestRace;
+  const longestRaceHref = longestRace === null ? null : raceHref(longestRace.raceId);
   const weekdays: WeekdayPoint[] = Array.from({ length: 7 }, (_, index) => {
     const day = (chapter.weekStartsOn + index) % 7;
     const seconds = viewing.weekdaySeconds[day] ?? 0;
@@ -261,6 +263,26 @@ function ViewingStatistics({ chapter, raceHref }: { chapter: ChronicleChapterV1;
               <>
                 {longestHref !== null ? <Link href={longestHref} className="hover:text-ink">{longest.raceName}</Link> : longest.raceName}
                 {' · '}{dateOf(longest.at)}
+              </>
+            )}
+            size="sm"
+          />
+          <Stat
+            label="Longest race"
+            value={longestRace === null ? '—' : formatDuration(longestRace.runtimeSec)}
+            sub={longestRace === null ? undefined : (
+              <>
+                <span className="block truncate">
+                  {longestRaceHref !== null
+                    ? <Link href={longestRaceHref} className="hover:text-ink">{longestRace.name}</Link>
+                    : longestRace.name}
+                </span>
+                {/* As Wrapped tells it: how much of the story was seen, never how much was not. Wraps rather than cut off. */}
+                <span className="block whitespace-normal">
+                  {longestRace.storyComplete
+                    ? 'complete race story'
+                    : `${formatCoveragePercent(longestRace.coverageSeconds, longestRace.runtimeSec)} seen ${chapter.complete ? `by the end of ${chapter.year}` : 'so far'}`}
+                </span>
               </>
             )}
             size="sm"

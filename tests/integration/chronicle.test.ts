@@ -14,7 +14,8 @@
  * by a variable, as in `account-isolation.test.ts`.
  */
 
-import { Children, isValidElement, type ReactNode } from 'react';
+import { Children, createElement, isValidElement, type ReactNode } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /** The account every server action and page here is run as. */
@@ -398,6 +399,38 @@ describe('a chapter and the statistics', () => {
       expect(stats.races.racesStoryComplete, `${year}`).toBe(summary.storyCompletes);
       expect(stats.storyCompleteRate, `${year}`).toBe(view!.chapter.storyComplete.rate);
     }
+  });
+});
+
+describe('the chapter page', () => {
+  /** The page's text, one `|` between elements, so a Stat reads label|value|sub. */
+  function pageText(view: Parameters<typeof ChapterView>[0]['view']): string {
+    return renderToStaticMarkup(createElement(ChapterView, { view }))
+      .replace(/<[^>]+>/g, '|').replace(/\|+/g, '|');
+  }
+
+  it('names the year\'s longest race and how much of it was seen, as Wrapped does', async () => {
+    const lm = await addRace(USER, { name: '24 Hours of Le Mans', hours: 24 });
+    const imola = await addRace(USER, { name: '8 Hours of Imola', hours: 8 });
+    // Imola is watched in full; Le Mans, the longer race, for five hours only.
+    await watch(imola, at(2026, 4, 20, 23), 0, 8 * H);
+    await watch(lm, at(2026, 6, 14, 20), 0, 5 * H);
+
+    const during = await getChronicleChapter(USER, 2026, at(2026, 9, 1));
+    expect(during!.chapter.viewing.longestRace).toMatchObject({ raceId: lm, storyComplete: false, coverageSeconds: 5 * H });
+    expect(pageText(during!)).toContain('|Longest race|24h 00m|24 Hours of Le Mans|20.8% seen so far|');
+    expect(renderToStaticMarkup(createElement(ChapterView, { view: during! }))).toContain(`href="/races/${lm}"`);
+
+    // Le Mans is finished in 2027: the 2026 chapter still tells how much of it
+    // had been seen by the end of 2026, the 2027 chapter that it is complete.
+    await watch(lm, at(2027, 3, 1), 5 * H, 24 * H);
+    const now = at(2027, 6, 1);
+    const [finished, next] = await Promise.all([getChronicleChapter(USER, 2026, now), getChronicleChapter(USER, 2027, now)]);
+    const line = buildWrappedCards(finished!.chapter, { careerYear: finished!.careerYear, state: finished!.state })
+      .find((card) => card.kind === 'longest-race');
+    expect(line).toMatchObject({ name: '24 Hours of Le Mans', coverageSeconds: 5 * H, storyComplete: false });
+    expect(pageText(finished!)).toContain('|Longest race|24h 00m|24 Hours of Le Mans|20.8% seen by the end of 2026|');
+    expect(pageText(next!)).toContain('|Longest race|24h 00m|24 Hours of Le Mans|complete race story|');
   });
 });
 

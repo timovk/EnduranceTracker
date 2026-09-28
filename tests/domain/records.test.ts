@@ -58,7 +58,38 @@ describe('each record', () => {
       stint(r, '2026-04-09T21:00', { from: '6:00', to: '8:00' }),
     ])), 'most-in-seven-days');
     expect(events.map((e) => [e.periodKey, e.value])).toEqual([['2026-04-01', 3 * H], ['2026-04-06', 6 * H]]);
-    expect(events[1]).toMatchObject({ label: 'Most in seven days', detail: '31 March 2026 to 6 April 2026' });
+    // Dated at the start of its last day: that day's chapter lists it.
+    expect(events[1]).toMatchObject({ label: 'Most in seven days', detail: '31 March 2026 to 6 April 2026', at: localTime('2026-04-06') });
+  });
+
+  it('the seven-day record is dated on its last day, so a week across New Year belongs to the new year', () => {
+    const r = race('r', { hours: 24 });
+    const events = progression(career([r], [
+      stint(r, '2026-12-28T21:00', { from: '0:00', to: '2:00' }),
+      stint(r, '2027-01-03T21:00', { from: '2:00', to: '5:00' }),
+    ]));
+    const rolling = ofKind(events, 'most-in-seven-days');
+    expect(rolling.map((e) => [e.periodKey, e.value, e.at])).toEqual([
+      ['2026-12-28', 2 * H, localTime('2026-12-28')],
+      ['2027-01-03', 5 * H, localTime('2027-01-03')],
+    ]);
+    expect(rolling[1]!.detail).toBe('28 December 2026 to 3 January 2027');
+    // 2027's chapter lists the week that ended in it, and the 2026 record
+    // reads as beaten on 3 January, not on the week's first day.
+    expect(ofKind(recordsSetIn(events, yearWindow(2027)), 'most-in-seven-days')).toEqual([rolling[1]]);
+    expect(ofKind(recordsSetIn(events, yearWindow(2026)), 'most-in-seven-days')).toEqual([rolling[0]]);
+    expect(beatenAfter(events, rolling[0]!)!.at).toEqual(localTime('2027-01-03'));
+  });
+
+  it('a batch-logged day counts no more than the day holds inside the seven days', () => {
+    const r = race('r', { hours: 24 });
+    const events = ofKind(progression(career([r], [
+      stint(r, '2026-03-09T21:00', { from: '0:00', to: '5:00' }),
+      // Forty hours of credit logged into 10 March: the day holds twenty-four.
+      stint(r, '2026-03-10T23:00', { from: '0:00', to: '20:00' }),
+      stint(r, '2026-03-10T23:01', { from: '0:00', to: '20:00' }),
+    ])), 'most-in-seven-days');
+    expect(events.map((e) => [e.periodKey, e.value])).toEqual([['2026-03-09', 5 * H], ['2026-03-10', 29 * H]]);
   });
 
   it('the seven-day record spans 29 February correctly', () => {
@@ -161,6 +192,30 @@ describe('each record', () => {
       [2, 'The X Hours, 2024–2025', 'editions'], [4, 'The X Hours, 2024–2027', 'editions'],
     ]);
     expect(events[1]).toMatchObject({ eventKey: 'x', raceId: 'x26', at: localTime('2026-05-04T21:00') });
+  });
+});
+
+describe('Story Completes in a time zone ahead of UTC', () => {
+  // Auckland is thirteen hours ahead in January: the first hours of the new
+  // year are still 31 December in UTC, and the records follow the owner's
+  // calendar, not UTC's.
+  inTimeZone(ZONES.auckland.zone, ZONES.auckland.offsets);
+
+  it('count in the local month and year', () => {
+    const races = ['a', 'b', 'c'].map((id) => race(id, { hours: 1 }));
+    const whole = { from: '0:00', to: '1:00' };
+    const events = progression(career(races, [
+      stint('a', '2026-12-20T21:00', whole),
+      stint('b', '2027-01-01T00:30', whole),
+      stint('c', '2027-01-01T01:30', whole),
+    ]));
+    expect(localTime('2027-01-01T00:30').toISOString()).toBe('2026-12-31T11:30:00.000Z');
+    expect(ofKind(events, 'most-story-completes-in-a-year').map((e) => [e.periodKey, e.value, e.at])).toEqual([
+      ['2026', 1, localTime('2026-01-01')], ['2027', 2, localTime('2027-01-01')],
+    ]);
+    expect(ofKind(events, 'most-completions-in-a-month').map((e) => [e.periodKey, e.value, e.at])).toEqual([
+      ['2026-12', 1, localTime('2026-12-01')], ['2027-01', 2, localTime('2027-01-01')],
+    ]);
   });
 });
 

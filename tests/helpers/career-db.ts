@@ -18,6 +18,7 @@
  * reaches, each once).
  */
 
+import { ACHIEVEMENTS } from '@/lib/config/achievements';
 import { prisma } from '@/lib/db/client';
 import { replayRace } from '@/lib/domain/career-timeline';
 import { editionIdentityOf, editionYear, longestConsecutiveRun } from '@/lib/domain/edition';
@@ -32,8 +33,32 @@ import type { Tx } from '@/lib/db/client';
 
 export const H = 3600;
 
+let catalogueChecked = false;
+
+/**
+ * Refuse to run against a database without the full achievement catalogue.
+ *
+ * `tests/setup.ts` writes it. Without it `syncAchievements` skips every
+ * achievement, so nothing unlocks and every "no achievement twice" assertion
+ * passes with nothing to check — this makes that loud instead. Checked once
+ * per test file.
+ */
+export async function requireAchievementCatalogue(): Promise<void> {
+  if (catalogueChecked) return;
+  const present = new Set((await prisma.achievement.findMany({ select: { key: true } })).map((row) => row.key));
+  const missing = ACHIEVEMENTS.filter((definition) => !present.has(definition.key)).map((definition) => definition.key);
+  if (missing.length > 0) {
+    throw new Error(
+      `The test database lacks ${missing.length} of ${ACHIEVEMENTS.length} achievement definitions ` +
+      `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}); tests/setup.ts should have written them.`,
+    );
+  }
+  catalogueChecked = true;
+}
+
 /** An account with a career profile, as a new account has. Replaces any account with the same id. */
 export async function createCareerUser(id: string, name: string): Promise<string> {
+  await requireAchievementCatalogue();
   await prisma.user.deleteMany({ where: { OR: [{ id }, { name }] } });
   await prisma.user.create({ data: { id, name, careerProfile: { create: {} } } });
   return id;

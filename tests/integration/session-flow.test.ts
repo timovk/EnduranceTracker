@@ -39,13 +39,14 @@ import { deleteSessionAction, logSessionAction, updateRaceAction } from '@/lib/s
 import { storyCompleteBonus } from '@/lib/domain/progression';
 import { formatNumber } from '@/lib/utils';
 import type { Tx } from '@/lib/db/client';
-import { insertLegacyShortenedRace, ledgerProblems } from '../helpers/career-db';
+import { insertLegacyShortenedRace, ledgerProblems, requireAchievementCatalogue } from '../helpers/career-db';
 
 const H = 3600;
 const USER = signedIn.userId;
 
 /** Wipe everything this user owns. Cascades take the rest. */
 async function resetUser(): Promise<void> {
+  await requireAchievementCatalogue();
   await prisma.user.deleteMany({ where: { id: USER } });
   await prisma.user.create({ data: { id: USER, name: 'Test', careerProfile: { create: {} } } });
 }
