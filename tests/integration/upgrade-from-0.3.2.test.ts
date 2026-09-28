@@ -474,7 +474,7 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     expect(forced).toMatchObject({
       completed: true, racesCredited: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
       eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
-      milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+      milestonesCreated: 0, milestoneXp: 0, achievementsUnlocked: 0, achievementXp: 0, datesFilled: 0, datesRecognised: 0,
       expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0, chaptersFrozen: 0,
     });
     const again = await written();

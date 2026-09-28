@@ -143,7 +143,7 @@ Expedition checkpoints, the chapters of finished years. It writes one line per
 account:
 
 ```
-[career-backfill] Alex (…): credited 212 races, 0 legacy races repaired, story bonuses +0/−0; 3 event steps (+800 XP), 41 credits; 2 new milestones (+1,500 XP), 14 dates filled, 3 recorded only; 2 expedition checkpoints (+300 XP), 1 summary; 1 chapter frozen
+[career-backfill] Alex (…): credited 212 races, 0 legacy races repaired, story bonuses +0/−0; 3 event steps (+800 XP), 41 credits; 2 new milestones (+1,500 XP), 0 achievements (+0 XP), 14 dates filled, 3 recorded only; 2 expedition checkpoints (+300 XP), 1 summary; 1 chapter frozen
 ```
 
 A very large history may not fit into one start. The line then ends with

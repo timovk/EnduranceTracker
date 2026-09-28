@@ -20,8 +20,11 @@ import { careerMilestoneDedupeKey, careerMilestoneOfRow } from '@/lib/config';
 import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { creditedSeconds } from '@/lib/domain/career-timeline';
 import { storyCompleteBonus } from '@/lib/domain/progression';
+import { syncAchievementDefinitions, syncAchievements, syncMilestones } from '@/lib/engines/achievement-engine';
+import { computeCareerMetrics } from '@/lib/engines/metrics';
 import { recomputeRaceAggregates } from '@/lib/engines/race-engine';
-import { revokeXpByDedupeKeys, settleLedger } from '@/lib/engines/xp-ledger';
+import { awardXp, revokeXpByDedupeKeys, settleLedger } from '@/lib/engines/xp-ledger';
+import { recomputeCareer } from '@/lib/server/recompute';
 import {
   type BackfillClock, backfillRaces, buildPhaseContext, CAREER_BACKFILL_KEY, CAREER_BACKFILL_PHASES,
   type CareerBackfillSummary, deadlineClock, describeCareerBackfill, describeLeftovers, EXPEDITION_CHUNK, isCareerBackfillApplied,
@@ -48,9 +51,11 @@ const EVENTS = '00000000-0000-4000-8000-0000000004bc';
 const RESUMED = '00000000-0000-4000-8000-0000000004bd';
 const IN_ONE_GO = '00000000-0000-4000-8000-0000000004be';
 const CHRONICLE = '00000000-0000-4000-8000-0000000004bf';
+const MILLION_BY_UPGRADE = '00000000-0000-4000-8000-0000000004c0';
+const MILLION_BY_RECOMPUTE = '00000000-0000-4000-8000-0000000004c1';
 const USERS = [
   DATED, REPLAY_LATER, RACES, INTERRUPTED, UNINTERRUPTED, SERVED_RECENTLY, SERVED_LONG_AGO, NEVER_SERVED,
-  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS, RESUMED, IN_ONE_GO, CHRONICLE,
+  EARLIER_BUILD, LEFTOVERS, SOMEONE_ELSE, EVENTS, RESUMED, IN_ONE_GO, CHRONICLE, MILLION_BY_UPGRADE, MILLION_BY_RECOMPUTE,
 ];
 
 /** The first start after the update. */
@@ -373,8 +378,15 @@ describe('P2: events', () => {
     expect(await prisma.masteryNode.count({ where: { tree: { userId: EVENTS, kind: 'RACE_EVENT' } } })).toBe(8);
 
     const summary = await runCareerBackfillFor(EVENTS, { now: STARTED, clock: PLENTY_OF_TIME });
-    // Only the new phase ran: the first experienced edition (recorded, no XP) and three experienced editions (300).
-    expect(summary).toMatchObject({ completed: true, racesCredited: 0, eventStepsUnlocked: 2, eventStepXp: 300, milestonesCreated: 0 });
+    // Only the new phases ran: the first experienced edition (recorded, no XP) and three experienced editions (300).
+    // The Expedition phase then synced the landmarks once more, and wrote the one
+    // Career Milestone this account had reached and had not been given: its first
+    // race started, recorded with no XP.
+    expect(summary).toMatchObject({
+      completed: true, racesCredited: 0, eventStepsUnlocked: 2, eventStepXp: 300, milestonesCreated: 1, milestoneXp: 0,
+    });
+    expect((await milestoneRows(EVENTS)).filter((row) => row.reachedAt?.getTime() === STARTED.getTime())
+      .map((row) => `${row.metric}:${row.threshold}`)).toEqual(['racesStarted:1']);
     // Credits: the complete edition for First Complete Edition, and all three for each experienced step.
     expect(summary.creditsWritten).toBe(1 + 3 + 3);
     expect(describeCareerBackfill(summary, 'Events')).toContain('2 event steps (+300 XP), 7 credits;');
@@ -528,7 +540,7 @@ describe('the start-up budget', () => {
     expect(describeCareerBackfill(summaries[0]!, 'Interrupted')).toBe(
       `[career-backfill] Interrupted (${INTERRUPTED}): credited 500 races, 0 legacy races repaired, story bonuses +${summaries[0]!.storyBonusesAwarded}/−0; `
         + '0 event steps (+0 XP), 0 credits; '
-        + '0 new milestones (+0 XP), 0 dates filled, 0 recorded only; 0 expedition checkpoints (+0 XP), 0 summaries; '
+        + '0 new milestones (+0 XP), 0 achievements (+0 XP), 0 dates filled, 0 recorded only; 0 expedition checkpoints (+0 XP), 0 summaries; '
         + '0 chapters frozen; '
         + `paused before P1 (after race ${summaries[0]!.pausedBefore!.cursor}); continues on the next start`,
     );
@@ -729,4 +741,158 @@ describe('what 0.3.x left in the ledger', () => {
     for (const row of ledgerBefore) expect(ledgerAfter.some((candidate) => candidate.id === row.id)).toBe(true);
     expect(await ledgerProblems(LEFTOVERS)).toEqual([]);
   });
+});
+
+describe('the landmarks the upgrade’s own XP reaches', () => {
+  /** When 0.3.2 last brought the account's landmarks up to date. */
+  const BEFORE_THE_UPDATE = new Date(2026, 8, 20, 20, 0);
+
+  /** The rungs of this career's XP and level ladders. */
+  function xpRungs(userId: string) {
+    return prisma.milestoneProgress.findMany({
+      where: { userId, metric: { in: ['careerXpMillions', 'level'] } },
+      orderBy: [{ metric: 'asc' }, { threshold: 'asc' }],
+    });
+  }
+
+  async function careerXp(userId: string): Promise<number> {
+    return Number((await prisma.careerProfile.findUniqueOrThrow({ where: { userId }, select: { careerXp: true } })).careerXp);
+  }
+
+  function achievements(userId: string) {
+    return prisma.achievementProgress.findMany({
+      where: { userId, unlockedAt: { not: null } },
+      orderBy: { achievementKey: 'asc' },
+      select: { achievementKey: true, unlockedAt: true },
+    });
+  }
+
+  /**
+   * Bring the account to `xp` with XP from before the update, and reach every
+   * achievement and ladder rung that XP supports, as 0.3.2's stint path did
+   * (0.3.2 had no Career Milestones). Returns what that reached.
+   */
+  async function asFarAs032Went(userId: string, xp: number): Promise<number> {
+    return prisma.$transaction(async (tx) => {
+      const db = tx as Tx;
+      const amount = xp - Number((await db.careerProfile.findUniqueOrThrow({ where: { userId } })).careerXp);
+      expect(amount).toBeGreaterThan(0);
+      await awardXp(db, userId, { source: 'MANUAL_ADJUSTMENT', amount, description: 'XP from before the update' });
+      let reached = 0;
+      for (;;) {
+        const metrics = await computeCareerMetrics(userId, db);
+        const round = (await syncAchievements(db, userId, metrics, BEFORE_THE_UPDATE)).length
+          + (await syncMilestones(db, userId, metrics, BEFORE_THE_UPDATE)).length;
+        if (round === 0) return reached;
+        reached += round;
+      }
+    });
+  }
+
+  /**
+   * A career 0.3.2 left just under a million XP. Eight 48-hour races watched
+   * whole — forty Expedition checkpoints, 24,000 XP, for the upgrade to pay
+   * — put back as 0.3.2 left them, with enough XP from before the update
+   * that the milestone phase's new rungs bring it to 994,000 XP: Career XP
+   * (millions) still rounds to 0.99 there. The checkpoints then take it to
+   * 1,018,000, past the first million but not yet level 50 (1,021,329 XP),
+   * and that rung's own 4,000 XP takes it past level 50: a ladder rung and
+   * an achievement. Returns the XP of the new rungs the milestone phase pays.
+   */
+  async function justUnderAMillion(userId: string, name: string): Promise<number> {
+    await syncAchievementDefinitions();
+    await createCareerUser(userId, name);
+    await watchLongRaces(userId, 8, new Date(2025, 2, 1, 8, 0));
+    const live = await careerXp(userId);
+    const checkpoints = await prisma.xPTransaction.aggregate({ where: { userId, source: 'EXPEDITION' }, _sum: { amount: true } });
+    expect(checkpoints._sum.amount).toBe(24_000);
+    await asRecordedBy032(userId);
+    // What the milestone phase pays back: the new rungs 0.3.2 did not have.
+    const newRungs = live - 24_000 - (await careerXp(userId));
+    expect(newRungs).toBeGreaterThan(0);
+
+    // The XP from before the update reaches nothing 0.3.2 would have recorded, so it stays exactly there.
+    expect(await asFarAs032Went(userId, 994_000 - newRungs)).toBe(0);
+    expect(await careerXp(userId)).toBe(994_000 - newRungs);
+    expect((await xpRungs(userId)).filter((row) => row.metric === 'careerXpMillions' || row.threshold >= 50)).toEqual([]);
+    expect((await achievements(userId)).map((row) => row.achievementKey)).not.toContain('level_50');
+    expect(await ledgerProblems(userId)).toEqual([]);
+    return newRungs;
+  }
+
+  it('records the XP and level rungs its own XP crosses, at the upgrade, so a forced second run changes nothing', async () => {
+    const newRungs = await justUnderAMillion(MILLION_BY_UPGRADE, 'CareerBackfillTest Million By Upgrade');
+
+    const summary = await runCareerBackfillFor(MILLION_BY_UPGRADE, { now: STARTED, clock: PLENTY_OF_TIME });
+    expect(summary).toMatchObject({ completed: true, expeditionCheckpoints: 40, expeditionXp: 24_000 });
+
+    // The checkpoints crossed the first million, and its 4,000 XP level 50:
+    // both rungs, and the achievement, recorded by the upgrade, when it ran.
+    // History cannot say when an XP total was reached, so they are recognised only.
+    const crossed = (await xpRungs(MILLION_BY_UPGRADE)).filter((row) => row.reachedAt?.getTime() === STARTED.getTime());
+    expect(crossed.map((row) => `${row.metric}:${row.threshold}`)).toEqual(['careerXpMillions:1', 'level:50']);
+    for (const row of crossed) {
+      expect(row, `${row.metric}:${row.threshold}`).toMatchObject({ achievedPrecision: 'RECOGNISED', achievedAt: null, sessionId: null });
+    }
+    expect(crossed[0]?.xpAwarded).toBe(4_000);
+    expect((await achievements(MILLION_BY_UPGRADE)).find((row) => row.achievementKey === 'level_50')?.unlockedAt).toEqual(STARTED);
+    expect(summary.milestoneXp).toBe(newRungs + crossed.reduce((sum, row) => sum + row.xpAwarded, 0));
+    expect(summary).toMatchObject({ achievementsUnlocked: 1, achievementXp: 7_500 });
+    const profile = await prisma.careerProfile.findUniqueOrThrow({ where: { userId: MILLION_BY_UPGRADE } });
+    expect(profile.level).toBe(50);
+    expect(describeCareerBackfill(summary, 'Million')).toContain(', 1 achievement (+7,500 XP), ');
+    expect(await ledgerProblems(MILLION_BY_UPGRADE)).toEqual([]);
+    expect(await expeditionProblems(MILLION_BY_UPGRADE)).toEqual([]);
+
+    // Nothing the career's XP supports is left for another run to reach.
+    const [ledgerBefore, rowsBefore, achievementsBefore] = await Promise.all([
+      ledger(MILLION_BY_UPGRADE), milestoneRows(MILLION_BY_UPGRADE), achievements(MILLION_BY_UPGRADE),
+    ]);
+    const forced = await runCareerBackfillFor(MILLION_BY_UPGRADE, { now: new Date(STARTED.getTime() + 86_400_000), clock: PLENTY_OF_TIME, force: true });
+    expect(forced).toMatchObject({
+      completed: true, storyBonusesAwarded: 0, eventStepsUnlocked: 0, milestonesCreated: 0, milestoneXp: 0,
+      achievementsUnlocked: 0, achievementXp: 0, datesFilled: 0, datesRecognised: 0, expeditionCheckpoints: 0, expeditionXp: 0,
+    });
+    expect(await ledger(MILLION_BY_UPGRADE)).toEqual(ledgerBefore);
+    expect(await milestoneRows(MILLION_BY_UPGRADE)).toEqual(rowsBefore);
+    expect(await achievements(MILLION_BY_UPGRADE)).toEqual(achievementsBefore);
+  }, 120_000);
+
+  it('leaves the first stint after the update none of the upgrade’s landmarks to claim', async () => {
+    const at = new Date(STARTED.getTime() + 2 * 86_400_000);
+    const raceId = await addRace(MILLION_BY_UPGRADE, { name: 'The First Race After The Update' });
+    const outcome = await logStint(MILLION_BY_UPGRADE, raceId, { from: 0, to: H, watchedAt: at, now: at });
+    const labels = outcome.xpBreakdown.map((line) => line.label);
+    expect(labels.filter((label) => /^Milestone — Career (XP|level)|^Achievement — Strategy Engineer$/.test(label))).toEqual([]);
+    for (const row of await xpRungs(MILLION_BY_UPGRADE)) {
+      if (row.metric === 'careerXpMillions' || row.threshold === 50) {
+        expect(row, `${row.metric}:${row.threshold}`).toMatchObject({ reachedAt: STARTED, sessionId: null });
+      }
+    }
+  });
+
+  it('db:recompute records them on its first run too, and finds nothing on its second', async () => {
+    await justUnderAMillion(MILLION_BY_RECOMPUTE, 'CareerBackfillTest Million By Recompute');
+
+    const first = await recomputeCareer(MILLION_BY_RECOMPUTE, { now: STARTED });
+    expect(first.expeditions).toMatchObject({ checkpointsAwarded: 40, xpAwarded: 24_000 });
+    expect(first).toMatchObject({ achievementsUnlocked: 1, milestonesReached: 2 });
+    const crossed = (await xpRungs(MILLION_BY_RECOMPUTE)).filter((row) => row.reachedAt?.getTime() === STARTED.getTime());
+    expect(crossed.map((row) => `${row.metric}:${row.threshold}`)).toEqual(['careerXpMillions:1', 'level:50']);
+    for (const row of crossed) expect(row.achievedPrecision).toBe('RECOGNISED');
+    expect(await ledgerProblems(MILLION_BY_RECOMPUTE)).toEqual([]);
+
+    const [ledgerBefore, rowsBefore, achievementsBefore] = await Promise.all([
+      ledger(MILLION_BY_RECOMPUTE), milestoneRows(MILLION_BY_RECOMPUTE), achievements(MILLION_BY_RECOMPUTE),
+    ]);
+    const second = await recomputeCareer(MILLION_BY_RECOMPUTE, { now: new Date(STARTED.getTime() + 86_400_000) });
+    expect(second).toMatchObject({
+      storyBonusesAwarded: 0, masteryNodesUnlocked: 0, achievementsUnlocked: 0, milestonesReached: 0,
+      careerMilestonesReached: 0, careerMilestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+      expeditions: { checkpointsAwarded: 0, xpAwarded: 0, checkpointsRevoked: 0, checkpointsResized: 0, summariesWritten: 0 },
+    });
+    expect(await ledger(MILLION_BY_RECOMPUTE)).toEqual(ledgerBefore);
+    expect(await milestoneRows(MILLION_BY_RECOMPUTE)).toEqual(rowsBefore);
+    expect(await achievements(MILLION_BY_RECOMPUTE)).toEqual(achievementsBefore);
+  }, 120_000);
 });

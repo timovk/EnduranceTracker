@@ -606,12 +606,22 @@ account `db:recompute` rebuilds.
 |---|---|---|
 | P1 races | Credited time written where it differs. A race whose stored intervals run past a runtime shortened under 0.3.x has its intervals rebuilt and its aggregates recomputed **with its status kept**. The Story Complete bonus is made to exist exactly when the replay says the race is complete; one a 0.3.x runtime edit skipped is paid, career XP only. Settled per chunk. | 500 races, in id order |
 | P2 events | The event trees brought up to date (the nine new steps inserted, six renamed), the event caches recomputed, then `syncMastery`: every step an event had reached is credited first, then the new steps it had passed are paid once. | one |
-| P3 milestones | The ladders synced, the new rungs a career had passed written and paid once, and every undated milestone and event step dated from the replay. | one |
-| P4 expeditions | Every Expedition gets the checkpoints its replayed coverage had reached (paid now, naming no stint), and a completed one its retrospective summary. | 25 Expedition races, in id order |
+| P3 milestones | The achievements and ladders synced, the new rungs a career had passed written and paid once — all of them again until nothing new is reached (`syncLandmarks`) — and every undated milestone and event step dated from the replay. | one |
+| P4 expeditions | Every Expedition gets the checkpoints its replayed coverage had reached (paid now, naming no stint), and a completed one its retrospective summary. The last chunk runs `syncLandmarks` again, because the checkpoints' XP can cross a Career XP or level rung or a level achievement. | 25 Expedition races, in id order |
 | P5 chronicle | Every finished year that is due is frozen, oldest first. The account is complete when none is left. | one year |
 
 Order matters: P2 reads P1's credited time, P3 dates what P2 unlocks, and P4
 and P5 need P1's coverage and P3's dates.
+
+`syncLandmarks` repeats its round — metrics read afresh, then achievements,
+ladders and Career Milestones — until a round reaches nothing, because what
+one round pays can reach more: the first-million rung's own XP can take a
+career up a level, and so past a level rung and a level achievement. What it
+reaches is recorded at the upgrade's `now`; an XP or level rung has no
+moment in history, so it is RECOGNISED and names no stint. Without the second
+sync, a rung the upgrade's own XP crossed would wait for the first stint after
+the update, which would claim it and list it in its summary, and a forced
+second run would pay it.
 
 Each chunk is its own transaction (`maxWait` 15 s, `timeout` 60 s), and **the
 same transaction** records the chunk in the marker: the cursor (the last race
@@ -657,7 +667,7 @@ never modifies a stint.
 ### Log lines
 
 ```
-[career-backfill] Alex (<id>): credited 12 races, 0 legacy races repaired, story bonuses +0/−0; 3 event steps (+800 XP), 41 credits; 2 new milestones (+1,500 XP), 14 dates filled, 3 recorded only; 2 expedition checkpoints (+300 XP), 1 summary; 0 chapters frozen
+[career-backfill] Alex (<id>): credited 12 races, 0 legacy races repaired, story bonuses +0/−0; 3 event steps (+800 XP), 41 credits; 2 new milestones (+1,500 XP), 0 achievements (+0 XP), 14 dates filled, 3 recorded only; 2 expedition checkpoints (+300 XP), 1 summary; 0 chapters frozen
 [career-backfill] Alex (<id>): …; paused before P4 (after race <id>); continues on the next start
 [career-backfill] Alex (<id>): 2 viewing XP rows whose stint was deleted and 0 Story Complete bonuses of races deleted before 0.4.0 were left as they were (db:recompute removes them)
 [career-backfill] Alex (<id>): failed, will retry on the next start
@@ -680,7 +690,8 @@ same phase bodies as the backfill, with a clock that never says stop:
    achievements, ladders, Career Milestones and any missing dates (all of
    them again with `--rebuild-milestone-dates`, as above);
 4. Expeditions, in chunks, with `resize`: the one repair that re-sizes a held
-   checkpoint to the current schedule;
+   checkpoint to the current schedule; then `syncLandmarks` in one more
+   transaction, for whatever the XP paid since step 3 reaches;
 5. the account marked as upgraded, and finished years frozen;
 6. with `--rebuild-chronicle <year>`, that frozen year rebuilt.
 

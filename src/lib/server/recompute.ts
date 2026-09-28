@@ -31,7 +31,11 @@
  *      re-sized to the race's current runtime (the one repair that re-sizes
  *      a checkpoint), reached ones of an Expedition paid — and the missing
  *      summary of a completed Expedition written. A summary that exists is
- *      never rewritten.
+ *      never rewritten. Then, in one more transaction, the achievements,
+ *      ladders and Career Milestones are synced again until nothing new is
+ *      reached (`syncLandmarks`): the XP paid since step 3 synced them — the
+ *      checkpoints, and the rungs' own — can cross a Career XP or level rung
+ *      or a level achievement, and a second run must find nothing left.
  *   5. The account's 0.4.0 backfill is recorded as done — recompute has just
  *      done all of it — and every finished year that is due and not yet
  *      frozen has its Chronicle chapter frozen. A frozen chapter is never
@@ -56,7 +60,9 @@ import { repairXpLedger, type LedgerRepair } from '@/lib/engines/session-engine'
 import { settleLedger, type XpRevocation } from '@/lib/engines/xp-ledger';
 import { ensureChroniclesFrozen, rebuildChronicleYear } from '@/lib/engines/chronicle-engine';
 import { careerRecordProgression } from '@/lib/engines/expedition-engine';
-import { backfillExpeditions, EXPEDITION_CHUNK, markCareerBackfillApplied } from '@/lib/server/upgrades/career-backfill';
+import {
+  backfillExpeditions, EXPEDITION_CHUNK, markCareerBackfillApplied, syncLandmarks,
+} from '@/lib/server/upgrades/career-backfill';
 
 export interface RecomputeOptions {
   /** The instant recorded as "now" by anything the rebuild completes. Defaults to the clock. */
@@ -83,6 +89,7 @@ export interface RecomputeReport {
   ledger: LedgerRepair;
   collectionCardsFilled: number;
   masteryNodesUnlocked: number;
+  /** Achievements and ladder rungs newly reached, in step 3 or after the checkpoints of step 4. */
   achievementsUnlocked: number;
   milestonesReached: number;
   /** Career Milestone rungs newly written, and the XP they paid. */
@@ -206,6 +213,15 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     expeditions.summariesWritten += result.summaries;
   }
 
+  // -- 4a. What the XP paid since step 3 reaches ---------------------------------
+  //
+  // Step 3 synced the landmarks before the checkpoints were paid, and before
+  // the XP of what it reached itself. Either can cross a Career XP or level
+  // rung, or a level achievement: they are synced again, until nothing new is
+  // reached, so the next stint has none of them to claim and a second run
+  // finds nothing to do.
+  const closing = await prisma.$transaction((tx) => syncLandmarks(tx as Tx, userId, now), SYNC_TRANSACTION);
+
   // -- 5. The upgrade, and the Chronicle -----------------------------------------
   //
   // Everything the 0.4.0 backfill would do has just been done, so the next
@@ -232,6 +248,12 @@ export async function recomputeCareer(userId: string, options: RecomputeOptions 
     storyBonusesRevoked,
     ledger,
     ...synced,
+    achievementsUnlocked: synced.achievementsUnlocked + closing.achievements,
+    milestonesReached: synced.milestonesReached + closing.ladderRungs,
+    careerMilestonesReached: synced.careerMilestonesReached + closing.careerRungs,
+    careerMilestoneXp: synced.careerMilestoneXp + closing.careerXp,
+    datesFilled: synced.datesFilled + closing.filled,
+    datesRecognised: synced.datesRecognised + closing.recognised,
     expeditions,
     chaptersFrozen,
     chaptersRebuilt,

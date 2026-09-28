@@ -34,15 +34,21 @@
  *                   first, then the new steps an event had already passed
  *                   are paid once — on editions that have not paid that kind
  *                   of step anywhere. One chunk.
- *   P3  milestones  The ladders synced, the new Career Milestone rungs a
- *                   career had already passed written and paid once, and
- *                   every undated milestone and event step dated from the
- *                   replay. One chunk.
+ *   P3  milestones  The achievements and ladders synced, the new Career
+ *                   Milestone rungs a career had already passed written and
+ *                   paid once — again until nothing new is reached, since
+ *                   what they pay can reach more — and every undated
+ *                   milestone and event step dated from the replay
+ *                   (`syncLandmarks`). One chunk.
  *   P4  expeditions Every race that is an Expedition gets the checkpoints its
  *                   replayed coverage had already reached (paid now, naming
  *                   no stint), and one whose story is complete gets its
  *                   Expedition Summary, retrospectively. Chunks of Expedition
- *                   races, in id order.
+ *                   races, in id order. The last chunk ends with
+ *                   `syncLandmarks` again: the checkpoints' XP can cross a
+ *                   Career XP or level rung, or a level achievement, and the
+ *                   upgrade records what its own XP reaches rather than
+ *                   leaving it for the next stint to claim.
  *   P5  chronicle   Every finished year that is due — past its grace period,
  *                   with something in it, and not frozen yet — has its
  *                   Chronicle chapter frozen, now that its landmarks are
@@ -66,7 +72,7 @@ import { prisma } from '@/lib/db/client';
 import { buildCareerTimeline, type CareerTimeline } from '@/lib/domain/career-timeline';
 import { isExpedition } from '@/lib/domain/expedition';
 import type { RecordEvent } from '@/lib/domain/records';
-import { syncMilestones } from '@/lib/engines/achievement-engine';
+import { syncAchievements, syncMilestones } from '@/lib/engines/achievement-engine';
 import { fillLandmarkDates, syncCareerMilestones } from '@/lib/engines/career-milestone-engine';
 import { loadTimelineInputs, type TimelineInputs } from '@/lib/engines/career-timeline-engine';
 import { freezeYear, yearsToFreeze } from '@/lib/engines/chronicle-engine';
@@ -362,29 +368,103 @@ export async function backfillEventProgression(
   };
 }
 
+/** What `syncLandmarks` reached and dated. */
+export interface LandmarkSync {
+  /** Achievements unlocked, and the XP they paid. */
+  achievements: number;
+  achievementXp: number;
+  /** Rungs of the existing ladders reached (`syncMilestones`), and their XP. */
+  ladderRungs: number;
+  ladderXp: number;
+  /** Career Milestone rungs written (`syncCareerMilestones`), and their XP. */
+  careerRungs: number;
+  careerXp: number;
+  /** Landmarks given their date from history, and those marked RECOGNISED. */
+  filled: number;
+  recognised: number;
+}
+
 /**
- * P3, inside its transaction: the ladders, the new Career Milestone rungs a
- * career had already passed (written and paid once), and a date for every
- * milestone and event step without one — rows reached since the history
- * began get their historical instants, and what history cannot place is
- * marked RECOGNISED.
+ * The most rounds `syncLandmarks` runs. A guard only: every round but the
+ * last writes a landmark that is written once, so it always ends, and a real
+ * career takes two or three.
  */
-export async function backfillMilestones(
-  tx: Tx,
-  userId: string,
-  now: Date,
-  timeline: CareerTimeline,
-): Promise<{ created: number; xp: number; filled: number; recognised: number }> {
-  const { metrics, history } = await computeCareerMetricsWithHistory(userId, tx);
-  const ladders = await syncMilestones(tx, userId, metrics, now);
-  const career = await syncCareerMilestones(tx, userId, { metrics, history, now });
-  const dates = await fillLandmarkDates(tx, userId, { history, now, timeline });
-  return {
-    created: ladders.length + career.created,
-    xp: ladders.reduce((sum, rung) => sum + rung.xpAwarded, 0) + career.xpAwarded,
-    filled: dates.milestones + dates.eventSteps,
-    recognised: dates.recognised,
+const LANDMARK_SYNC_ROUNDS = 20;
+
+/**
+ * Bring every landmark the career's figures support up to date, inside the
+ * caller's transaction: the achievements, the milestone ladders and the
+ * Career Milestones, then a date for every milestone and event step that has
+ * none.
+ *
+ * The three are synced again, from freshly read metrics, until a round
+ * reaches nothing: what one round pays can reach more, because a rung's or an
+ * achievement's own XP can cross a Career XP (millions) or level rung, or a
+ * level achievement. When it returns, nothing the career's XP supports is
+ * left for the next stint to claim, or for a second run to find — which is
+ * what lets the upgrade's phases pay XP after the ladders were first synced
+ * and still change nothing when run again.
+ *
+ * What it writes is recorded `now`. `fillLandmarkDates` then gives each new
+ * row its moment from the replay (`timeline`, when the caller holds one, else
+ * built from the history only if a row needs it), and what history cannot
+ * place — every XP and level rung — is marked RECOGNISED, naming no stint.
+ */
+export async function syncLandmarks(tx: Tx, userId: string, now: Date, timeline?: CareerTimeline): Promise<LandmarkSync> {
+  const result: LandmarkSync = {
+    achievements: 0, achievementXp: 0, ladderRungs: 0, ladderXp: 0, careerRungs: 0, careerXp: 0, filled: 0, recognised: 0,
   };
+  let current = await computeCareerMetricsWithHistory(userId, tx);
+  for (let round = 1; ; round += 1) {
+    const { metrics, history } = current;
+    const achievements = await syncAchievements(tx, userId, metrics, now);
+    const ladders = await syncMilestones(tx, userId, metrics, now);
+    const career = await syncCareerMilestones(tx, userId, { metrics, history, now });
+    result.achievements += achievements.length;
+    result.achievementXp += achievements.reduce((sum, unlock) => sum + unlock.xpAwarded, 0);
+    result.ladderRungs += ladders.length;
+    result.ladderXp += ladders.reduce((sum, rung) => sum + rung.xpAwarded, 0);
+    result.careerRungs += career.created;
+    result.careerXp += career.xpAwarded;
+    if (achievements.length + ladders.length + career.created === 0 || round >= LANDMARK_SYNC_ROUNDS) break;
+    current = await computeCareerMetricsWithHistory(userId, tx);
+  }
+  const dates = await fillLandmarkDates(tx, userId, { history: current.history, now, timeline });
+  result.filled = dates.milestones + dates.eventSteps;
+  result.recognised = dates.recognised;
+  return result;
+}
+
+/** A `LandmarkSync` in the backfill's terms: every milestone rung, ladder or career, counted together. */
+export interface LandmarkCounts {
+  created: number;
+  xp: number;
+  achievements: number;
+  achievementXp: number;
+  filled: number;
+  recognised: number;
+}
+
+function landmarkCounts(sync: LandmarkSync): LandmarkCounts {
+  return {
+    created: sync.ladderRungs + sync.careerRungs,
+    xp: sync.ladderXp + sync.careerXp,
+    achievements: sync.achievements,
+    achievementXp: sync.achievementXp,
+    filled: sync.filled,
+    recognised: sync.recognised,
+  };
+}
+
+/**
+ * P3, inside its transaction (`syncLandmarks`): the achievements and the
+ * ladders, the new Career Milestone rungs a career had already passed
+ * (written and paid once), and a date for every milestone and event step
+ * without one — rows reached since the history began get their historical
+ * instants, and what history cannot place is marked RECOGNISED.
+ */
+export async function backfillMilestones(tx: Tx, userId: string, now: Date, timeline: CareerTimeline): Promise<LandmarkCounts> {
+  return landmarkCounts(await syncLandmarks(tx, userId, now, timeline));
 }
 
 export interface ExpeditionChunkResult {
@@ -468,6 +548,9 @@ export interface CareerBackfillSummary {
   creditsWritten: number;
   milestonesCreated: number;
   milestoneXp: number;
+  /** Achievements the career had reached, including those the upgrade's own XP reached. */
+  achievementsUnlocked: number;
+  achievementXp: number;
   datesFilled: number;
   datesRecognised: number;
   expeditionCheckpoints: number;
@@ -484,7 +567,7 @@ function emptySummary(userId: string): CareerBackfillSummary {
     userId, completed: false, skipped: false, pausedBefore: null,
     racesCredited: 0, legacyRacesRepaired: 0, storyBonusesAwarded: 0, storyBonusesRevoked: 0,
     eventStepsUnlocked: 0, eventStepXp: 0, creditsWritten: 0,
-    milestonesCreated: 0, milestoneXp: 0, datesFilled: 0, datesRecognised: 0,
+    milestonesCreated: 0, milestoneXp: 0, achievementsUnlocked: 0, achievementXp: 0, datesFilled: 0, datesRecognised: 0,
     expeditionCheckpoints: 0, expeditionXp: 0, summariesWritten: 0, chaptersFrozen: 0,
     leftovers: { orphanedViewingRows: 0, storyBonusesOfDeletedRaces: 0 },
   };
@@ -505,6 +588,15 @@ async function countLeftovers(userId: string): Promise<CareerBackfillSummary['le
     orphanedViewingRows,
     storyBonusesOfDeletedRaces: bonuses.filter((bonus) => bonus.dedupeKey !== null && !keys.has(bonus.dedupeKey)).length,
   };
+}
+
+function addLandmarks(summary: CareerBackfillSummary, landmarks: LandmarkCounts): void {
+  summary.milestonesCreated += landmarks.created;
+  summary.milestoneXp += landmarks.xp;
+  summary.achievementsUnlocked += landmarks.achievements;
+  summary.achievementXp += landmarks.achievementXp;
+  summary.datesFilled += landmarks.filled;
+  summary.datesRecognised += landmarks.recognised;
 }
 
 function withPhaseDone(marker: CareerBackfillMarker, phase: PhaseKey, now: Date): CareerBackfillMarker {
@@ -529,9 +621,13 @@ function withPhaseDone(marker: CareerBackfillMarker, phase: PhaseKey, now: Date)
  * from the recorded phase and cursor. A chunk that has started always
  * finishes.
  *
+ * The last Expedition chunk also syncs the landmarks again
+ * (`syncLandmarks`), so what the upgrade's own XP reaches is recorded by the
+ * upgrade, when it runs, rather than claimed by the next stint.
+ *
  * `force` ignores the marker and runs every phase again from the start. For
  * tests and deliberate maintenance: every chunk is idempotent, so a forced
- * run pays nothing twice.
+ * run pays nothing twice, and finds nothing new to reach.
  */
 export async function runCareerBackfillFor(
   userId: string,
@@ -615,10 +711,7 @@ export async function runCareerBackfillFor(
       }
       const ctx = await contextFor();
       const result = await chunk(withPhaseDone(marker, phase, now), (tx) => backfillMilestones(tx, userId, now, ctx.timeline));
-      summary.milestonesCreated += result.created;
-      summary.milestoneXp += result.xp;
-      summary.datesFilled += result.filled;
-      summary.datesRecognised += result.recognised;
+      addLandmarks(summary, result);
     }
 
     if (phase === 'P4') {
@@ -635,10 +728,17 @@ export async function runCareerBackfillFor(
         const next = last
           ? withPhaseDone(marker, phase, now)
           : { ...marker, cursors: { ...marker.cursors, P4: ids[ids.length - 1] }, lastRunAt: now.toISOString() };
-        const result = await chunk(next, (tx) => backfillExpeditions(tx, ctx, ids, { resize: false }));
+        // The last chunk closes the XP-paying phases: the checkpoints were
+        // paid after P3 synced the landmarks, so they are synced once more,
+        // in the same transaction as the marker that says P4 is done.
+        const { result, landmarks } = await chunk(next, async (tx) => ({
+          result: await backfillExpeditions(tx, ctx, ids, { resize: false }),
+          landmarks: last ? landmarkCounts(await syncLandmarks(tx, userId, now, ctx.timeline)) : null,
+        }));
         summary.expeditionCheckpoints += result.checkpoints;
         summary.expeditionXp += result.xp;
         summary.summariesWritten += result.summaries;
+        if (landmarks !== null) addLandmarks(summary, landmarks);
         if (last) break;
       }
     }
@@ -698,6 +798,7 @@ export function describeCareerBackfill(summary: CareerBackfillSummary, name?: st
     `${count(summary.eventStepsUnlocked)} event steps (+${count(summary.eventStepXp)} XP), ` +
     `${count(summary.creditsWritten)} credits; ` +
     `${count(summary.milestonesCreated)} new milestones (+${count(summary.milestoneXp)} XP), ` +
+    `${count(summary.achievementsUnlocked)} ${summary.achievementsUnlocked === 1 ? 'achievement' : 'achievements'} (+${count(summary.achievementXp)} XP), ` +
     `${count(summary.datesFilled)} dates filled, ${count(summary.datesRecognised)} recorded only; ` +
     `${count(summary.expeditionCheckpoints)} expedition checkpoints (+${count(summary.expeditionXp)} XP), ` +
     `${count(summary.summariesWritten)} ${summary.summariesWritten === 1 ? 'summary' : 'summaries'}; ` +
