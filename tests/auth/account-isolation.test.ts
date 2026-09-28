@@ -41,6 +41,9 @@ vi.mock('next/navigation', () => ({
   redirect: (to: string) => {
     throw new Error(`NEXT_REDIRECT:${to}`);
   },
+  notFound: () => {
+    throw new Error('NEXT_NOT_FOUND');
+  },
 }));
 
 import { prisma, disconnectDb } from '@/lib/db/client';
@@ -49,8 +52,11 @@ import { awardXpStandalone } from '@/lib/engines/xp-ledger';
 import {
   clearCareerTimelineCache, getCareerTimeline, timelineFingerprint,
 } from '@/lib/engines/career-timeline-engine';
-import { getRaceDetail, listRaces } from '@/lib/server/races';
-import { getEventLegacy, getEventsIndex, resolveEventForRaceInput } from '@/lib/engines/event-legacy-engine';
+import { getEventOptions, getRaceDetail, listRaces } from '@/lib/server/races';
+import {
+  getEventLegacy, getEventsIndex, getEventSuggestionForRace, getEventSuggestions, resolveEventForRaceInput,
+  suggestEventForName,
+} from '@/lib/engines/event-legacy-engine';
 import { recomputeRaceMasteries } from '@/lib/engines/mastery-engine';
 import {
   createEventAction, findRacesToLinkAction, linkRacesToEventAction, markWrappedSeenAction, mergeEventsAction,
@@ -62,6 +68,13 @@ import {
   getExpeditionSummary, getExpeditionSummaryForRace, getExpeditionView,
 } from '@/lib/engines/expedition-engine';
 import { buildOutcomeForSession } from '@/lib/server/session-summary';
+import { getDashboard } from '@/lib/server/dashboard';
+import { syncAchievementDefinitions } from '@/lib/engines/achievement-engine';
+import { getCareerMilestonesView, listRecentCareerMilestones } from '@/lib/engines/career-milestone-engine';
+import { getYearComparison } from '@/lib/engines/stats-engine';
+import { yearWindow } from '@/lib/domain/calendar';
+import { generateMetadata as eventPageMetadata } from '@/app/events/[key]/page';
+import { generateMetadata as expeditionPageMetadata } from '@/app/races/[id]/expedition/page';
 import type { Tx } from '@/lib/db/client';
 import {
   createChampionshipAction,
@@ -425,6 +438,290 @@ describe('a chapter of the Chronicle belongs to the account whose year it is', (
     expect(after.wrappedSeenAt).not.toBeNull();
     expect(after.rebuiltAt).not.toBeNull();
     expect(after.frozenAt).toEqual(frozen.frozenAt);
+  });
+});
+
+/**
+ * Every case above gives the second account nothing of its own for the thing
+ * under test: no event with that key, no chapter for that year, no stint near
+ * that minute. A lookup that lost its `userId` would still find nothing there,
+ * and the case would pass. So here both accounts follow `le-mans`, `spa` and
+ * `sarthe`, both have a chapter for the same year, and their stints are a
+ * minute apart: a read or write that is not scoped by the account shows up as
+ * the other account's data, or moves it.
+ *
+ * The scenario is built once and the cases read it in order; the merge, which
+ * changes Sam's events, comes last.
+ */
+describe('two accounts that follow the same events and were active in the same year', () => {
+  // Not `PREFIX`: the file's `beforeEach` wipes those accounts before every case.
+  const PAIR = 'IsolationPair';
+  const pair = { alex: '', sam: '' };
+  const year = new Date().getFullYear() - 1;
+  /** A June evening last year: stints are logged through the engine with their date, as the forms cannot backdate. */
+  const evening = new Date(year, 5, 14, 21, 0);
+  /** Midsummer of this year: last year is well past its grace period whenever the test runs. */
+  const later = new Date(year + 1, 5, 1, 12, 0);
+  const ids = { alexLeMans: '', alexSarthe: '', samLeMans: '', samUnlinked: '' };
+  let samFirstStint: Awaited<ReturnType<typeof logViewingSession>>;
+  let linksAsAdded: { name: string; userId: string; raceMastery: { userId: string } | null }[] = [];
+
+  async function stintAt(userId: string, raceId: string, hours: number, at: Date) {
+    return logViewingSession(userId, {
+      raceId, mode: 'RANGE', startTimestamp: 0, endTimestamp: hours * H, playbackSpeed: 1, watchedAt: at, note: undefined,
+    }, at);
+  }
+
+  async function ledgerSum(userId: string, window: { start: Date; end: Date }): Promise<number> {
+    const sum = await prisma.xPTransaction.aggregate({
+      where: { userId, createdAt: { gte: window.start, lt: window.end } },
+      _sum: { amount: true },
+    });
+    return sum._sum.amount ?? 0;
+  }
+
+  /** Every date one of the account's own milestone rows is shown with. */
+  async function ownMilestoneDates(userId: string): Promise<Set<string>> {
+    const rows = await prisma.milestoneProgress.findMany({ where: { userId }, select: { achievedAt: true, reachedAt: true } });
+    return new Set(rows.flatMap((row) => {
+      const at = row.achievedAt ?? row.reachedAt;
+      return at === null ? [] : [at.toISOString()];
+    }));
+  }
+
+  /** The account's own unlocked steps of one event's tree. */
+  function ownEventSteps(userId: string, key: string): Promise<number> {
+    return prisma.masteryProgress.count({
+      where: { userId, unlockedAt: { not: null }, node: { tree: { userId, key: `event:${key}` } } },
+    });
+  }
+
+  beforeAll(async () => {
+    await prisma.user.deleteMany({ where: { name: { startsWith: PAIR } } });
+    // The catalogue, so a first stint has achievements to unlock on a new database too.
+    await syncAchievementDefinitions();
+    pair.alex = await createAccount({ name: `${PAIR} Alex` });
+    pair.sam = await createAccount({ name: `${PAIR} Sam` });
+    const h24 = { raceType: 'H24', scheduledDuration: '24:00:00' };
+
+    // Every race exists before the first stint: a race form freezes whatever finished year is due.
+    // Spa is Sam's event first; Le Mans and Sarthe are Alex's first, and Alex's Sarthe has a name of its own.
+    // Sam's Le Mans and Alex's Sarthe are six-hour races, to be watched whole.
+    const samSpa = await createRace(pair.sam, { ...h24, name: 'Sam Spa Night', eventKey: 'spa' });
+    const alexSpa = await createRace(pair.alex, { ...h24, name: 'Alex Spa', eventKey: 'spa' });
+    ids.alexLeMans = await createRace(pair.alex, {
+      ...h24, name: `${year} 24 Hours of Le Mans`, eventKey: 'le-mans', circuit: 'Circuit de la Sarthe',
+    });
+    await createRace(pair.alex, { ...h24, name: 'Alex Only Classic', eventKey: 'alex-only' });
+    ids.alexSarthe = await createRace(pair.alex, { name: 'Alex Sarthe', eventKey: 'sarthe' });
+    expect(await as(pair.alex, () => renameEventAction(form({ key: 'sarthe', name: 'Alex Private Sarthe' }))))
+      .toMatchObject({ ok: true });
+    ids.samLeMans = await createRace(pair.sam, { name: 'Sam Sarthe Night', eventKey: 'le-mans' });
+    await createRace(pair.sam, { ...h24, name: 'Sam Sarthe Sprint', eventKey: 'sarthe' });
+    // Named like an edition of Alex's Le Mans, and in no event.
+    ids.samUnlinked = await createRace(pair.sam, { ...h24, name: `${year + 1} 24 Hours of Le Mans` });
+    // As the forms linked them, before any stint's recompute could tidy a link.
+    linksAsAdded = await prisma.race.findMany({
+      where: { userId: { in: [pair.alex, pair.sam] }, iconicKey: { not: null } },
+      select: { name: true, userId: true, raceMastery: { select: { userId: true } } },
+    });
+
+    // Sam's first stint, and Alex's thirty seconds later: each inside the other's unlock window, were it not per account.
+    samFirstStint = await stintAt(pair.sam, samSpa, 3, new Date(evening.getTime() - H * 1000));
+    await stintAt(pair.alex, alexSpa, 24, new Date(evening.getTime() - H * 1000 + 30_000));
+    await stintAt(pair.alex, ids.alexLeMans, 24, evening);
+    await stintAt(pair.sam, ids.samLeMans, 6, new Date(evening.getTime() + 60_000));
+    // Alex is paid for Sarthe's first complete edition, a step Sam will only ever hold as a copy a merge carried over.
+    await stintAt(pair.alex, ids.alexSarthe, 6, new Date(evening.getTime() + 90_000));
+
+    expect(await ensureChroniclesFrozen(pair.alex, later)).toEqual([year]);
+    expect(await ensureChroniclesFrozen(pair.sam, later)).toEqual([year]);
+  });
+
+  afterAll(async () => {
+    await prisma.user.deleteMany({ where: { name: { startsWith: PAIR } } });
+  });
+
+  it('a race added with a key both accounts use joins the account’s own event', () => {
+    expect(linksAsAdded).toHaveLength(7);
+    for (const race of linksAsAdded) expect(race.raceMastery?.userId, race.name).toBe(race.userId);
+  });
+
+  it('rebuilding and marking one account’s chapter leaves the other’s exactly as it was', async () => {
+    const alexChapter = await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: pair.alex, year } } });
+
+    expect(await as(pair.sam, () => rebuildChronicleYearAction(year))).toMatchObject({ ok: true });
+    expect(await as(pair.sam, () => markWrappedSeenAction(year))).toEqual({ ok: true });
+
+    expect(await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: pair.alex, year } } }))
+      .toEqual(alexChapter);
+    const samChapter = await prisma.chronicleYear.findUniqueOrThrow({ where: { userId_year: { userId: pair.sam, year } } });
+    expect(samChapter.rebuiltAt).not.toBeNull();
+    expect(samChapter.wrappedSeenAt).not.toBeNull();
+  });
+
+  it('a chapter holds only its own account’s year', async () => {
+    const window = yearWindow(year);
+    const view = await getChronicleChapter(pair.sam, year, later);
+    expect(view?.frozen).not.toBeNull();
+    const chapter = view!.chapter;
+    expect(chapter.summary.creditedSeconds).toBeCloseTo(9 * H, 3);
+    expect(chapter.summary.xpEarned).toBe(await ledgerSum(pair.sam, window));
+
+    const ownAchievements = await prisma.achievementProgress.findMany({
+      where: { userId: pair.sam, unlockedAt: { gte: window.start, lt: window.end } },
+      select: { achievement: { select: { key: true } } },
+    });
+    expect(ownAchievements.length).toBeGreaterThan(0);
+    expect(chapter.achievements.map((row) => row.key).sort())
+      .toEqual(ownAchievements.map((row) => row.achievement.key).sort());
+    expect(chapter.summary.achievementsUnlocked).toBe(ownAchievements.length);
+
+    const ownDates = await ownMilestoneDates(pair.sam);
+    const reached = [...chapter.milestones.career, ...chapter.milestones.ladder];
+    expect(reached.length).toBeGreaterThan(0);
+    for (const milestone of reached) expect(ownDates.has(milestone.at), milestone.at).toBe(true);
+
+    // Alex finished two 24-hour Expeditions that year; Sam finished none.
+    expect(await prisma.expeditionSummary.count({ where: { userId: pair.alex } })).toBe(2);
+    expect(chapter.expeditions).toEqual([]);
+    expect(JSON.stringify(chapter)).not.toContain('Alex');
+    expect(JSON.stringify(chapter)).not.toContain(ids.alexLeMans);
+
+    // This year's chapter, built live. The ledger is stamped with the real clock, so the XP lands here.
+    const live = await getChronicleChapter(pair.sam, year + 1, new Date());
+    expect(live!.chapter.summary.xpEarned).toBeGreaterThan(0);
+    expect(live!.chapter.summary.xpEarned).toBe(await ledgerSum(pair.sam, yearWindow(year + 1)));
+  });
+
+  it('the Events page and an event’s page count only the account’s own steps and editions', async () => {
+    const index = await getEventsIndex(pair.sam);
+    for (const key of ['spa', 'le-mans']) {
+      const own = await ownEventSteps(pair.sam, key);
+      expect(own, key).toBeGreaterThan(0);
+      expect(index.events.find((event) => event.key === key)?.stepsUnlocked, key).toBe(own);
+    }
+
+    const page = await getEventLegacy(pair.sam, 'le-mans');
+    if (page === null || 'redirectTo' in page) throw new Error('Sam’s Le Mans has no page');
+    expect(page.stats.creditedSeconds).toBeCloseTo(6 * H, 3);
+    expect(page.steps.filter((step) => step.unlocked)).toHaveLength(await ownEventSteps(pair.sam, 'le-mans'));
+    expect(JSON.stringify(page)).not.toContain(ids.alexLeMans);
+    expect(JSON.stringify(page)).not.toContain('Alex');
+  });
+
+  it('the race forms, the merge dialog and the suggestions offer only the account’s own events and editions', async () => {
+    expect((await getEventOptions(pair.sam)).map((option) => option.key).sort()).toEqual(['le-mans', 'sarthe', 'spa']);
+
+    // Only Alex has an edition named like this; Sam's own Le Mans race is not.
+    const nextEdition = `${year + 2} 24 Hours of Le Mans`;
+    expect(await suggestEventForName(pair.alex, nextEdition)).toMatchObject({ key: 'le-mans' });
+    expect(await suggestEventForName(pair.sam, nextEdition)).toBeNull();
+    expect(await getEventSuggestionForRace(pair.sam, ids.samUnlinked)).toBeNull();
+    const suggested = await getEventSuggestions(pair.sam);
+    const samRaces = new Set((await listRaces(pair.sam)).map((race) => race.id));
+    for (const suggestion of suggested) {
+      const raceIds = suggestion.kind === 'link' ? [suggestion.raceId] : suggestion.kind === 'create' ? suggestion.raceIds : [];
+      for (const raceId of raceIds) expect(samRaces.has(raceId), suggestion.id).toBe(true);
+    }
+    expect(suggested.filter((suggestion) => suggestion.kind === 'link' && suggestion.raceId === ids.samUnlinked)).toEqual([]);
+  });
+
+  it('Career Milestones, the dashboard, a reopened stint and Compare show only the account’s own', async () => {
+    const ownDates = await ownMilestoneDates(pair.sam);
+    const recent = await listRecentCareerMilestones(pair.sam, 100);
+    expect(recent.length).toBeGreaterThan(0);
+    expect(new Set(recent.map((row) => row.key)).size).toBe(recent.length);
+    for (const row of recent) expect(ownDates.has(row.date.toISOString()), row.key).toBe(true);
+    const milestones = await getCareerMilestonesView(pair.sam, later);
+    expect(milestones.timeline.length).toBeGreaterThan(0);
+    for (const item of milestones.timeline) expect(ownDates.has(item.date?.toISOString() ?? ''), item.id).toBe(true);
+    expect(JSON.stringify(milestones)).not.toContain('Alex');
+
+    const ownSteps = new Set((await prisma.masteryProgress.findMany({
+      where: { userId: pair.sam, unlockedAt: { not: null } },
+      select: { unlockedAt: true, node: { select: { key: true, tree: { select: { key: true } } } } },
+    })).map((row) => `mastery:${row.node.tree.key}:${row.node.key}@${row.unlockedAt!.toISOString()}`));
+    const shelf = (await getDashboard(pair.sam, later)).unlocks;
+    const steps = shelf.filter((row) => row.kind === 'mastery');
+    expect(steps.length).toBeGreaterThan(0);
+    for (const row of steps) expect(ownSteps.has(`${row.key}@${row.at}`), row.key).toBe(true);
+    for (const row of shelf.filter((unlock) => unlock.kind === 'milestone')) expect(ownDates.has(row.at), row.key).toBe(true);
+
+    // Reopened, Sam's first stint lists what it listed live, though Alex unlocked the same things thirty seconds later.
+    const reopened = await buildOutcomeForSession(pair.sam, samFirstStint.sessionId);
+    const keys = (list: readonly { key: string }[]) => list.map((row) => row.key).sort();
+    expect(samFirstStint.achievements.length).toBeGreaterThan(0);
+    expect(keys(reopened!.achievements)).toEqual(keys(samFirstStint.achievements));
+    const nodes = (list: readonly { treeKey: string; nodeKey: string }[]) =>
+      list.map((row) => `${row.treeKey}:${row.nodeKey}`).sort();
+    expect(samFirstStint.mastery.length).toBeGreaterThan(0);
+    expect(nodes(reopened!.mastery)).toEqual(nodes(samFirstStint.mastery));
+    const rungs = (list: readonly { metric: string; threshold: number }[]) =>
+      list.map((row) => `${row.metric}:${row.threshold}`).sort();
+    expect(samFirstStint.milestones.length).toBeGreaterThan(0);
+    expect(rungs(reopened!.milestones)).toEqual(rungs(samFirstStint.milestones));
+    expect(rungs(reopened!.careerMilestones)).toEqual(rungs(samFirstStint.careerMilestones));
+
+    const compare = await getYearComparison(pair.sam, year, year + 1, { samePeriod: false }, new Date());
+    const xp = compare.rows.find((row) => row.key === 'xp');
+    expect(xp?.b).toBeGreaterThan(0);
+    expect(xp?.b).toBe(await ledgerSum(pair.sam, yearWindow(year + 1)));
+  });
+
+  it('a page title names only the account’s own event or race', async () => {
+    const eventTitle = (key: string) =>
+      eventPageMetadata({ params: Promise.resolve({ key }), searchParams: Promise.resolve({}) });
+    const expeditionTitle = (id: string) =>
+      expeditionPageMetadata({ params: Promise.resolve({ id }), searchParams: Promise.resolve({}) });
+    const samSarthe = await prisma.raceMastery.findFirstOrThrow({ where: { userId: pair.sam, key: 'sarthe' } });
+
+    // A key both follow reads as the account's own event; a key only the other follows, as no event at all.
+    expect(await as(pair.sam, () => eventTitle('sarthe'))).toEqual({ title: samSarthe.displayName ?? samSarthe.name });
+    expect(await as(pair.alex, () => eventTitle('sarthe'))).toEqual({ title: 'Alex Private Sarthe' });
+    expect(await as(pair.sam, () => eventTitle('alex-only'))).toEqual({ title: 'Event' });
+
+    expect(await as(pair.sam, () => expeditionTitle(ids.alexLeMans))).toEqual({ title: 'Expedition' });
+    expect(await as(pair.alex, () => expeditionTitle(ids.alexLeMans)))
+      .toEqual({ title: `${year} 24 Hours of Le Mans — Expedition` });
+    expect(await as(pair.sam, () => expeditionTitle(ids.samLeMans))).toEqual({ title: 'Sam Sarthe Night — Expedition' });
+  });
+
+  it('merging one account’s events never moves the other account’s editions of the same key', async () => {
+    const samSarthe = await prisma.raceMastery.findFirstOrThrow({ where: { userId: pair.sam, key: 'sarthe' } });
+    const alexEvents = await prisma.raceMastery.findMany({ where: { userId: pair.alex }, orderBy: { key: 'asc' } });
+
+    const merged = await as(pair.sam, () => mergeEventsAction('le-mans', 'sarthe'));
+
+    expect(merged).toMatchObject({
+      ok: true, data: { racesMoved: 1, into: { key: 'sarthe', name: samSarthe.displayName ?? samSarthe.name } },
+    });
+    expect(merged.message).not.toContain('Alex');
+    expect(await prisma.race.findUniqueOrThrow({
+      where: { id: ids.alexLeMans }, select: { iconicKey: true, raceMastery: { select: { userId: true, key: true } } },
+    })).toEqual({ iconicKey: 'le-mans', raceMastery: { userId: pair.alex, key: 'le-mans' } });
+    expect(await prisma.raceMastery.findMany({ where: { userId: pair.alex }, orderBy: { key: 'asc' } })).toEqual(alexEvents);
+    // Sam's own edition did move.
+    expect(await prisma.race.findUniqueOrThrow({
+      where: { id: ids.samLeMans }, select: { iconicKey: true, raceMasteryId: true },
+    })).toEqual({ iconicKey: 'sarthe', raceMasteryId: samSarthe.id });
+
+    // The steps it carried were paid, if at all, under Le Mans. Sarthe's page shows what Sam was paid for each
+    // step there, which for a carried one is nothing, though Alex was paid for the same step of the same key.
+    const page = await getEventLegacy(pair.sam, 'sarthe');
+    if (page === null || 'redirectTo' in page) throw new Error('Sam’s Sarthe has no page');
+    const paid = new Map((await prisma.xPTransaction.findMany({
+      where: { userId: pair.sam, dedupeKey: { startsWith: 'mastery:event:sarthe:' } },
+      select: { dedupeKey: true, amount: true },
+    })).map((row) => [row.dedupeKey, row.amount]));
+    const unlocked = page.steps.filter((step) => step.unlocked);
+    expect(unlocked.length).toBeGreaterThan(0);
+    expect(await prisma.xPTransaction.count({
+      where: { userId: pair.alex, dedupeKey: { in: unlocked.map((step) => `mastery:event:sarthe:${step.nodeKey}`) } },
+    })).toBeGreaterThan(0);
+    for (const step of unlocked) {
+      expect(step.xp, step.nodeKey).toBe(paid.get(`mastery:event:sarthe:${step.nodeKey}`) ?? null);
+    }
   });
 });
 
