@@ -1090,6 +1090,8 @@ export const CAREER_STATS_SHAPE = {
   raceOptionLimit: 200,
   /** Most races offered at once by an event's "Add races" dialog. */
   addRacesDialogLimit: 50,
+  /** Race cards the race library shows per page (a multiple of the 2 and 3 card columns). */
+  libraryPageSize: 60,
 } as const;
 
 /**

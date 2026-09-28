@@ -84,6 +84,9 @@ export const CHANGELOG: readonly ChangelogEntry[] = [
           'The Milestones tab on Achievements is now called Lifetime ladders. The achievement "Expedition" is now ' +
             'called "Around the Clock, Three Times", and the event steps for complete editions now say "complete" ' +
             'in their names.',
+          'The race library shows 60 races at a time, with Previous and Next below them, so it stays quick with ' +
+            'thousands of races. Search, the views and the sort still cover the whole library, and the number of ' +
+            'races waiting for you still counts all of them.',
         ],
       },
       {
@@ -95,6 +98,7 @@ export const CHANGELOG: readonly ChangelogEntry[] = [
           'Event editions dated 1 January are no longer counted in the year before on computers west of Greenwich.',
           'A stint summary opened again later no longer lists things unlocked after that stint.',
           'A completion figure never rounds up to 100% while part of the race is still to watch.',
+          'The race library no longer fails to open once it holds about a thousand races.',
         ],
       },
     ],

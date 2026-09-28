@@ -8,7 +8,7 @@
 
 import type { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/db/client';
-import { STORY_CONFIG } from '@/lib/config';
+import { CAREER_STATS_SHAPE, STORY_CONFIG } from '@/lib/config';
 import { creditedSeconds, replayRace } from '@/lib/domain/career-timeline';
 import { editionIdentity, editionYear } from '@/lib/domain/edition';
 import {
@@ -38,7 +38,15 @@ export interface RaceFilter {
   sort?: 'recent' | 'date' | 'name' | 'progress' | 'duration' | 'priority';
 }
 
-/** Included on every race read so the timeline bar can be drawn. */
+/**
+ * Included on every race read so the timeline bar can be drawn.
+ *
+ * The intervals are loaded without an `orderBy` and put in timeline order by
+ * `fromRows`. Prisma caps a SQLite query at 999 bound values: it splits an
+ * unordered to-many load into several queries, but an ordered one goes out as
+ * one query with every race's id in it, which fails (P2029) for a library of
+ * about 998 races or more.
+ */
 const RACE_SELECT = {
   id: true, name: true, circuit: true, country: true, raceDate: true,
   runtimeSec: true, scheduledDurationSec: true, actualDurationSec: true,
@@ -49,7 +57,7 @@ const RACE_SELECT = {
   startedAt: true, completedAt: true, lastWatchedAt: true, storyCompletedAt: true,
   championship: { select: { id: true, name: true, shortName: true, accentColor: true } },
   season: { select: { id: true, year: true, label: true, plannedRaceCount: true } },
-  intervals: { select: { startSec: true, endSec: true }, orderBy: { startSec: 'asc' } },
+  intervals: { select: { startSec: true, endSec: true } },
 } satisfies Prisma.RaceSelect;
 
 /** The race select plus its full session history, for the race detail page. */
@@ -68,30 +76,36 @@ const RACE_DETAIL_SELECT = {
   },
 } satisfies Prisma.RaceSelect;
 
+/** The races a library filter shows, in the account. */
+function raceWhere(userId: string, filter: RaceFilter): Prisma.RaceWhereInput {
+  return {
+    userId,
+    ...(filter.status?.length ? { status: { in: filter.status } } : {}),
+    ...(filter.championshipId ? { championshipId: filter.championshipId } : {}),
+    ...(filter.seasonId ? { seasonId: filter.seasonId } : {}),
+    ...(filter.raceType ? { raceType: filter.raceType } : {}),
+    ...(filter.majorOnly ? { isMajorEvent: true } : {}),
+    ...(filter.storyCompleteOnly ? { storyCompletedAt: { not: null } } : {}),
+    ...(filter.unfinishedOnly ? { storyCompletedAt: null, status: { notIn: ['ARCHIVED', 'ABANDONED'] } } : {}),
+    // SQLite has no `mode: 'insensitive'`, but its LIKE is already
+    // case-insensitive for ASCII, which is what `contains` compiles to. So
+    // searching for "fuji" still finds "6 Hours of Fuji".
+    ...(filter.search
+      ? {
+          OR: [
+            { name: { contains: filter.search } },
+            { circuit: { contains: filter.search } },
+            { country: { contains: filter.search } },
+          ],
+        }
+      : {}),
+  };
+}
+
+/** Every race the filter shows, as cards. The library page reads a page at a time instead. */
 export async function listRaces(userId: string, filter: RaceFilter = {}): Promise<RaceCardData[]> {
   const races = await prisma.race.findMany({
-    where: {
-      userId,
-      ...(filter.status?.length ? { status: { in: filter.status } } : {}),
-      ...(filter.championshipId ? { championshipId: filter.championshipId } : {}),
-      ...(filter.seasonId ? { seasonId: filter.seasonId } : {}),
-      ...(filter.raceType ? { raceType: filter.raceType } : {}),
-      ...(filter.majorOnly ? { isMajorEvent: true } : {}),
-      ...(filter.storyCompleteOnly ? { storyCompletedAt: { not: null } } : {}),
-      ...(filter.unfinishedOnly ? { storyCompletedAt: null, status: { notIn: ['ARCHIVED', 'ABANDONED'] } } : {}),
-      // SQLite has no `mode: 'insensitive'`, but its LIKE is already
-      // case-insensitive for ASCII, which is what `contains` compiles to. So
-      // searching for "fuji" still finds "6 Hours of Fuji".
-      ...(filter.search
-        ? {
-            OR: [
-              { name: { contains: filter.search } },
-              { circuit: { contains: filter.search } },
-              { country: { contains: filter.search } },
-            ],
-          }
-        : {}),
-    },
+    where: raceWhere(userId, filter),
     select: RACE_SELECT,
     orderBy: orderFor(filter.sort),
   });
@@ -99,16 +113,66 @@ export async function listRaces(userId: string, filter: RaceFilter = {}): Promis
   return races.map(toCardData);
 }
 
-function orderFor(sort: RaceFilter['sort']) {
+export interface RaceLibraryPage {
+  /** This page's cards, in the filter's order. */
+  races: RaceCardData[];
+  /** Races the filter shows, on every page. */
+  total: number;
+  /** Of those, the ones not started and not Story Complete: the backlog line. */
+  unwatched: number;
+  /** 1-based, and always a page that exists (1 for an empty library). */
+  page: number;
+  pageCount: number;
+  pageSize: number;
+}
+
+/**
+ * One page of the library, `CAREER_STATS_SHAPE.libraryPageSize` cards at a
+ * time, so a library of thousands never sends every card to the page. The
+ * counts come from the database, not from the page. A page number past the
+ * end shows the last page (a race was removed, or the link is old).
+ */
+export async function getRaceLibraryPage(
+  userId: string,
+  filter: RaceFilter = {},
+  requestedPage = 1,
+): Promise<RaceLibraryPage> {
+  const where = raceWhere(userId, filter);
+  const pageSize = CAREER_STATS_SHAPE.libraryPageSize;
+  const [total, unwatched] = await Promise.all([
+    prisma.race.count({ where }),
+    prisma.race.count({ where: { AND: [where, { coverageSec: 0, storyCompletedAt: null }] } }),
+  ]);
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, Math.trunc(requestedPage) || 1), pageCount);
+  const races = total === 0
+    ? []
+    : await prisma.race.findMany({
+        where,
+        select: RACE_SELECT,
+        orderBy: orderFor(filter.sort),
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      });
+
+  return { races: races.map(toCardData), total, unwatched, page, pageCount, pageSize };
+}
+
+/**
+ * Each sort ends on the id, so races that tie keep one order and a page never
+ * repeats or skips one.
+ */
+function orderFor(sort: RaceFilter['sort']): Prisma.RaceOrderByWithRelationInput[] {
+  const byId = { id: 'asc' as const };
   switch (sort) {
-    case 'date': return [{ raceDate: 'desc' as const }, { name: 'asc' as const }];
-    case 'name': return [{ name: 'asc' as const }];
-    case 'progress': return [{ coverageSec: 'desc' as const }];
-    case 'duration': return [{ runtimeSec: 'desc' as const }];
-    case 'priority': return [{ priority: 'desc' as const }, { excitement: 'desc' as const }];
+    case 'date': return [{ raceDate: 'desc' }, { name: 'asc' }, byId];
+    case 'name': return [{ name: 'asc' }, byId];
+    case 'progress': return [{ coverageSec: 'desc' }, byId];
+    case 'duration': return [{ runtimeSec: 'desc' }, byId];
+    case 'priority': return [{ priority: 'desc' }, { excitement: 'desc' }, byId];
     case 'recent':
     default:
-      return [{ lastWatchedAt: { sort: 'desc' as const, nulls: 'last' as const } }, { createdAt: 'desc' as const }];
+      return [{ lastWatchedAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }, byId];
   }
 }
 
@@ -134,7 +198,7 @@ function toCardData(race: RaceRow): RaceCardData {
     isMajorEvent: race.isMajorEvent,
     isExpedition: isExpedition(race),
     storyComplete: race.storyCompletedAt !== null,
-    intervals: race.intervals.map((i) => ({ start: i.startSec, end: i.endSec })),
+    intervals: fromRows(race.intervals),
   };
 }
 

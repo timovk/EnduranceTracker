@@ -42,6 +42,8 @@ export function RaceFilterBar({
       const next = new URLSearchParams(params.toString());
       if (value) next.set(key, value);
       else next.delete(key);
+      // A different view starts on its first page.
+      next.delete('page');
       router.replace(`${pathname}?${next.toString()}`, { scroll: false });
     },
     [params, pathname, router],

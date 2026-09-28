@@ -38,6 +38,7 @@ import {
 import {
   ensureChroniclesFrozen, freezeYear, getChronicleChapter, getChronicleIndex, yearsToFreeze,
 } from '@/lib/engines/chronicle-engine';
+import { getRaceLibraryPage, listRaces } from '@/lib/server/races';
 import { eventStepProblems, expeditionProblems, ledgerProblems, logStint } from '../helpers/career-db';
 import type { LargeCareerDatabase, SeededCareer } from '../helpers/large-career-db';
 import { createLargeCareerDatabase } from '../helpers/large-career-db';
@@ -344,6 +345,20 @@ describe.skipIf(process.env.PERF !== '1')('a career at scale (database)', () => 
       expect(view.result?.stints.length).toBeGreaterThanOrEqual(199);
       expect(view.ms, career.userId).toBeLessThan(limit);
     }
+  }, SLOW);
+
+  it('opens a page of the race library in under 500 ms, and reads the whole library of a large career', async () => {
+    // A library past 998 races once failed outright (P2029): the cards'
+    // intervals were loaded in one ordered query with every race's id in it.
+    for (const career of [real, large]) {
+      const page = await timedAsync(() => getRaceLibraryPage(career.userId, { sort: 'recent' }, 2));
+      expect(page.result.total).toBe(career.races);
+      expect(page.result.races).toHaveLength(CAREER_STATS_SHAPE.libraryPageSize);
+      expect(page.ms, career.userId).toBeLessThan(500);
+    }
+    const whole = await timedAsync(() => listRaces(large.userId, { sort: 'date' }));
+    expect(whole.result).toHaveLength(large.races);
+    expect(whole.ms).toBeLessThan(5_000);
   }, SLOW);
 
   it('switches Expedition Mode, writing a missing summary, in under 500 ms for a real career and 2 s for a large one', async () => {
