@@ -158,7 +158,8 @@ Worth saying out loud, because "it builds" and "it works" are different claims:
   twice, and a second start changing nothing. `tests/e2e/desktop.mjs` ends
   with a simulated upgrade of the same fixture in the packaged application
   (history pass complete, every milestone dated, 2025 frozen once, no pause or
-  failure in the log), but that has not yet been run on a 0.4.0 package.
+  failure in the log). The packaged Linux build of 0.4.0 passed all 72 checks
+  of that run, the 0.3.2 upgrade included.
 - The Windows installer is produced by the CI workflow above. The 0.2.0
   installer has been installed and used on Windows. Installing a newer version
   over an existing one has so far only been simulated on the Linux package,

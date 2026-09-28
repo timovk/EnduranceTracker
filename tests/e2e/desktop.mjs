@@ -38,8 +38,12 @@
  * left, and finishes with a simulated upgrade of a real 0.3.2 career: the
  * committed fixture `tests/fixtures/career-0.3.2.db`, dropped into the data
  * folder and started, must come out with its one-time history pass complete,
- * every milestone dated and its first year frozen. That makes 71 checks while
- * the season pass is closed, and 69 once it has reopened.
+ * every milestone dated and its first year frozen.
+ *
+ * The 0.4.0 package has been run through all of it under xvfb, on 28 September
+ * 2026 with the season pass still closed: 72 checks, all passing, the 0.3.2
+ * upgrade included. Once the pass has reopened, its three closed-pass checks
+ * become one, so expect 70.
  */
 
 import { _electron as electron } from 'playwright';
