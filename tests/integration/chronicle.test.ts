@@ -44,7 +44,7 @@ import {
 import { createEvent } from '@/lib/engines/event-legacy-engine';
 import { eventHref } from '@/lib/engines/mastery-engine';
 import { deleteRace } from '@/lib/engines/session-engine';
-import { getStatistics } from '@/lib/engines/stats-engine';
+import { getFilterOptions, getStatistics, getYearComparison } from '@/lib/engines/stats-engine';
 import type { ActionResult } from '@/lib/server/actions';
 import {
   createChampionshipAction, createRaceAction, deleteRaceAction, deleteSessionAction, logSessionAction,
@@ -215,6 +215,41 @@ describe('freezing a finished year', () => {
     expect(index.years.map((year) => [year.year, year.kind])).toEqual([[2027, 'chapter'], [2026, 'chapter'], [2025, 'chapter']]);
   });
 
+  it('a career whose very first stint reached back over New Year begins in the old year', async () => {
+    const opening = await addRace(USER, { name: 'Midnight Two Hours', hours: 4 });
+    const lm = await addRace(USER, { name: '24 Hours of Le Mans', hours: 24 });
+    // The first stint ever: watched from 22:30 on 31 December 2025, logged at 00:30.
+    await watch(opening, at(2026, 1, 1, 0, 30), 0, 2 * H);
+    await watch(lm, at(2026, 6, 1), 0, 12 * H);
+    await watch(lm, at(2027, 6, 1), 12 * H, 18 * H);
+    await markCareerBackfillApplied(USER);
+
+    const now = at(2028, 1, 5);
+    expect(await ensureChroniclesFrozen(USER, now)).toEqual([2025, 2026, 2027]);
+    const index = await getChronicleIndex(USER, now);
+    expect(index.years.map((year) => [year.year, year.careerYear])).toEqual([[2028, 4], [2027, 3], [2026, 2], [2025, 1]]);
+
+    const first = await getChronicleChapter(USER, 2025, now);
+    expect(first).toMatchObject({ state: 'frozen', careerYear: 1, quiet: false });
+    expect(first!.chapter.summary.creditedSeconds).toBeCloseTo(1.5 * H, 6);
+    expect(first!.chapter.beginnings?.firstStint).toMatchObject({ at: at(2025, 12, 31, 22, 30).toISOString(), raceName: 'Midnight Two Hours' });
+    // The Chronicle and Career Statistics count the same years, and the same time in them.
+    expect((await getStatistics(USER, { year: 2025 }, now)).viewing.realSeconds).toBe(Math.round(first!.chapter.summary.creditedSeconds));
+    expect((await getFilterOptions(USER, {})).years.map((year) => year.year)).toContain(2025);
+    // Its landmarks are in its chapter: the first real viewing hour was reached on 31 December.
+    expect(first!.chapter.milestones.ladder.map((rung) => `${rung.metric}:${rung.threshold}`)).toContain('realHours:1');
+
+    // 2026 was a whole year.
+    const third = await getChronicleChapter(USER, 2027, now);
+    expect(third!.chapter.previousYear).toMatchObject({ year: 2026, careerBeganInYear: false });
+    const whole = await getYearComparison(USER, 2026, 2027, {}, now);
+    expect(whole.partialNote).toBeNull();
+    expect(whole.rows.find((row) => row.key === 'hours')?.percentChange).not.toBeNull();
+    const partial = await getYearComparison(USER, 2025, 2026, {}, now);
+    expect(partial.years).toEqual([2028, 2027, 2026, 2025]);
+    expect(partial.partialNote).toBe('Your 2025 chapter began on 31 December');
+  });
+
   it('a chapter is never frozen before the account\'s backfill is complete', async () => {
     await newYearCareer();
     const now = at(2027, 1, 10);
@@ -293,6 +328,33 @@ describe('freezing a finished year', () => {
     // The race is gone from the library, so nothing links to it.
     expect(view!.raceIdsInLibrary).not.toContain(ten);
     expect(view!.chapter.notableRaces.map((race) => race.raceId)).toContain(ten);
+  });
+});
+
+describe('a year\'s own milestone', () => {
+  it('reached by a stint batch-logged just after New Year, is dated in its year and listed in its chapter', async () => {
+    const long = await addRace(USER, { name: 'Long Haul', hours: 48 });
+    const late = await addRace(USER, { name: 'Day Race', hours: 24 });
+    // 288 hours in December, and 40 more logged at 23:30 on 31 December.
+    for (const day of [5, 7, 9, 11, 13, 15]) await watch(long, at(2026, 12, day, 0, 0), 0, 48 * H);
+    await watch(long, at(2026, 12, 31, 23, 30), 0, 40 * H);
+    // Twenty hours logged an hour later: the window is cut to that hour, and
+    // its first half — ten hours — takes 2026 past its plan.
+    await watch(late, at(2027, 1, 1, 0, 30), 0, 20 * H);
+
+    const lastMoment = new Date(at(2027, 1, 1, 0, 0).getTime() - 1);
+    const row = await prisma.milestoneProgress.findFirstOrThrow({ where: { userId: USER, metric: 'realHoursYear:2026' } });
+    expect(row).toMatchObject({ achievedAt: lastMoment, achievedPrecision: 'INTERPOLATED', subjectName: 'Day Race' });
+
+    await markCareerBackfillApplied(USER);
+    const now = at(2027, 2, 1);
+    expect(await ensureChroniclesFrozen(USER, now)).toEqual([2026]);
+    const [old, next] = await Promise.all([getChronicleChapter(USER, 2026, now), getChronicleChapter(USER, 2027, now)]);
+    expect(old!.chapter.summary.creditedSeconds).toBeCloseTo(338 * H, 3);
+    expect(old!.chapter.milestones.career).toContainEqual(expect.objectContaining({
+      id: 'year-plan:2026', at: lastMoment.toISOString(), precision: 'INTERPOLATED',
+    }));
+    expect(next!.chapter.milestones.career.map((milestone) => milestone.id)).not.toContain('year-plan:2026');
   });
 });
 

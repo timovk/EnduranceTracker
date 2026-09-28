@@ -6,7 +6,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { STORY_CONFIG, XP_CONFIG } from '@/lib/config';
+import { BUDGET_CONFIG, STORY_CONFIG, XP_CONFIG } from '@/lib/config';
+import { precisionLabel } from '@/lib/copy/tone';
 import {
   buildCareerTimeline, compareCanonical, coverageAt, coverageCrossing, creditedSeconds, cumulativeCrossing,
   isRaceExperienced, nthEvent, raceExperiencedEvents, raceStartEvents, replayRace, storyCompleteEvents,
@@ -258,6 +259,74 @@ describe('the career walk', () => {
   });
 });
 
+/**
+ * A year's rung is reached by time in that year, so it is dated in that year
+ * whatever the stint that crossed it looks like: batch-logged just after New
+ * Year, or holding exactly what the year still needed. Run on three clocks,
+ * because "1 January" is a different instant on each.
+ */
+describe('the year rung is dated inside its own year', () => {
+  for (const place of [ZONES.london, ZONES.losAngeles, ZONES.auckland]) {
+    describe(place.zone, () => {
+      inTimeZone(place.zone, place.offsets);
+
+      it('a rung crossed by a stint batch-logged just after New Year is dated on 31 December', () => {
+        const lh = race('lh', { hours: 48 });
+        const late = race('late', { hours: 24 });
+        const sessions = [
+          // 288 hours in December, then 40 hours logged just before midnight.
+          ...[5, 7, 9, 11, 13, 15].map((day) => stint(lh, `2026-12-${String(day).padStart(2, '0')}T00:00`, { from: '0:00', to: '48:00' })),
+          stint(lh, '2026-12-31T23:30', { from: '0:00', to: '40:00' }),
+          // Twenty hours logged an hour later: its window is cut to that
+          // hour, half of it in 2026, so it puts ten hours into the old year.
+          stint(late, '2027-01-01T00:30', { from: '0:00', to: '20:00' }),
+        ];
+        const timeline = career([lh, late], sessions);
+        const crossing = timeline.stints[7]!;
+        expect(crossing.windowReliable).toBe(false);
+
+        const instant = milestoneInstant(timeline, 'realHoursYear:2026', BUDGET_CONFIG.annualHours);
+        const lastMoment = new Date(yearWindow(2026).end.getTime() - 1);
+        expect(instant).toMatchObject({ at: lastMoment, precision: 'INTERPOLATED', sessionId: crossing.sessionId, raceId: 'late' });
+        expect(instant!.at.getFullYear()).toBe(2026);
+        // Worked out, not the stint's own instant, and it reads so: in 2026.
+        const label = precisionLabel(instant!.precision, instant!.at, 'late');
+        expect(label).toBe('Reached around 23:55 on 31 December 2026, during a stint of late (worked out from when the stint was logged)');
+
+        // The year held 338 hours; every threshold the batch-logged stint
+        // crossed is dated at that same last moment, and the next year's
+        // count starts afresh from its own part of the stint.
+        expect(cumulativeCrossing(timeline.stints, 338 * H, (s) => s.creditedSeconds, yearWindow(2026))?.at).toEqual(lastMoment);
+        expect(cumulativeCrossing(timeline.stints, 338 * H + 60, (s) => s.creditedSeconds, yearWindow(2026))).toBeNull();
+        expect(cumulativeCrossing(timeline.stints, 10 * H, (s) => s.creditedSeconds, yearWindow(2027)))
+          .toMatchObject({ at: localTime('2027-01-01T00:30'), precision: 'STINT' });
+      });
+
+      it('never dates any threshold of a year outside it, however the stints were logged', () => {
+        const r = race('r', { hours: 24 });
+        const sessions = [
+          stint(r, '2026-12-31T20:00', { from: '0:00', to: '3:00' }),
+          stint(r, '2026-12-31T23:59', { from: '3:00', to: '9:00' }),
+          stint(r, '2027-01-01T00:01', { from: '9:00', to: '15:00' }),
+          stint(r, '2027-01-01T04:00', { from: '15:00', to: '21:00' }),
+        ];
+        const timeline = career([r], sessions);
+        for (const year of [2026, 2027]) {
+          const window = yearWindow(year);
+          let previous = -Infinity;
+          for (let seconds = 600; ; seconds += 600) {
+            const instant = cumulativeCrossing(timeline.stints, seconds, (s) => s.creditedSeconds, window);
+            if (instant === null) break;
+            expect(instant.at >= window.start && instant.at < window.end, `${year}, ${seconds} s`).toBe(true);
+            expect(instant.at.getTime()).toBeGreaterThanOrEqual(previous);
+            previous = instant.at.getTime();
+          }
+        }
+      });
+    });
+  }
+});
+
 /** Four whole days of racing, then a fifth 24-hour stint. */
 function hundredHours(): { races: TimelineRaceRow[]; sessions: TimelineSessionRow[] } {
   const races = ['a', 'b', 'c', 'd', 'e'].map((id) => race(id, { hours: 24 }));
@@ -297,6 +366,11 @@ describe('interpolated instants', () => {
     expect(inOldYear?.at).toEqual(localTime('2026-12-31T23:00'));
     // Only two hours of it fell in 2026.
     expect(cumulativeCrossing(timeline.stints, 2 * H + 1, (s) => s.creditedSeconds, yearWindow(2026))).toBeNull();
+    // Exactly those two hours are reached at the year's last moment, never at
+    // midnight on 1 January, which is the next year's.
+    expect(cumulativeCrossing(timeline.stints, 2 * H, (s) => s.creditedSeconds, yearWindow(2026))).toMatchObject({
+      at: new Date(yearWindow(2026).end.getTime() - 1), precision: 'INTERPOLATED',
+    });
   });
 
   it('two stints logged a minute apart never date a later threshold before an earlier one', () => {

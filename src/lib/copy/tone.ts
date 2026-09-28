@@ -13,6 +13,7 @@
  */
 
 import { EXPEDITION_CONFIG, EXPEDITION_SHAPE, TIMELINE_SHAPE } from '@/lib/config';
+import { localDayKey } from '@/lib/domain/calendar';
 import type { ChronicleChapterV1, WrappedCard } from '@/lib/domain/chronicle';
 import { clampIntervals, gapsIn } from '@/lib/domain/intervals';
 import { formatCoveragePercent, formatDuration } from '@/lib/domain/time';
@@ -199,7 +200,11 @@ export function precisionLabel(
 ): string {
   if (precision === 'INTERPOLATED') {
     const step = TIMELINE_SHAPE.displayRoundingMinutes * 60_000;
-    const rounded = new Date(Math.round(at.getTime() / step) * step);
+    let rounded = new Date(Math.round(at.getTime() / step) * step);
+    // Rounding never carries a time into the next day: a year's rung worked
+    // out at 23:58 on 31 December reads "around 23:55" in that year, not
+    // "around 00:00 on 1 January" of the next.
+    if (localDayKey(rounded) !== localDayKey(at)) rounded = new Date(Math.floor(at.getTime() / step) * step);
     const during = subjectName ? `, during a stint of ${subjectName}` : '';
     return `Reached around ${clockTime(rounded)} on ${longDate(rounded)}${during} (worked out from when the stint was logged)`;
   }
@@ -237,11 +242,15 @@ export function stillAheadNote(value: number, target: number, unit: 'hours' | 'c
 /**
  * The current year's hours as a plain fact — "2026 so far: 36 hours". Never a
  * bar and never a remaining figure: a yearly target that resets every January
- * would be a quota.
+ * would be a quota. Hours are shown whole from ten (tenths below) and never
+ * rounded up, like `stillAheadNote`, so the line never reads "336 hours"
+ * while the "336 hours in {year}" milestone beside it is still to come.
+ * Worked out in whole seconds, so an exact tenth is never pushed down by
+ * float error.
  */
 export function yearToDateFact(year: number, creditedSeconds: number): string {
-  const hours = Math.max(0, creditedSeconds) / 3600;
-  const shown = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
+  const seconds = Math.max(0, creditedSeconds);
+  const shown = seconds >= 10 * 3600 ? Math.floor(seconds / 3600) : Math.floor(Math.round(seconds) / 360) / 10;
   const figure = shown.toLocaleString('en-GB');
   return `${year} so far: ${figure} ${shown === 1 ? 'hour' : 'hours'}`;
 }
@@ -608,6 +617,8 @@ export function wrappedCardLine(card: WrappedCard): string {
       return `${count(card.count)} Expeditions completed, with ${hoursFigure(card.creditedSeconds / 3600)} of viewing between them.`;
     case 'records': {
       const records = card.records.map((record) => `${record.label.charAt(0).toLowerCase()}${record.label.slice(1)} (${record.valueText})`);
+      // The card names a few; when the year set more, it says how many and never passes the few off as all.
+      if (card.total > card.records.length) return `${count(card.total)} personal records set, among them ${listOf(records)}.`;
       return `${card.records.length === 1 ? 'A personal record' : 'Personal records'} set: ${listOf(records)}.`;
     }
     case 'compared': {

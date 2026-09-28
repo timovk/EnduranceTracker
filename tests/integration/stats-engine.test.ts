@@ -10,10 +10,13 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { careerMilestoneOfRow } from '@/lib/config';
 import { disconnectDb, prisma, type Tx } from '@/lib/db/client';
 import { levelFromXp } from '@/lib/domain/progression';
 import { COMPARE_ROW_ORDER } from '@/lib/domain/window-summary';
-import { createEvent, mergeEvents } from '@/lib/engines/event-legacy-engine';
+import { getCareerMilestonesView } from '@/lib/engines/career-milestone-engine';
+import { buildChapterData } from '@/lib/engines/chronicle-engine';
+import { createEvent, getEventLegacy, mergeEvents } from '@/lib/engines/event-legacy-engine';
 import { eventHref } from '@/lib/engines/mastery-engine';
 import { deleteViewingSession } from '@/lib/engines/session-engine';
 import {
@@ -399,6 +402,47 @@ describe('Career Statistics', () => {
     expect(sunday.byWeekday[0]?.label).toBe('Sunday');
   });
 
+  it('the most active day holds at most a day, the same figure as the most-in-a-day record', async () => {
+    const [one, two, three] = await Promise.all(['One', 'Two', 'Three'].map((name) => addRace(USER, { name: `Ten Hours ${name}`, hours: 10 })));
+    // Logged a minute apart: the last two windows are cut to a minute each,
+    // so twenty-five credited hours land on 9 May.
+    await watch(USER, one!, at(2026, 5, 9, 20, 0), 0, 10 * H);
+    await watch(USER, two!, at(2026, 5, 9, 20, 1), 0, 5 * H);
+    await watch(USER, three!, at(2026, 5, 9, 20, 2), 0, 10 * H);
+
+    const stats = await getStatistics(USER, {}, NOW);
+    expect(stats.viewing.realSeconds).toBe(25 * H);
+    expect(stats.cadence.mostActiveDay).toEqual({ date: '2026-05-09', realSeconds: 24 * H, realHours: 24, sessions: 3 });
+    const record = (await getRecords(USER, {})).records.find((entry) => entry.kind === 'most-in-a-day');
+    expect(record?.value).toBe(stats.cadence.mostActiveDay?.realSeconds);
+    expect((await getStatistics(USER, { year: 2026 }, NOW)).cadence.mostActiveDay?.realSeconds).toBe(24 * H);
+  });
+
+  it('names the most-watched event\'s editions as its own page counts them', async () => {
+    const spa = { iconicKey: 'spa-24', hours: 1 };
+    const day = (year: number) => new Date(Date.UTC(year, 6, 27));
+    const y2024 = await addRace(USER, { ...spa, name: 'Spa 2024', raceDate: day(2024) });
+    const y2025 = await addRace(USER, { ...spa, name: 'Spa 2025', raceDate: day(2025) });
+    // The same edition uploaded twice is one edition.
+    const reupload = await addRace(USER, { ...spa, name: 'Spa 2025 (re-upload)', raceDate: day(2025) });
+    // A glimpse and a race never watched are no edition at all.
+    const glimpse = await addRace(USER, { ...spa, name: 'Spa 2022', raceDate: day(2022) });
+    await addRace(USER, { ...spa, name: 'Spa 2023', raceDate: day(2023) });
+    await watch(USER, y2024, at(2026, 3, 1), 0, H);
+    await watch(USER, y2025, at(2026, 3, 2), 0, H);
+    await watch(USER, reupload, at(2026, 3, 3), 0, H);
+    await watch(USER, glimpse, at(2026, 3, 4), 0, 2 * MINUTE);
+
+    const legacy = await getEventLegacy(USER, 'spa-24');
+    if (legacy === null || 'redirectTo' in legacy) throw new Error('no event page');
+    expect(legacy.stats).toMatchObject({ editionsExperienced: 2, editionsStoryComplete: 2 });
+    for (const filter of [{}, { year: 2026 }]) {
+      const favourite = (await getStatistics(USER, filter, NOW)).favourites.event;
+      expect(favourite?.key).toBe('spa-24');
+      expect(favourite?.detail).toBe('2 editions experienced, 2 Story Complete.');
+    }
+  });
+
   it('XP and levels by year', async () => {
     const raceId = await addRace(USER, { hours: 24 });
     const first = await watchAwarding(USER, raceId, at(2026, 3, 10), 0, 3 * H);
@@ -427,15 +471,26 @@ describe('Career Statistics', () => {
     const raceId = await addRace(USER, { hours: 6 });
     await watch(USER, raceId, at(2027, 3, 6), 0, 6 * H);
 
-    const [achievements, milestones] = await Promise.all([
+    const [achievements, rows] = await Promise.all([
       prisma.achievementProgress.count({ where: { userId: USER, unlockedAt: { not: null } } }),
-      prisma.milestoneProgress.count({ where: { userId: USER, reachedAt: { not: null } } }),
+      prisma.milestoneProgress.findMany({ where: { userId: USER, reachedAt: { not: null } }, select: { metric: true, threshold: true } }),
     ]);
+    // The milestones are the Career Milestones catalogue's; the lifetime-ladder rungs are not among them.
+    const milestones = rows.filter((row) => careerMilestoneOfRow(row.metric, row.threshold) !== null).length;
+    expect(milestones).toBeGreaterThan(0);
+    expect(milestones).toBeLessThan(rows.length);
     const stats = await getStatistics(USER, {}, NOW);
     const last = stats.landmarksOverTime[stats.landmarksOverTime.length - 1];
     expect(last?.achievements).toBe(achievements);
     expect(last?.milestones).toBe(milestones);
     expect(achievements).toBeGreaterThan(0);
+    // The same count Career Milestones reads, and the year's chapter.
+    expect(last?.milestones).toBe((await getCareerMilestonesView(USER, NOW)).timeline.length);
+    const year = (await getStatistics(USER, { year: 2027 }, NOW)).landmarksOverTime.at(-1);
+    const chapter = await buildChapterData(USER, 2027, NOW);
+    expect([year?.achievements, year?.masteryNodes, year?.milestones]).toEqual([
+      chapter.summary.achievementsUnlocked, chapter.summary.masteryStepsUnlocked, chapter.summary.milestonesReached,
+    ]);
     // Running totals never go down.
     for (let index = 1; index < stats.landmarksOverTime.length; index += 1) {
       const [previous, current] = [stats.landmarksOverTime[index - 1]!, stats.landmarksOverTime[index]!];
@@ -450,18 +505,19 @@ describe('Career Statistics', () => {
     await watch(USER, raceId, at(2026, 3, 6), 0, H);
     await watch(USER, raceId, at(2027, 3, 6), H, 6 * H);
 
-    // A rung the history dated earlier than it was recorded counts where the history puts it.
-    const rung = await prisma.milestoneProgress.findFirstOrThrow({
+    // A milestone the history dated earlier than it was recorded counts where the history puts it.
+    const rung = (await prisma.milestoneProgress.findMany({
       where: { userId: USER, reachedAt: { gte: at(2027, 1, 1, 0) } },
-      select: { id: true },
-    });
+      orderBy: { id: 'asc' },
+      select: { id: true, metric: true, threshold: true },
+    })).find((row) => careerMilestoneOfRow(row.metric, row.threshold) !== null)!;
     await prisma.milestoneProgress.updateMany({ where: { id: rung.id, userId: USER }, data: { achievedAt: at(2027, 1, 20) } });
 
     const [achievements, milestones] = await Promise.all([
       prisma.achievementProgress.findMany({ where: { userId: USER, unlockedAt: { not: null } }, select: { unlockedAt: true } }),
       prisma.milestoneProgress.findMany({
-        where: { userId: USER, reachedAt: { not: null } }, select: { reachedAt: true, achievedAt: true },
-      }),
+        where: { userId: USER, reachedAt: { not: null } }, select: { metric: true, threshold: true, reachedAt: true, achievedAt: true },
+      }).then((rows) => rows.filter((row) => careerMilestoneOfRow(row.metric, row.threshold) !== null)),
     ]);
     const in2027 = (at: Date | null) => at !== null && at.getFullYear() === 2027;
     const year = await getStatistics(USER, { year: 2027 }, NOW);
@@ -501,7 +557,42 @@ describe('Career Statistics', () => {
     expect(stats.completion.masteryTreesTotal).toBe(kept.length);
     expect(stats.completion.mastery.total).toBe(kept.reduce((sum, tree) => sum + tree._count.nodes, 0));
     expect(stats.completion.mastery.done).toBe(unlocked.filter((row) => row.node.tree.key !== mergedTree).length);
+    // Every step here was carried into the survivor, which had none: each is counted once.
     expect(stats.landmarksOverTime[stats.landmarksOverTime.length - 1]?.masteryNodes).toBe(stats.completion.mastery.done);
+    const chapter = await buildChapterData(USER, 2027, NOW);
+    expect(stats.landmarksOverTime.at(-1)?.masteryNodes).toBe(chapter.summary.masteryStepsUnlocked);
+  });
+
+  it('keeps the steps a merged event reached that the event it joined already had, as the Chronicle does', async () => {
+    const into = await inTx((tx) => createEvent(tx, USER, 'Petit Le Mans', NOW));
+    const from = await inTx((tx) => createEvent(tx, USER, 'Petit', NOW));
+    if (!from.ok || !into.ok) throw new Error('the events already exist');
+    const race = (name: string, key: string, year: number) => addRace(USER, {
+      name, hours: 1, iconicKey: key, raceDate: new Date(Date.UTC(year, 9, 1)),
+    });
+    const p24 = await race('Petit Le Mans 2024', into.event.key, 2024);
+    const p25 = await race('Petit 2025', from.event.key, 2025);
+    const p26 = await race('Petit Le Mans 2026', into.event.key, 2026);
+    // Each event reaches its own first edition before the merge: 1 and 5 March.
+    await watch(USER, p24, at(2027, 3, 1), 0, H);
+    await watch(USER, p25, at(2027, 3, 5), 0, H);
+    await watch(USER, p26, at(2027, 3, 10), 0, H);
+
+    const month = async () => (await getStatistics(USER, { year: 2027 }, NOW)).landmarksOverTime.find((point) => point.month === '2027-03')!;
+    const before = await month();
+    const chapterBefore = await buildChapterData(USER, 2027, NOW);
+    expect(before.masteryNodes).toBe(chapterBefore.summary.masteryStepsUnlocked);
+
+    await inTx((tx) => mergeEvents(tx, USER, from.event.key, into.event.key, at(2027, 4, 1)));
+
+    // Petit's own first edition on 5 March was carried nowhere — the survivor
+    // had its own — so it is still a step reached that day, here and in the chapter.
+    const after = await month();
+    const chapter = await buildChapterData(USER, 2027, NOW);
+    expect(after.masteryNodes).toBeGreaterThanOrEqual(before.masteryNodes);
+    expect(chapter.mastery.steps).toContainEqual(expect.objectContaining({ treeKey: `event:${from.event.key}`, nodeKey: 'edition_1' }));
+    expect(after.masteryNodes).toBe(chapter.summary.masteryStepsUnlocked);
+    expect((await getStatistics(USER, { year: 2027 }, NOW)).landmarksOverTime.at(-1)?.masteryNodes).toBe(chapter.summary.masteryStepsUnlocked);
   });
 
   it('keeps records within the filters, and within a year', async () => {

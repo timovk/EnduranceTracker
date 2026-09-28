@@ -23,7 +23,7 @@ import {
   wrappedCardLine, wrappedOpeningLine, yearToDateFact,
 } from '@/lib/copy/tone';
 import type { ChronicleChapterV1, WrappedCard } from '@/lib/domain/chronicle';
-import { CAREER_MILESTONES, CAREER_MILESTONES_BY_ID, MILESTONES } from '@/lib/config';
+import { BUDGET_CONFIG, CAREER_MILESTONES, CAREER_MILESTONES_BY_ID, MILESTONES } from '@/lib/config';
 
 /** A chapter's summary for the headline, with every figure at a chosen size. */
 function chapterSummary(overrides: Partial<ChronicleChapterV1['summary']>): ChronicleChapterV1['summary'] {
@@ -74,8 +74,10 @@ function everyWrappedCard(): WrappedCard[] {
     }
     cards.push({ asOf, kind: 'expeditions', count: 1, names: ['24 Hours of Le Mans'], creditedSeconds: 24 * 3_600 });
     cards.push({ asOf, kind: 'expeditions', count: 3, names: ['A', 'B', 'C'], creditedSeconds: 60 * 3_600 });
-    cards.push({ asOf, kind: 'records', records: [{ label: 'Longest session', valueText: '4h 24m' }] });
-    cards.push({ asOf, kind: 'records', records: [{ label: 'Longest session', valueText: '4h 24m' }, { label: 'Most in a day', valueText: '6h 00m' }, { label: 'Most Story Completes in a year', valueText: '5' }] });
+    cards.push({ asOf, kind: 'records', total: 1, records: [{ label: 'Longest session', valueText: '4h 24m' }] });
+    const threeRecords = [{ label: 'Longest session', valueText: '4h 24m' }, { label: 'Most in a day', valueText: '6h 00m' }, { label: 'Most Story Completes in a year', valueText: '5' }];
+    cards.push({ asOf, kind: 'records', total: 3, records: threeRecords });
+    cards.push({ asOf, kind: 'records', total: 10, records: threeRecords });
     for (const beganOn of [null, '2025-07-23T16:41:05.896Z']) {
       for (const sign of [-1, 0, 1]) {
         cards.push({
@@ -405,7 +407,14 @@ describe('tone', () => {
       'Reached around 21:45 on 14 June 2030, during a stint of 24 Hours of Le Mans 2030 '
         + '(worked out from when the stint was logged)',
     );
+    // Rounding never carries a moment into the next day, where no chapter or list puts it.
     expect(precisionLabel('INTERPOLATED', new Date(2030, 5, 14, 23, 58))).toBe(
+      'Reached around 23:55 on 14 June 2030 (worked out from when the stint was logged)',
+    );
+    expect(precisionLabel('INTERPOLATED', new Date(new Date(2031, 0, 1).getTime() - 1))).toBe(
+      'Reached around 23:55 on 31 December 2030 (worked out from when the stint was logged)',
+    );
+    expect(precisionLabel('INTERPOLATED', new Date(2030, 5, 15, 0, 2))).toBe(
       'Reached around 00:00 on 15 June 2030 (worked out from when the stint was logged)',
     );
     expect(precisionLabel('STINT', new Date(2030, 5, 14, 21, 50))).toBe('Reached with the stint logged at 21:50 on 14 June 2030');
@@ -415,7 +424,13 @@ describe('tone', () => {
 
   it('states the year so far as a fact, with no target in it', () => {
     expect(yearToDateFact(2026, 36 * 3_600)).toBe('2026 so far: 36 hours');
-    expect(yearToDateFact(2026, 36.6 * 3_600)).toBe('2026 so far: 37 hours');
+    // Never rounded up: the hours shown are hours watched.
+    expect(yearToDateFact(2026, 36.6 * 3_600)).toBe('2026 so far: 36 hours');
+    expect(yearToDateFact(2026, BUDGET_CONFIG.annualHours * 3_600 - 1)).toBe(`2026 so far: ${BUDGET_CONFIG.annualHours - 1} hours`);
+    expect(yearToDateFact(2026, (BUDGET_CONFIG.annualHours - 0.4) * 3_600)).toBe(`2026 so far: ${BUDGET_CONFIG.annualHours - 1} hours`);
+    expect(yearToDateFact(2026, BUDGET_CONFIG.annualHours * 3_600)).toBe(`2026 so far: ${BUDGET_CONFIG.annualHours} hours`);
+    expect(yearToDateFact(2026, 5_399)).toBe('2026 so far: 1.4 hours');
+    expect(yearToDateFact(2026, 0.3 * 3_600)).toBe('2026 so far: 0.3 hours');
     expect(yearToDateFact(2026, 5_400)).toBe('2026 so far: 1.5 hours');
     expect(yearToDateFact(2026, 3_600)).toBe('2026 so far: 1 hour');
     expect(yearToDateFact(2026, 0)).toBe('2026 so far: 0 hours');

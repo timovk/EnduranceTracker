@@ -36,7 +36,7 @@ import {
 } from '@/lib/domain/career-timeline';
 import { editionIdentity } from '@/lib/domain/edition';
 import {
-  buildExpeditionSummarySnapshot, checkpointOfKey, checkpointSchedule, checkpointsCrossedBy, checkpointsPayXp,
+  buildExpeditionSummarySnapshot, careerStartOf, checkpointOfKey, checkpointSchedule, checkpointsCrossedBy, checkpointsPayXp,
   checkpointsSatisfied, coverageReaches, expeditionDedupeKey, expeditionFigures, isExpedition, nextCheckpoint,
   parseExpeditionSummarySnapshot, EXPEDITION_SUMMARY_SCHEMA_VERSION,
   type ExpeditionFigures, type ExpeditionSummarySnapshotV1, type ExpeditionSummaryUnlocks,
@@ -49,7 +49,7 @@ import type {
 } from './contracts';
 import { getBudgetSnapshot } from './budget-engine';
 import { isCareerMilestoneRung, listStintCareerMilestones } from './career-milestone-engine';
-import { loadRaceTimelineInputs, loadTimelineInputs, type TimelineInputs } from './career-timeline-engine';
+import { loadRaceTimelineInputs, loadTimelineInputs, previousStintInstant, type TimelineInputs } from './career-timeline-engine';
 import { eventHref, getMasteryForChampionship } from './mastery-engine';
 import { storyBonusKey } from './progression-resync';
 import { reconstructStintUnlocks } from './stint-unlocks';
@@ -846,7 +846,10 @@ export async function getExpeditionView(userId: string, raceId: string, now: Dat
     const percent = checkpointOfKey(raceId, row.dedupeKey);
     return percent === null ? [] : [[percent, row.amount]];
   }));
-  const figures = expeditionFigures(history, speed, now, held);
+  // Started where the career replay starts it: cut at the stint logged just before its first, whatever race that was.
+  const firstRow = inputs.sessions.find((session) => session.id === history.stints[0]?.sessionId);
+  const previous = firstRow === undefined ? null : await previousStintInstant(prisma, userId, firstRow);
+  const figures = expeditionFigures(history, speed, now, held, careerStartOf(history, previous));
 
   const [budget, mastery, event] = await Promise.all([
     getBudgetSnapshot(userId, now).catch(() => null),

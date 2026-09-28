@@ -32,7 +32,7 @@ import type {
   GroupStat, LongestSessionView, RecordsView, StatisticsView as Stats, StatsFilterOptions, YearComparisonView,
 } from '@/lib/engines/stats-engine';
 import { CAREER_STATS_SHAPE } from '@/lib/config';
-import { formatDuration } from '@/lib/domain/time';
+import { formatDuration, formatPercentFloor } from '@/lib/domain/time';
 import { AXIS_PROPS, CHART_COLORS } from '@/components/charts/chart-theme';
 import { ChartTooltip } from '@/components/charts/chart-tooltip';
 import { CumulativeLine } from '@/components/charts/cumulative-line';
@@ -441,14 +441,14 @@ function Overview({ stats }: { stats: Stats }) {
               <Stat label="Races completed (Story Complete)" value={formatNumber(races.racesStoryComplete)} size="sm" tone="accent" />
               <Stat
                 label="Story Complete rate"
-                value={rate === null ? '—' : `${rate.toFixed(0)}%`}
+                value={rate === null ? '—' : formatPercentFloor(rate)}
                 sub={rate === null ? `Needs ${numberWord(CAREER_STATS_SHAPE.rateMinimumRaces)} races` : 'of the races started'}
                 size="sm"
                 tone="muted"
               />
               <Stat
                 label="Average race completion"
-                value={stats.averageRaceCompletionPercent === null ? '—' : `${stats.averageRaceCompletionPercent.toFixed(0)}%`}
+                value={stats.averageRaceCompletionPercent === null ? '—' : formatPercentFloor(stats.averageRaceCompletionPercent)}
                 sub="of each race watched"
                 size="sm"
                 tone="muted"
@@ -462,7 +462,7 @@ function Overview({ stats }: { stats: Stats }) {
             </div>
             {rate !== null ? (
               <p className="border-t border-hairline pt-3 text-[0.6875rem] text-ink-faint">
-                Of the races you started{year !== undefined ? ` in ${year}` : ''}, {rate.toFixed(0)}% are complete stories.
+                Of the races you started{year !== undefined ? ` in ${year}` : ''}, {formatPercentFloor(rate)} are complete stories.
               </p>
             ) : null}
           </PanelBody>
@@ -860,7 +860,7 @@ function EventTable({ rows }: { rows: GroupStat[] }) {
                       )}
                     </td>
                     <td className="timing px-4 py-2 text-right text-xs text-ink-muted">{formatHours(row.realHours)}</td>
-                    <td className="timing px-4 py-2 text-right text-xs text-ink-dim">{(row.share * 100).toFixed(0)}%</td>
+                    <td className="timing px-4 py-2 text-right text-xs text-ink-dim">{formatPercentFloor(row.share * 100)}</td>
                     <td className="timing px-4 py-2 text-right text-xs text-ink-dim">{row.racesExperienced}</td>
                     <td className="timing px-4 py-2 text-right text-xs text-ink-dim">{row.storyCompletes}</td>
                   </tr>

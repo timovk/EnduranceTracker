@@ -26,6 +26,7 @@ import type { LocalWindow } from './calendar';
 import { clipToWindow, dayKeyToLocalDate, localDayKey, splitAcrossLocalDays, weekKeyForDay } from './calendar';
 import type { CareerTimeline, RaceHistory, StintEvent, TimelineRaceRow } from './career-timeline';
 import { coverageAt } from './career-timeline';
+import { percentTenths } from './time';
 
 export interface WindowOptions {
   weekStartsOn: number;
@@ -495,8 +496,14 @@ function chapterBeganNote(year: number, began: Date): string {
   return `Your ${year} chapter began on ${began.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' })}`;
 }
 
-function differenceOf(a: number | null, b: number | null): number | null {
-  return a === null || b === null ? null : b - a;
+/**
+ * `b − a`. A percentage is compared as the two figures are shown — in whole
+ * tenths, floored (`percentTenths`) — so "92.4% → 83.6%" always reads "8.8
+ * points lower", never a tenth the two printed figures do not show.
+ */
+function differenceOf(a: number | null, b: number | null, unit: CompareRow['unit']): number | null {
+  if (a === null || b === null) return null;
+  return unit === 'percent-points' ? (percentTenths(b) - percentTenths(a)) / 10 : b - a;
 }
 
 /**
@@ -559,7 +566,7 @@ export function compareSummaries(
       unit: definition.unit,
       a: valueA,
       b: valueB,
-      difference: differenceOf(valueA, valueB),
+      difference: differenceOf(valueA, valueB, definition.unit),
       percentChange,
       note,
     };
@@ -587,13 +594,14 @@ export function compareSummaries(
         // share to say something; below that, only the hours themselves.
         const valueA = inShares ? (entry.a?.share ?? 0) * 100 : entry.a?.creditedSeconds ?? 0;
         const valueB = inShares ? (entry.b?.share ?? 0) * 100 : entry.b?.creditedSeconds ?? 0;
+        const unit: CompareRow['unit'] = inShares ? 'percent-points' : 'seconds';
         return {
           id: entry.id,
           label: entry.name,
-          unit: inShares ? 'percent-points' : 'seconds',
+          unit,
           a: valueA,
           b: valueB,
-          difference: valueB - valueA,
+          difference: differenceOf(valueA, valueB, unit)!,
           percentChange: null,
           note: null,
         };

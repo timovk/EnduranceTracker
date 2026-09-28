@@ -47,6 +47,22 @@ export function dayKeyToLocalDate(key: string): Date {
   return new Date(year ?? 1970, (month ?? 1) - 1, day ?? 1, 0, 0, 0, 0);
 }
 
+/** Local midnight starting the day after `date`. */
+export function nextDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1, 0, 0, 0, 0);
+}
+
+/**
+ * The length of a local day in seconds: 23, 24 or 25 hours. No day holds more
+ * viewing than this, so a day's credited time is capped at it wherever a day
+ * is shown on its own: more is batch logging, which crowds several stints'
+ * windows into a few minutes, not a longer day.
+ */
+export function dayLengthSeconds(dayKey: string): number {
+  const start = dayKeyToLocalDate(dayKey);
+  return (nextDay(start).getTime() - start.getTime()) / 1000;
+}
+
 /** A calendar year in local time: 1 January at midnight to the next 1 January. */
 export function yearWindow(year: number): LocalWindow {
   return { start: new Date(year, 0, 1, 0, 0, 0, 0), end: new Date(year + 1, 0, 1, 0, 0, 0, 0) };

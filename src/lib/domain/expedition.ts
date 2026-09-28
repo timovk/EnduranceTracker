@@ -138,7 +138,7 @@ export interface ExpeditionFigures {
   creditedSeconds: number;
   rewatchSeconds: number;
   sessions: number;
-  /** The window start of the first stint. */
+  /** The window start of the first stint, cut at the stint before it in the career (R6). */
   startedAt: Date | null;
   /** From the start to completion (or to now), never less than the time credited. */
   elapsedSeconds: number | null;
@@ -149,6 +149,20 @@ export interface ExpeditionFigures {
 }
 
 /**
+ * Where an Expedition started: its first stint's window start, cut at the
+ * stint before it in the whole career (R6), as the career replay starts it.
+ * `previousInstant` is that stint's `watchedAt` (null for the career's first
+ * stint). One race's replay alone cannot know it, and a first stint
+ * batch-logged a minute after another race's would otherwise start hours
+ * before the career replay, the records and the Chronicle say it did.
+ */
+export function careerStartOf(history: RaceHistory, previousInstant: Date | null): Date | null {
+  const first = history.stints[0];
+  if (first === undefined) return null;
+  return previousInstant !== null && previousInstant > first.nominalStartsAt ? previousInstant : first.nominalStartsAt;
+}
+
+/**
  * The live figures of an Expedition, from one race's replay.
  *
  * `held` maps each checkpoint whose XP the ledger holds for this race to the
@@ -156,25 +170,30 @@ export interface ExpeditionFigures {
  * while Expedition Mode was off is reached without being held, and one paid
  * under an earlier schedule keeps the amount it was paid, which is the figure
  * shown for it.
+ *
+ * `startedAt` is where the Expedition started in the career (`careerStartOf`);
+ * without it, the race's own replay says, which is the same unless the first
+ * stint was logged right after another race's.
  */
 export function expeditionFigures(
   history: RaceHistory,
   avgSpeed: number,
   now: Date,
   held: ReadonlyMap<number, number> = new Map(),
+  startedAt: Date | null = history.startedAt,
 ): ExpeditionFigures {
   const runtimeSec = history.race.runtimeSec;
   const coverageSec = history.coverageSeconds;
   const remaining = estimateRemaining(coverageSec, runtimeSec, avgSpeed);
 
   let elapsedSeconds: number | null = null;
-  if (history.startedAt !== null) {
+  if (startedAt !== null) {
     const completing = history.completingSessionId === null
       ? null
       : history.stints.find((stint) => stint.sessionId === history.completingSessionId) ?? null;
     const end = history.storyCompletedAt ?? now;
     const credited = completing?.raceCreditedAfterSeconds ?? history.creditedSeconds;
-    elapsedSeconds = Math.round(Math.max(0, (end.getTime() - history.startedAt.getTime()) / 1000, credited));
+    elapsedSeconds = Math.round(Math.max(0, (end.getTime() - startedAt.getTime()) / 1000, credited));
   }
 
   return {
@@ -187,7 +206,7 @@ export function expeditionFigures(
     creditedSeconds: history.creditedSeconds,
     rewatchSeconds: history.rewatchCreditedSeconds,
     sessions: history.sessionCount,
-    startedAt: history.startedAt,
+    startedAt,
     elapsedSeconds,
     storyCompletedAt: history.storyCompletedAt,
     checkpoints: checkpointSchedule(runtimeSec).map((checkpoint) => {
@@ -352,8 +371,10 @@ function recordsSetBy(progression: readonly RecordEvent[], raceId: string, compl
  *
  * Every time figure comes from the race's replay stopped at the stint that
  * completed its story, so stints logged after it (a re-watch of the podium)
- * change nothing. The start is the first stint's own window start, which does
- * not depend on the stints of other races. XP is what the ledger holds for
+ * change nothing. The start is where the career replay starts the race: its
+ * first stint's window, cut at the stint before it in the career (R6), so the
+ * card's start to finish is the one its own records, the Records tab and the
+ * Chronicle measure. XP is what the ledger holds for
  * those stints, the Story Complete bonus and the checkpoints: sums of real
  * rows, so they are exact. The event's standing is read from the career
  * replay at the completion; records are those the race held by then.
@@ -372,7 +393,7 @@ export function buildExpeditionSummarySnapshot(input: ExpeditionSummaryInput): E
 
   const stints: readonly StintEvent[] = history.stints.slice(0, completingIndex + 1);
   const completedAt = history.storyCompletedAt;
-  const startedAt = first.nominalStartsAt;
+  const startedAt = input.timeline.races.get(race.id)?.startedAt ?? first.nominalStartsAt;
   const creditedSeconds = completing.raceCreditedAfterSeconds;
   const uniqueCoverageSeconds = completing.coverageAfterSeconds;
   const rewatchSeconds = Math.round(stints.reduce((sum, stint) => sum + stint.rewatchCreditedSeconds, 0));

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { EXPEDITION_CONFIG, EXPEDITION_SHAPE } from '@/lib/config';
 import {
-  buildExpeditionSummarySnapshot, checkpointOfKey, checkpointSchedule, checkpointsCrossedBy, checkpointsPayXp,
+  buildExpeditionSummarySnapshot, careerStartOf, checkpointOfKey, checkpointSchedule, checkpointsCrossedBy, checkpointsPayXp,
   checkpointsSatisfied, checkpointTicks, coverageReaches, eventStandingAt, expeditionDedupeKey, expeditionFigures,
   expeditionSummarySnapshotSchema, isExpedition, nextCheckpoint, parseExpeditionSummarySnapshot,
   type ExpeditionSummaryInput,
@@ -302,6 +302,38 @@ describe('the Expedition Summary', () => {
     expect(snapshot.creditedSeconds).toBe(12 * H);
     expect(snapshot.elapsedSeconds).toBe(12 * H);
     expect(snapshot.calendarDays).toBe(1);
+  });
+
+  it('starts where the career starts it, when its first stint was logged a minute after another race\'s', () => {
+    const other = race('other', { hours: 6 });
+    const ten = race('ten', { hours: 10 });
+    const sessions = [
+      stint(other, '2026-05-09T20:00', { from: '0:00', to: '2:00' }),
+      // Batch-logged: its window is cut at the other race's stint, a minute long.
+      stint(ten, '2026-05-09T20:01', { from: '0:00', to: '5:00' }),
+      stint(ten, '2026-05-11T21:00', { from: '5:00', to: '10:00' }),
+    ];
+    const timeline = career([other, ten], sessions);
+    const started = timeline.races.get('ten')!.startedAt!;
+    expect(started).toEqual(localTime('2026-05-09T20:00'));
+    const completed = localTime('2026-05-11T21:00');
+    const elapsed = (completed.getTime() - started.getTime()) / 1000;
+
+    // The race's own replay alone would start it five hours before its first stint was logged.
+    const alone = replayRace(ten, sessions);
+    expect(careerStartOf(alone, null)).toEqual(localTime('2026-05-09T15:01'));
+    expect(careerStartOf(alone, localTime('2026-05-09T20:00'))).toEqual(started);
+
+    // The permanent summary, the page and the records all measure from the same start.
+    const snapshot = buildExpeditionSummarySnapshot(inputFor(alone, timeline));
+    expect(snapshot).toMatchObject({ startedAt: started.toISOString(), elapsedSeconds: elapsed, calendarDays: 3 });
+    const figures = expeditionFigures(alone, 1, localTime('2026-06-01T12:00'), new Map(), careerStartOf(alone, localTime('2026-05-09T20:00')));
+    expect(figures).toMatchObject({ startedAt: started, elapsedSeconds: elapsed });
+    const records = computeRecordProgression(timeline, careerRecordOptions(1));
+    const best = (kind: string) => records.filter((record) => record.kind === kind && record.raceId === 'ten').at(-1)?.value;
+    expect(best('longest-start-to-finish')).toBe(elapsed);
+    expect(best('fastest-long-race-completion')).toBe(elapsed);
+    expect(snapshot.records.find((record) => record.kind === 'longest-start-to-finish')?.valueText).toBe('2 days 1h');
   });
 
   it('is only ever built for a story that is complete', () => {

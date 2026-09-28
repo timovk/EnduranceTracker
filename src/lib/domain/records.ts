@@ -19,7 +19,9 @@
 
 import { CAREER_STATS_SHAPE, EXPEDITION_SHAPE } from '@/lib/config';
 import type { LocalWindow } from './calendar';
-import { clipToWindow, dayKeyToLocalDate, localDayKey, localMonthKey, splitAcrossLocalDays } from './calendar';
+import {
+  clipToWindow, dayKeyToLocalDate, dayLengthSeconds, localDayKey, localMonthKey, nextDay, splitAcrossLocalDays,
+} from './calendar';
 import type { CareerTimeline, StintEvent, TimelineRaceRow } from './career-timeline';
 import { longestConsecutiveRun } from './edition';
 import { formatElapsed } from './time';
@@ -146,17 +148,6 @@ class Best {
 
 const higher = (candidate: number, best: number) => candidate > best;
 const lower = (candidate: number, best: number) => candidate < best;
-
-/** Local midnight starting the day after `date`. */
-function nextDay(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1, 0, 0, 0, 0);
-}
-
-/** The length of a local day in seconds: 23, 24 or 25 hours. */
-function dayLengthSeconds(dayKey: string): number {
-  const start = dayKeyToLocalDate(dayKey);
-  return (nextDay(start).getTime() - start.getTime()) / 1000;
-}
 
 /**
  * Every improvement of every record, in chronological order.

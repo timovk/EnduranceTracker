@@ -26,7 +26,7 @@
 import { z } from 'zod';
 import { CAREER_STATS_SHAPE, CHRONICLE_SHAPE } from '@/lib/config';
 import type { LocalWindow } from './calendar';
-import { clipToWindow, localDaysSpanned, weekLabel, yearWindow } from './calendar';
+import { clipToWindow, dayLengthSeconds, localDaysSpanned, weekLabel, yearWindow } from './calendar';
 import type { CareerTimeline, RaceHistory } from './career-timeline';
 import { coverageAt } from './career-timeline';
 import { editionIdentityOf } from './edition';
@@ -161,6 +161,10 @@ export const chronicleChapterSchema = z.object({
     levelsReached: z.array(z.object({ level: z.number(), at: z.string() })),
     titlesReached: z.array(z.string()),
   }),
+  /**
+   * `activeFrom`: when the career began, when it began in that year (the first
+   * stint's window start); otherwise the first stint instant in it.
+   */
   previousYear: z.object({
     year: z.number(), activeFrom: z.string().nullable(), careerBeganInYear: z.boolean(),
     creditedSeconds: z.number(), racesExperienced: z.number(), storyCompletes: z.number(), xpEarned: z.number(),
@@ -304,9 +308,24 @@ export function chapterWindowOptions(weekStartsOn: number) {
   };
 }
 
-/** The local year of the career's first stint: Career Year 1. Null for a career with no stints. */
+/**
+ * The career's first moment: where its first stint's window starts. Every
+ * later window is cut at the stint before it (R6), so nothing in the career
+ * is earlier. A first stint logged at 00:30 on 1 January that began on
+ * 31 December began the career in the old year. Null for a career with no
+ * stints.
+ */
+export function careerStartsAt(timeline: CareerTimeline): Date | null {
+  return timeline.stints[0]?.startsAt ?? null;
+}
+
+/**
+ * The local year of the career's first moment: Career Year 1. The year a
+ * first stint reaches back into holds viewing time, so it is a chapter of its
+ * own, as it is a year in Career Statistics. Null for a career with no stints.
+ */
 export function firstActivityYear(timeline: CareerTimeline): number | null {
-  return timeline.stints[0]?.watchedAt.getFullYear() ?? null;
+  return careerStartsAt(timeline)?.getFullYear() ?? null;
 }
 
 /**
@@ -322,9 +341,12 @@ export function activeYears(timeline: CareerTimeline): Set<number> {
   return years;
 }
 
-/** Whether the career began inside a year rather than on its first moment: its first year is not a whole one. */
+/**
+ * When the career began, if it began inside `year` rather than on its first
+ * moment: that year is not a whole one. Null for any other year.
+ */
 export function careerBeganInYear(timeline: CareerTimeline, year: number): Date | null {
-  const first = timeline.stints[0]?.watchedAt ?? null;
+  const first = careerStartsAt(timeline);
   if (first === null || first.getFullYear() !== year) return null;
   return first > yearWindow(year).start ? first : null;
 }
@@ -419,7 +441,12 @@ export function buildChapter(input: ChapterInput): ChronicleChapterV1 {
         coverageSeconds: Math.min(coverageAt(longestRaceHistory, lastInstant), summary.longestRace.runtimeSec),
       };
 
-  const day = largest([...summary.days].map(([key, bucket]) => [key, bucket.creditedSeconds] as [string, number]));
+  // A day never holds more than its own length: batch logging can crowd more
+  // credited time into one, and the day is then read as full, exactly as the
+  // most-in-a-day record reads it.
+  const day = largest([...summary.days].map(([key, bucket]) => (
+    [key, Math.min(bucket.creditedSeconds, dayLengthSeconds(key))] as [string, number]
+  )));
   const week = largest([...summary.weeks].map(([key, bucket]) => [key, bucket.creditedSeconds] as [string, number]));
   const month = largest([...summary.months].map(([key, bucket]) => [key, bucket.creditedSeconds] as [string, number]));
   const weekShape = week === null ? null : weekLabel(week[0], input.weekStartsOn, window);
@@ -680,7 +707,8 @@ function beginningsOf(timeline: CareerTimeline, window: LocalWindow): ChronicleC
   ));
   const editionRace = firstEdition === undefined ? undefined : timeline.racesById.get(firstEdition.raceId);
   return {
-    firstStint: first === undefined ? null : { at: iso(first.watchedAt), raceId: first.raceId, raceName: nameOf(first.raceId) },
+    // The chronicle begins where the first stint's window does: its first chapter may be the year that stint reached back into.
+    firstStint: first === undefined ? null : { at: iso(first.startsAt), raceId: first.raceId, raceName: nameOf(first.raceId) },
     firstStoryComplete: firstStory === undefined || !inYear(firstStory.watchedAt, window)
       ? null
       : { at: iso(firstStory.watchedAt), raceId: firstStory.raceId, raceName: nameOf(firstStory.raceId) },
@@ -718,11 +746,15 @@ function notableRaces(
     used.add(raceId);
     picked.push({ raceId, name: race.name, reason, detail });
   };
-  /** The best candidate by `value` (higher wins), ties to the earlier moment, then the lower id. */
-  const best = <T extends { raceId: string; value: number; at: Date }>(candidates: readonly T[]): T | null => {
+  /**
+   * The best candidate by `value` (higher wins), ties to the earlier moment,
+   * then the lower id. Races already listed are passed over, unless the step
+   * names a superlative that only the true best may carry (`skipUsed` false).
+   */
+  const best = <T extends { raceId: string; value: number; at: Date }>(candidates: readonly T[], skipUsed = true): T | null => {
     let chosen: T | null = null;
     for (const candidate of candidates) {
-      if (used.has(candidate.raceId)) continue;
+      if (skipUsed && used.has(candidate.raceId)) continue;
       if (
         chosen === null
         || candidate.value > chosen.value
@@ -739,11 +771,18 @@ function notableRaces(
   const longest = best(completed);
   if (longest !== null) add(longest.raceId, 'longest-story', `The longest race you completed in ${year}: ${formatDuration(longest.value)}`);
 
-  // 2. The most watched, by credited time inside the year.
+  // 2. The most watched, by credited time inside the year: the race that
+  // truly is, never the runner-up. When it is already listed as the longest
+  // race completed — the usual case, a 24-hour race — its line says so too,
+  // and the slot goes to the next step.
   const watched = best([...tallies.values()]
     .filter((tally) => tally.creditedSeconds > 0)
-    .map((tally) => ({ raceId: tally.history.race.id, value: tally.creditedSeconds, at: tally.history.firstStintAt ?? window.start })));
-  if (watched !== null) add(watched.raceId, 'most-watched', `Your most-watched race of ${year}: ${formatDuration(watched.value)}`);
+    .map((tally) => ({ raceId: tally.history.race.id, value: tally.creditedSeconds, at: tally.history.firstStintAt ?? window.start })), false);
+  if (watched !== null) {
+    const listed = picked.find((entry) => entry.raceId === watched.raceId);
+    if (listed !== undefined) listed.detail = `${listed.detail}, and your most-watched: ${formatDuration(watched.value)}`;
+    else add(watched.raceId, 'most-watched', `Your most-watched race of ${year}: ${formatDuration(watched.value)}`);
+  }
 
   // 3. Every Expedition completed, at most two.
   let expeditionsAdded = 0;
@@ -793,14 +832,18 @@ function notableRaces(
 function previousYearOf(input: ChapterInput, firstYear: number | null): ChronicleChapterV1['previousYear'] {
   const year = input.year - 1;
   if (firstYear === null || year < firstYear) return null;
-  const began = careerBeganInYear(input.timeline, year) !== null;
+  // When the career began inside the year before, `activeFrom` says when: the
+  // first stint's window start, which is the day "Your {year} chapter began
+  // on" names — also for a year that holds only time a stint reached back into.
+  const beganAt = careerBeganInYear(input.timeline, year);
+  const began = beganAt !== null;
 
   const frozen = input.previousYearFrozen;
   if (frozen !== null && frozen.year === year) {
     if (frozen.summary.sessions === 0 && frozen.summary.creditedSeconds === 0) return null;
     return {
       year,
-      activeFrom: frozen.window.activeFrom,
+      activeFrom: beganAt !== null ? iso(beganAt) : frozen.window.activeFrom,
       careerBeganInYear: began,
       creditedSeconds: frozen.summary.creditedSeconds,
       racesExperienced: frozen.summary.racesExperienced,
@@ -815,7 +858,7 @@ function previousYearOf(input: ChapterInput, firstYear: number | null): Chronicl
   if (summary.sessions === 0 && summary.creditedSeconds === 0) return null;
   return {
     year,
-    activeFrom: summary.activeFrom === null ? null : iso(summary.activeFrom),
+    activeFrom: beganAt !== null ? iso(beganAt) : summary.activeFrom === null ? null : iso(summary.activeFrom),
     careerBeganInYear: began,
     creditedSeconds: summary.creditedSeconds,
     racesExperienced: summary.racesExperienced,
@@ -871,7 +914,8 @@ export type WrappedCard = CardBase & (
   | { kind: 'xp'; xpEarned: number; levelStart: number; levelEnd: number; levelsGained: number }
   | { kind: 'landmarks'; achievements: number; milestones: number; masterySteps: number; highlights: string[] }
   | { kind: 'expeditions'; count: number; names: string[]; creditedSeconds: number }
-  | { kind: 'records'; records: { label: string; valueText: string }[] }
+  /** `total` is every record the year set; `records`, the first few of them named on the card. */
+  | { kind: 'records'; total: number; records: { label: string; valueText: string }[] }
   | { kind: 'compared'; year: number; previousYear: number; beganOn: string | null; rows: WrappedComparison[] }
   | { kind: 'closing'; year: number }
 );
@@ -1007,10 +1051,10 @@ export function buildWrappedCards(
     });
   }
 
-  // 13. Personal records set, the first few in the order records are listed.
+  // 13. Personal records set: how many, and the first few in the order records are listed.
   if (chapter.records.length > 0) {
     cards.push({
-      asOf, kind: 'records',
+      asOf, kind: 'records', total: chapter.records.length,
       records: chapter.records.slice(0, CHRONICLE_SHAPE.wrappedRecordsShown).map((record) => ({ label: record.label, valueText: record.valueText })),
     });
   }

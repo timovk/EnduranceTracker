@@ -27,6 +27,7 @@ import {
   getExpeditionSummary, getExpeditionView, reconcileExpedition,
 } from '@/lib/engines/expedition-engine';
 import { deleteRace, deleteViewingSession } from '@/lib/engines/session-engine';
+import { getRecords } from '@/lib/engines/stats-engine';
 import { settleLedger, revokeXpByDedupeKeys } from '@/lib/engines/xp-ledger';
 import { updateRaceAction } from '@/lib/server/actions';
 import { setExpeditionModeAction } from '@/lib/server/career-actions';
@@ -374,6 +375,30 @@ describe('the Expedition Summary', () => {
     await stint(race, 23, 24, at(16, 21));
     const again = await prisma.expeditionSummary.findMany({ where: { userId: USER } });
     expect(again).toEqual(rows);
+  });
+
+  it('starts where the career starts it, on the page, the summary and the records, when its first stint was batch-logged', async () => {
+    const other = await addRace(USER, { name: '6 Hours of Other', hours: 6 });
+    const ten = await addRace(USER, { name: '10 Hours of Batch', hours: 10 });
+    await stint(other, 0, 2, at(9, 20, 0));
+    // Logged a minute after the other race's stint: its window is cut to that minute.
+    await stint(ten, 0, 5, at(9, 20, 1));
+    await stint(ten, 5, 10, at(11, 21, 0));
+
+    const started = at(9, 20, 0);
+    const elapsed = (at(11, 21, 0).getTime() - started.getTime()) / 1000;
+    const view = await getExpeditionView(USER, ten, at(20, 12));
+    expect(view!.figures).toMatchObject({ startedAt: started, elapsedSeconds: elapsed });
+
+    const row = await prisma.expeditionSummary.findFirstOrThrow({ where: { userId: USER, raceId: ten } });
+    expect(row.startedAt).toEqual(started);
+    const snapshot = expeditionSummarySnapshotSchema.parse(row.snapshot);
+    expect(snapshot).toMatchObject({ startedAt: started.toISOString(), elapsedSeconds: elapsed, calendarDays: 3 });
+    const records = await getRecords(USER, {});
+    for (const kind of ['longest-start-to-finish', 'fastest-long-race-completion'] as const) {
+      expect(records.records.find((record) => record.kind === kind)?.value).toBe(elapsed);
+    }
+    expect(snapshot.records.find((record) => record.kind === 'fastest-long-race-completion')?.valueText).toBe('2 days 1h');
   });
 
   it('the summary survives deleting the completing stint and deleting the race', async () => {

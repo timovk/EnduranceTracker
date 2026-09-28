@@ -149,6 +149,32 @@ export async function loadRaceTimelineInputs(
   return { race: toTimelineRaceRow(race), sessions };
 }
 
+/**
+ * The instant of the stint just before `stint` in the career's canonical
+ * order, whatever race it was of; null for the career's first stint. This is
+ * where R6 cuts `stint`'s window, so one race's replay can start where the
+ * career replay starts it without replaying the career. One indexed read.
+ */
+export async function previousStintInstant(
+  db: Tx,
+  userId: string,
+  stint: { id: string; watchedAt: Date; createdAt: Date },
+): Promise<Date | null> {
+  const previous = await db.raceViewingSession.findFirst({
+    where: {
+      userId,
+      OR: [
+        { watchedAt: { lt: stint.watchedAt } },
+        { watchedAt: stint.watchedAt, createdAt: { lt: stint.createdAt } },
+        { watchedAt: stint.watchedAt, createdAt: stint.createdAt, id: { lt: stint.id } },
+      ],
+    },
+    orderBy: [{ watchedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+    select: { watchedAt: true },
+  });
+  return previous?.watchedAt ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // The fingerprint
 // ---------------------------------------------------------------------------

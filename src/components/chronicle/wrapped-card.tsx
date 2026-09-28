@@ -51,7 +51,7 @@ function anatomy(card: Card): { label: string; hero: string; unit?: string } {
     case 'expeditions':
       return { label: 'Expeditions completed', hero: formatNumber(card.count) };
     case 'records':
-      return { label: 'Personal records set', hero: formatNumber(card.records.length) };
+      return { label: 'Personal records set', hero: formatNumber(card.total) };
     case 'compared':
       return { label: `Compared with ${card.previousYear}`, hero: `${card.previousYear} → ${card.year}` };
     case 'closing':

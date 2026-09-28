@@ -10,6 +10,8 @@ import type { CareerTimeline, TimelineRaceRow, TimelineSessionRow } from '@/lib/
 import { yearWindow } from '@/lib/domain/calendar';
 import type { CompareSide } from '@/lib/domain/window-summary';
 import { COMPARE_ROW_ORDER, compareSummaries, durationClassOf, durationClassRange, summariseWindow } from '@/lib/domain/window-summary';
+import { differencePhrase } from '@/lib/copy/tone';
+import { formatPercentFloor, percentTenths } from '@/lib/domain/time';
 import { career, localTime, race, stint } from '../helpers/timeline-fixture';
 import { inTimeZone, ZONES } from '../helpers/time-zone';
 
@@ -297,6 +299,45 @@ describe('comparing two years', () => {
     const small = twoYears(1, 3);
     const hoursOnly = compareSummaries(side(small, 2026), side(small, 2027)).championships;
     expect(hoursOnly).toEqual([expect.objectContaining({ id: 'wec', unit: 'seconds', a: 6 * H, b: 18 * H })]);
+  });
+
+  it('shows a percentage as the Chronicle does, and says the difference between the figures shown', () => {
+    const timeline = twoYears(2, 3);
+    const { rows } = compareSummaries(
+      side(timeline, 2026, { completionPercent: 92.4528 }),
+      side(timeline, 2027, { completionPercent: 83.6066 }),
+    );
+    const completion = rows.find((row) => row.key === 'completion')!;
+    // Shown floored to a tenth, as the chapter shows them: 92.4% and 83.6%.
+    expect([formatPercentFloor(completion.a!), formatPercentFloor(completion.b!)]).toEqual(['92.4%', '83.6%']);
+    // Their unrounded difference is 8.85 points; the one the figures show is 8.8.
+    expect(completion.difference).toBeCloseTo(-8.8, 9);
+    expect(differencePhrase(completion.difference!, completion.unit)).toBe('8.8 points lower');
+
+    // Nothing short of every second reads 100%, and no exact tenth is pushed down.
+    expect(formatPercentFloor(99.96)).toBe('99.9%');
+    expect(formatPercentFloor(100)).toBe('100%');
+    expect(formatPercentFloor(0.7 * 11)).toBe('7.7%');
+    expect(formatPercentFloor(49)).toBe('49%');
+    expect(formatPercentFloor(-1)).toBe('0%');
+    expect(percentTenths(49.19)).toBe(491);
+  });
+
+  it('says a difference in shares between the shares shown', () => {
+    const a = yearOf(2026, 3, 'a', 'wec');
+    const a2 = yearOf(2026, 1, 'x', 'imsa');
+    const b = yearOf(2027, 2, 'b', 'wec');
+    const b2 = yearOf(2027, 1, 'y', 'imsa');
+    const shift = (sessions: TimelineSessionRow[]) => sessions.map((s) => ({ ...s, watchedAt: new Date(s.watchedAt.getTime() + 15 * 86_400_000) }));
+    const timeline = career([...a.races, ...a2.races, ...b.races, ...b2.races], [...a.sessions, ...shift(a2.sessions), ...b.sessions, ...shift(b2.sessions)]);
+    const { championships } = compareSummaries(side(timeline, 2026), side(timeline, 2027));
+    // WEC: 75% of 2026, two thirds of 2027 — shown as 66.6%, so 8.4 points lower, not 8.3.
+    const wec = championships.find((row) => row.id === 'wec')!;
+    expect([formatPercentFloor(wec.a!), formatPercentFloor(wec.b!)]).toEqual(['75%', '66.6%']);
+    expect(differencePhrase(wec.difference!, wec.unit)).toBe('8.4 points lower');
+    const imsa = championships.find((row) => row.id === 'imsa')!;
+    expect([formatPercentFloor(imsa.a!), formatPercentFloor(imsa.b!)]).toEqual(['25%', '33.3%']);
+    expect(differencePhrase(imsa.difference!, imsa.unit)).toBe('8.3 points higher');
   });
 
   it('lines up the months of the two years', () => {

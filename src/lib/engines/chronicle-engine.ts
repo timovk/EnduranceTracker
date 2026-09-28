@@ -81,17 +81,23 @@ async function weekStartOf(db: Tx, userId: string): Promise<number> {
 // ---------------------------------------------------------------------------
 
 /**
- * Career Year 1: the local year of the earliest stint, or of the earliest
- * frozen chapter if its stints have since been deleted — a frozen year stays
- * part of the Chronicle whatever happens to the history after it. Null for a
- * career with neither.
+ * Career Year 1: the local year of the career's first moment — where the
+ * earliest stint's window starts (`firstActivityYear`), so a first stint
+ * logged at 00:30 on 1 January that began on 31 December makes the old year
+ * the first — or of the earliest frozen chapter if its stints have since been
+ * deleted: a frozen year stays part of the Chronicle whatever happens to the
+ * history after it. Null for a career with neither.
  */
 async function chronicleFirstYear(db: Tx, userId: string): Promise<number | null> {
   const [first, earliest] = await Promise.all([
-    db.raceViewingSession.findFirst({ where: { userId }, orderBy: [...CANONICAL_ORDER], select: { watchedAt: true } }),
+    db.raceViewingSession.findFirst({
+      where: { userId }, orderBy: [...CANONICAL_ORDER], select: { watchedAt: true, realSeconds: true, timelineSeconds: true },
+    }),
     db.chronicleYear.findFirst({ where: { userId }, orderBy: { year: 'asc' }, select: { year: true } }),
   ]);
-  const years = [first?.watchedAt.getFullYear(), earliest?.year].filter((year): year is number => year !== undefined);
+  // The first stint has none before it to cut its window: it starts its credited time before its instant.
+  const firstMoment = first === null ? undefined : new Date(first.watchedAt.getTime() - creditedSeconds(first) * 1000);
+  const years = [firstMoment?.getFullYear(), earliest?.year].filter((year): year is number => year !== undefined);
   return years.length === 0 ? null : Math.min(...years);
 }
 

@@ -17,7 +17,7 @@ import { Panel, PanelBody, PanelHeader, EmptyState } from '@/components/ui/primi
 import { Button, Select, Toggle } from '@/components/ui/controls';
 import { CAREER_STATS_SHAPE } from '@/lib/config';
 import { differencePhrase } from '@/lib/copy/tone';
-import { formatDuration } from '@/lib/domain/time';
+import { formatDuration, formatPercentFloor } from '@/lib/domain/time';
 import { formatNumber } from '@/lib/utils';
 import * as React from 'react';
 
@@ -30,7 +30,8 @@ function valueText(value: number | null, unit: CompareRow['unit']): string {
   if (value === null) return '—';
   if (unit === 'seconds') return formatDuration(value);
   if (unit === 'xp') return `${formatNumber(value)} XP`;
-  if (unit === 'percent-points') return `${formatNumber(value, 1)}%`;
+  // Floored to a tenth, as the Chronicle shows the same figures; the difference beside it is worked out from these.
+  if (unit === 'percent-points') return formatPercentFloor(value);
   return formatNumber(value);
 }
 

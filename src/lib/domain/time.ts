@@ -138,6 +138,26 @@ export function formatCoveragePercent(coverageSec: number, runtimeSec: number): 
   return tenths % 10 === 0 ? `${tenths / 10}%` : `${(tenths / 10).toFixed(1)}%`;
 }
 
+/**
+ * A percentage as the screens show it, in whole tenths: floored, never
+ * rounded, so a figure short of 100 never reads "100%" (the same rule as
+ * `formatCoveragePercent`), and clamped at 0. A hair is added before flooring
+ * so float error never pushes an exact tenth down (7.7 stays 77, not 76).
+ * Every screen that shows a completion, a rate or a share uses this, so the
+ * Chronicle, Career Statistics and Compare print one figure for one value,
+ * and a difference worked out from two shown figures matches them.
+ */
+export function percentTenths(value: number): number {
+  if (value >= 100) return 1000;
+  return Math.min(999, Math.floor(Math.max(0, value) * 10 + 1e-9));
+}
+
+/** "49.1%", "49%", "100%": `percentTenths`, written out. */
+export function formatPercentFloor(value: number): string {
+  const tenths = percentTenths(value);
+  return tenths >= 1000 ? '100%' : `${(tenths / 10).toLocaleString('en-GB')}%`;
+}
+
 function pad(value: number): string {
   return value.toString().padStart(2, '0');
 }

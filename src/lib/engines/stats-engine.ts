@@ -75,12 +75,15 @@
 
 import type { Prisma } from '@/generated/prisma/client';
 import {
-  ACHIEVEMENTS, CAREER_STATS_SHAPE, DURATION_CLASSES, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG, STATS_CONFIG,
+  ACHIEVEMENTS, CAREER_STATS_SHAPE, careerMilestoneOfRow, DURATION_CLASSES, RACE_TYPE_PRESETS, SEASON_PASS_CONFIG,
+  STATS_CONFIG,
 } from '@/lib/config';
 import { EXPIRED_CHALLENGE_NOTE, backlogFraming } from '@/lib/copy/tone';
 import { prisma } from '@/lib/db/client';
-import { clipToWindow, samePeriodEnd, yearWindow, type LocalWindow } from '@/lib/domain/calendar';
+import { clipToWindow, dayLengthSeconds, samePeriodEnd, yearWindow, type LocalWindow } from '@/lib/domain/calendar';
 import { coverageAt, type CareerTimeline, type RaceHistory, type TimelineRaceRow } from '@/lib/domain/career-timeline';
+import { careerBeganInYear, careerStartsAt } from '@/lib/domain/chronicle';
+import { editionIdentityOf } from '@/lib/domain/edition';
 import { monthPeriod } from '@/lib/domain/periods';
 import { averagePlaybackSpeed } from '@/lib/domain/playback';
 import { levelFromXp, prestigeForLevel, titleForLevel, totalXpForLevel } from '@/lib/domain/progression';
@@ -95,7 +98,7 @@ import {
   type Bucket, type CompareGroupRow, type CompareRow, type CompareSide, type GroupRow, type StintRef, type WindowSummary,
 } from '@/lib/domain/window-summary';
 import { getCareerTimeline } from './career-timeline-engine';
-import { eventHref } from './mastery-engine';
+import { carriedEventStepCopies, eventHref } from './mastery-engine';
 
 // ===========================================================================
 // The filter
@@ -1460,8 +1463,12 @@ function buildCadence(scope: StatsScope, monthly: MonthlyStat[], years: YearStat
     (best, year) => (best === null || year.realSeconds > best.realSeconds ? year : best),
     null,
   );
+  // A day holds at most its own length: batch logging can crowd more credited
+  // time into one, which is read as a full day, as the most-in-a-day record
+  // and the Chronicle read it.
+  const dayCredited = (day: DayBucket) => Math.min(day.realSeconds, dayLengthSeconds(day.date));
   const mostActiveDayBucket = [...buckets.days.values()].reduce<DayBucket | null>(
-    (best, day) => (day.realSeconds > 0 && (best === null || day.realSeconds > best.realSeconds) ? day : best),
+    (best, day) => (day.realSeconds > 0 && (best === null || dayCredited(day) > dayCredited(best)) ? day : best),
     null,
   );
 
@@ -1487,8 +1494,8 @@ function buildCadence(scope: StatsScope, monthly: MonthlyStat[], years: YearStat
       ? null
       : {
           date: mostActiveDayBucket.date,
-          realSeconds: mostActiveDayBucket.realSeconds,
-          realHours: toHours(mostActiveDayBucket.realSeconds),
+          realSeconds: dayCredited(mostActiveDayBucket),
+          realHours: toHours(dayCredited(mostActiveDayBucket)),
           sessions: mostActiveDayBucket.sessions,
         },
   };
@@ -1685,6 +1692,39 @@ function buildCircuitStats(scope: StatsScope): CircuitStat[] {
     .sort((a, b) => b.realSeconds - a.realSeconds || a.name.localeCompare(b.name));
 }
 
+/**
+ * An event's editions in the scope, counted as the Chronicle and the event's
+ * own page count them (§3.1): distinct edition identities — two races of one
+ * year are one edition — among its races experienced in the scope, and among
+ * those whose story was completed in it. A race only glimpsed, or never
+ * watched, is no edition at all.
+ */
+function eventEditionsInScope(scope: StatsScope, eventKey: string): { experienced: number; storyComplete: number } {
+  const { timeline, summary, window } = scope;
+  const experienced = new Set<string>();
+  const storyComplete = new Set<string>();
+  for (const raceId of summary.raceIdsWatched) {
+    const history = timeline.races.get(raceId);
+    if (history === undefined || history.race.eventKey !== eventKey || history.experiencedAt === null) continue;
+    if (window === null || history.experiencedAt < window.end) {
+      experienced.add(editionIdentityOf(history.race.id, history.race.editionYear));
+    }
+  }
+  for (const entry of summary.storyCompleteList) {
+    const race = timeline.racesById.get(entry.raceId);
+    if (race !== undefined && race.eventKey === eventKey) storyComplete.add(editionIdentityOf(race.id, race.editionYear));
+  }
+  return { experienced: experienced.size, storyComplete: storyComplete.size };
+}
+
+/** "5 editions experienced, 4 Story Complete." — editions, as the event's own page counts them. */
+function eventFavouriteDetail(group: RaceGroup, editions: { experienced: number; storyComplete: number }): string {
+  const count = (n: number) => `${n} ${n === 1 ? 'edition' : 'editions'}`;
+  if (editions.experienced === 0 && editions.storyComplete === 0) return `${toHours(group.realSeconds)} hours of viewing.`;
+  const complete = editions.storyComplete > 0 ? `, ${editions.storyComplete} Story Complete` : '';
+  return `${count(editions.experienced)} experienced${complete}.`;
+}
+
 function buildFavourites(scope: StatsScope): FavouriteStats {
   const championshipNames = new Map(scope.championships.map((row) => [row.id, row.name]));
   const championships = groupRaces(scope, (race) =>
@@ -1723,7 +1763,7 @@ function buildFavourites(scope: StatsScope): FavouriteStats {
       : toFavourite(circuit, `${toHours(circuit.realSeconds)} hours here, across ${circuit.races} races.`),
     event: event === null
       ? null
-      : toFavourite(event, `${event.races} editions, ${event.racesStoryComplete} of them Story Complete.`),
+      : toFavourite(event, eventFavouriteDetail(event, eventEditionsInScope(scope, event.key))),
     race: race === null
       ? null
       : toFavourite(race, `${toHours(race.realSeconds)} hours across ${race.sessions} sessions.`),
@@ -1813,8 +1853,11 @@ interface LandmarkDates {
 
 /**
  * The keys of events merged into another. Their trees keep their own unlocks,
- * but the steps now live — dated — in the event they were merged into, so a
- * count of steps leaves those trees out, as the Mastery page does.
+ * but the steps now live — dated — in the event they were merged into, so the
+ * completion figures (how many of the trees' steps are done) leave those trees
+ * out, as the Mastery page does. The landmarks line does not use this: it
+ * counts when steps were reached, and leaves out only the copies a merge
+ * carried over (`loadLandmarkDates`).
  */
 async function mergedEventKeys(userId: string): Promise<string[]> {
   const rows = await prisma.raceMastery.findMany({
@@ -1831,31 +1874,48 @@ function outsideMergedTrees(merged: readonly string[]): Prisma.MasteryTreeWhereI
 }
 
 /**
- * When every achievement, mastery step and milestone was reached: the date the
- * history places it at (`achievedAt`) where there is one, otherwise when it was
- * recorded. Three reads of dates alone.
+ * When every achievement, mastery step and Career Milestone was reached: the
+ * date the history places it at (`achievedAt`) where there is one, otherwise
+ * when it was recorded. Three reads, counted as the Chronicle counts the same
+ * year (`buildChapterData`), so this line and a chapter never disagree:
+ *
+ *   - mastery steps: every step reached, in whatever event, leaving out only
+ *     the copies a merge carried into the surviving event
+ *     (`carriedEventStepCopies`). A step the merged-away event reached that
+ *     the survivor already had is carried nowhere, and stays a landmark of
+ *     the day it was reached;
+ *   - milestones: the Career Milestones catalogue's rungs, including each
+ *     year's plan (`careerMilestoneOfRow`) — the milestones Career Milestones
+ *     lists — not the lifetime-ladder rungs, which are a separate list.
  */
-async function loadLandmarkDates(userId: string, merged: Promise<string[]>): Promise<LandmarkDates> {
-  const trees = outsideMergedTrees(await merged);
+async function loadLandmarkDates(userId: string): Promise<LandmarkDates> {
   const [achievements, masteryNodes, milestones] = await Promise.all([
     prisma.achievementProgress.findMany({
       where: { userId, unlockedAt: { not: null } },
       select: { unlockedAt: true },
     }),
     prisma.masteryProgress.findMany({
-      where: { userId, unlockedAt: { not: null }, node: { tree: trees } },
-      select: { unlockedAt: true, achievedAt: true },
+      where: { userId, unlockedAt: { not: null } },
+      select: { unlockedAt: true, achievedAt: true, node: { select: { key: true, tree: { select: { key: true } } } } },
     }),
     prisma.milestoneProgress.findMany({
       where: { userId, reachedAt: { not: null } },
-      select: { reachedAt: true, achievedAt: true },
+      select: { metric: true, threshold: true, reachedAt: true, achievedAt: true },
     }),
   ]);
+  const unlocked = masteryNodes.flatMap((row) => (row.unlockedAt === null ? [] : [{ ...row, unlockedAt: row.unlockedAt }]));
+  const carried = await carriedEventStepCopies(prisma, userId, unlocked.map((row) => ({
+    treeKey: row.node.tree.key, nodeKey: row.node.key, unlockedAt: row.unlockedAt,
+  })));
   const dates = (rows: readonly (Date | null)[]) => rows.filter((at): at is Date => at !== null);
   return {
     achievements: dates(achievements.map((row) => row.unlockedAt)),
-    masteryNodes: dates(masteryNodes.map((row) => row.achievedAt ?? row.unlockedAt)),
-    milestones: dates(milestones.map((row) => row.achievedAt ?? row.reachedAt)),
+    masteryNodes: unlocked
+      .filter((row) => !carried.has(`${row.node.tree.key}:${row.node.key}`))
+      .map((row) => row.achievedAt ?? row.unlockedAt),
+    milestones: dates(milestones
+      .filter((row) => careerMilestoneOfRow(row.metric, row.threshold) !== null)
+      .map((row) => row.achievedAt ?? row.reachedAt)),
   };
 }
 
@@ -2689,7 +2749,7 @@ export async function getStatistics(
       where: { userId },
       select: { careerXp: true, level: true, prestige: true },
     }),
-    loadLandmarkDates(userId, merged),
+    loadLandmarkDates(userId),
     loadXpAndLevelsByYear(userId, years.map((year) => year.year)),
   ]);
 
@@ -2956,7 +3016,10 @@ export async function getYearComparison(
   const filter: StatsFilter = { ...(options.filter ?? {}), year: undefined };
   const context = await loadFilterContext(userId, filter);
   const currentYear = now.getFullYear();
-  const first = context.timeline.stints[0]?.watchedAt ?? null;
+  // The career's first moment is where its first stint's window starts: a
+  // first stint that reached back over New Year began the career in the old
+  // year, as the Chronicle and the year list count it.
+  const first = careerStartsAt(context.timeline);
   const last = context.timeline.stints[context.timeline.stints.length - 1]?.watchedAt ?? null;
   const firstYear = first?.getFullYear() ?? currentYear;
   const lastYear = Math.max(currentYear, last?.getFullYear() ?? currentYear);
@@ -2999,7 +3062,7 @@ export async function getYearComparison(
     const window = windowFor(year);
     const summary = summariseWindow(context.timeline, window, windowOptions(context.weekStartsOn, context.include));
     const ledger = await ledgerWindow(userId, window);
-    const began = first !== null && first.getFullYear() === year && first > yearWindow(year).start ? first : null;
+    const began = careerBeganInYear(context.timeline, year);
     return { ...summary, year, xpEarned: ledger.xpEarned, levelsGained: ledger.levelsGained, careerBeganInYear: began };
   };
   const [sideA, sideB] = await Promise.all([side(yearA), side(yearB)]);

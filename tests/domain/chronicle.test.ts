@@ -8,13 +8,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { CHRONICLE_SHAPE } from '@/lib/config';
 import {
-  buildChapter, buildWrappedCards, chronicleChapterSchema, UnreadableChapterError, upgradeChapterSnapshot,
+  buildChapter, buildWrappedCards, careerBeganInYear, chronicleChapterSchema, firstActivityYear, UnreadableChapterError,
+  upgradeChapterSnapshot,
   type ChapterInput, type ChapterMilestoneRow, type ChronicleChapterV1, type WrappedCard,
 } from '@/lib/domain/chronicle';
 import type { CareerTimeline } from '@/lib/domain/career-timeline';
 import { careerRecordOptions, computeRecordProgression, RECORD_ORDER } from '@/lib/domain/records';
 import { chapterBeginning, wrappedCardLine } from '@/lib/copy/tone';
 import { career, localTime, race, resetStintIds, stint } from '../helpers/timeline-fixture';
+import { inTimeZone, ZONES } from '../helpers/time-zone';
 
 const H = 3600;
 
@@ -218,26 +220,54 @@ describe('a chapter', () => {
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids.length).toBeLessThanOrEqual(CHRONICLE_SHAPE.notableRacesCount);
     expect(chapter.notableRaces.map((notable) => [notable.raceId, notable.reason])).toEqual([
+      // Le Mans holds the most credited time too: a race is listed once, and
+      // no other race is called the most-watched in its place.
       ['lm', 'longest-story'],
-      // Le Mans holds the most credited time too, but a race is listed once.
-      ['seb', 'most-watched'],
       // Le Mans is an Expedition as well; only Fuji is left to list as one.
       ['fuji', 'expedition'],
       ['spa', 'most-stints'],
-      // Sebring and Le Mans were first editions too, and are already listed.
+      // Sebring and Le Mans were first editions too, and Le Mans is already listed.
       ['day', 'first-edition'],
+      ['seb', 'longest-journey'],
     ]);
     expect(chapter.notableRaces.map((notable) => notable.detail)).toEqual([
-      'The longest race you completed in 2026: 24h 00m',
-      'Your most-watched race of 2026: 12h 00m',
+      'The longest race you completed in 2026: 24h 00m, and your most-watched: 18h 00m',
       'An Expedition completed over one day',
       '4 stints in 2026',
       'Your first edition of Daytona experienced',
+      'From first stint to complete story in 12h 00m',
     ]);
-    // Without the Expeditions, the longest journey from first stint to complete story gets its place.
+    // Without the Expeditions, the longest journey still unlisted gets its place.
     const plain = buildChapter(input(career(races, sessions), 2026));
-    expect(plain.notableRaces.map((notable) => notable.reason)).toEqual(['longest-story', 'most-watched', 'most-stints', 'first-edition', 'longest-journey']);
-    expect(plain.notableRaces[4]).toMatchObject({ raceId: 'fuji', detail: 'From first stint to complete story in 6h 00m' });
+    expect(plain.notableRaces.map((notable) => notable.reason)).toEqual(['longest-story', 'most-stints', 'first-edition', 'longest-journey']);
+    expect(plain.notableRaces[3]).toMatchObject({ raceId: 'seb', detail: 'From first stint to complete story in 12h 00m' });
+  });
+
+  it('calls only the race with the most time in the year its most-watched', () => {
+    const races = [
+      race('lm', { hours: 24 }),
+      race('seb', { hours: 12 }),
+      race('spa', { hours: 6 }),
+    ];
+    const sessions = [
+      // Twenty hours of Le Mans, still short of its finish.
+      stint('lm', '2026-06-13T23:00', { from: '0:00', to: '10:00' }),
+      stint('lm', '2026-06-20T23:00', { from: '10:00', to: '20:00' }),
+      stint('seb', '2026-03-21T23:00', { from: '0:00', to: '12:00' }),
+      stint('spa', '2026-05-01T23:00', { from: '0:00', to: '6:00' }),
+    ];
+    const chapter = buildChapter(input(career(races, sessions), 2026));
+    expect(chapter.notableRaces.slice(0, 2)).toEqual([
+      { raceId: 'seb', name: 'seb', reason: 'longest-story', detail: 'The longest race you completed in 2026: 12h 00m' },
+      { raceId: 'lm', name: 'lm', reason: 'most-watched', detail: 'Your most-watched race of 2026: 20h 00m' },
+    ]);
+
+    // The race called the most-watched has the most credited time of the year.
+    const credited = new Map<string, number>();
+    for (const one of career(races, sessions).stints) credited.set(one.raceId, (credited.get(one.raceId) ?? 0) + one.creditedSeconds);
+    const mostWatched = chapter.notableRaces.filter((entry) => entry.reason === 'most-watched');
+    expect(mostWatched).toHaveLength(1);
+    expect(credited.get(mostWatched[0]!.raceId)).toBe(Math.max(...credited.values()));
   });
 
   it('keeps the best record of each kind set in the year, in the order records are listed', () => {
@@ -331,7 +361,8 @@ describe('a chapter', () => {
     ]);
     const first = buildChapter(input(timeline, 2026));
     expect(first.beginnings).toEqual({
-      firstStint: { at: localTime('2026-09-22T21:00').toISOString(), raceId: 'fuji', raceName: '6 Hours of Fuji' },
+      // Where the first stint's window starts: the hour before it was logged.
+      firstStint: { at: localTime('2026-09-22T20:00').toISOString(), raceId: 'fuji', raceName: '6 Hours of Fuji' },
       firstStoryComplete: { at: localTime('2026-09-23T23:00').toISOString(), raceId: 'fuji', raceName: '6 Hours of Fuji' },
       firstEventEdition: {
         at: localTime('2026-09-22T21:00').toISOString(), eventKey: 'fuji-6', eventName: 'Fuji 6 Hours', raceName: '6 Hours of Fuji',
@@ -345,6 +376,42 @@ describe('a chapter', () => {
     expect(buildChapter(input(timeline, 2027)).beginnings).toBeNull();
   });
 
+  it('a career whose first stint reached back over New Year begins in the old year', () => {
+    const opening = race('opening', { name: 'Midnight Four Hours', hours: 4 });
+    const spa = race('spa', { hours: 12 });
+    const timeline = career([opening, spa], [
+      // Watched from 22:30 on 31 December 2025, logged at 00:30.
+      stint(opening, '2026-01-01T00:30', { from: '0:00', to: '2:00' }),
+      stint(spa, '2026-06-01T21:00', { from: '0:00', to: '3:00' }),
+      stint(spa, '2027-06-01T21:00', { from: '3:00', to: '6:00' }),
+    ]);
+    expect(firstActivityYear(timeline)).toBe(2025);
+    expect(careerBeganInYear(timeline, 2025)).toEqual(localTime('2025-12-31T22:30'));
+    expect(careerBeganInYear(timeline, 2026)).toBeNull();
+
+    // The old year is the first chapter, and it tells the beginning.
+    const first = buildChapter(input(timeline, 2025));
+    expect(first.summary.creditedSeconds).toBeCloseTo(1.5 * H, 6);
+    expect(first.beginnings?.firstStint).toEqual({ at: localTime('2025-12-31T22:30').toISOString(), raceId: 'opening', raceName: 'Midnight Four Hours' });
+    expect(chapterBeginning(first.beginnings)[0]).toBe('Your chronicle begins on 31 December 2025 with the Midnight Four Hours.');
+    expect(first.previousYear).toBeNull();
+
+    // 2026 is a whole year: no beginning of its own, and compared with a first
+    // year that began on 31 December.
+    const second = buildChapter(input(timeline, 2026, { previousYearXp: 100 }));
+    expect(second.beginnings).toBeNull();
+    expect(second.previousYear).toMatchObject({
+      year: 2025, careerBeganInYear: true, activeFrom: localTime('2025-12-31T22:30').toISOString(), creditedSeconds: 1.5 * H,
+    });
+    const compared = buildWrappedCards(second, { careerYear: 2, state: 'frozen' }).find((card) => card.kind === 'compared');
+    if (compared?.kind !== 'compared') throw new Error('no comparison card');
+    expect(wrappedCardLine(compared)).toMatch(/^Your 2025 chapter began on 31 December\. /);
+
+    // 2027 is compared with a whole 2026.
+    const third = buildChapter(input(timeline, 2027, { previousYearXp: 100 }));
+    expect(third.previousYear).toMatchObject({ year: 2026, careerBeganInYear: false });
+  });
+
   it('compares with the year before from its frozen chapter, or live, and says when the career began inside it', () => {
     const spa = race('spa', { hours: 12 });
     const timeline = career([spa], [
@@ -352,8 +419,9 @@ describe('a chapter', () => {
       stint(spa, '2026-03-01T21:00', { from: '2:00', to: '5:00' }),
     ]);
     const live = buildChapter(input(timeline, 2026, { previousYearXp: 700 }));
+    // The career began where its first stint's window starts, two hours before it was logged.
     expect(live.previousYear).toEqual({
-      year: 2025, activeFrom: localTime('2025-09-22T21:00').toISOString(), careerBeganInYear: true,
+      year: 2025, activeFrom: localTime('2025-09-22T19:00').toISOString(), careerBeganInYear: true,
       creditedSeconds: 2 * H, racesExperienced: 1, storyCompletes: 0, xpEarned: 700, averageSessionSeconds: 2 * H,
     });
 
@@ -365,7 +433,7 @@ describe('a chapter', () => {
     expect(frozen.previousYear).toBeNull();
     const cards = buildWrappedCards(fromFrozen, { careerYear: 2, state: 'frozen' });
     const compared = cards.find((card) => card.kind === 'compared');
-    expect(compared).toMatchObject({ previousYear: 2025, beganOn: localTime('2025-09-22T21:00').toISOString() });
+    expect(compared).toMatchObject({ previousYear: 2025, beganOn: localTime('2025-09-22T19:00').toISOString() });
     // A first year that was not a whole one gets no percentage changes.
     if (compared?.kind !== 'compared') throw new Error('no comparison card');
     expect(compared.rows.map((row) => row.percentChange)).toEqual([null, null, null, null]);
@@ -415,6 +483,36 @@ describe('a chapter', () => {
   });
 });
 
+describe('a day of batch logging', () => {
+  inTimeZone(ZONES.london.zone, ZONES.london.offsets);
+
+  /** Three races logged a minute apart: the last two windows are cut to a minute each. */
+  function batch(day: string) {
+    const races = ['a', 'b', 'c'].map((id) => race(id, { hours: 10 }));
+    return career(races, [
+      stint('a', `${day}T23:00`, { from: '0:00', to: '10:00' }),
+      stint('b', `${day}T23:01`, { from: '0:00', to: '5:00' }),
+      stint('c', `${day}T23:02`, { from: '0:00', to: '10:00' }),
+    ]);
+  }
+
+  it('the most active day holds at most a day, the same figure as the most-in-a-day record', () => {
+    // Twenty-five credited hours land on 9 May: more than the day has.
+    const chapter = buildChapter(input(batch('2026-05-09'), 2026));
+    expect(chapter.summary.creditedSeconds).toBeCloseTo(25 * H, 6);
+    expect(chapter.viewing.mostActiveDay).toEqual({ dayKey: '2026-05-09', seconds: 24 * H });
+    const record = chapter.records.find((entry) => entry.kind === 'most-in-a-day');
+    expect(record).toMatchObject({ value: chapter.viewing.mostActiveDay!.seconds, at: localTime('2026-05-09').toISOString() });
+  });
+
+  it('a day the clocks go forward holds 23 hours', () => {
+    // 29 March 2026 is 23 hours long in London.
+    const chapter = buildChapter(input(batch('2026-03-29'), 2026));
+    expect(chapter.viewing.mostActiveDay).toEqual({ dayKey: '2026-03-29', seconds: 23 * H });
+    expect(chapter.records.find((entry) => entry.kind === 'most-in-a-day')?.value).toBe(23 * H);
+  });
+});
+
 describe('Endurance Wrapped', () => {
   it('Wrapped omits cards without data', () => {
     const spa = race('spa', { hours: 6 });
@@ -455,6 +553,27 @@ describe('Endurance Wrapped', () => {
     if (records?.kind !== 'records') throw new Error('no records card');
     expect(records.records.length).toBeLessThanOrEqual(CHRONICLE_SHAPE.wrappedRecordsShown);
     for (const card of cards) expect(wrappedCardLine(card).length).toBeGreaterThan(0);
+  });
+
+  it('says how many personal records the year set, and names only the first few', () => {
+    const seb = race('seb', { hours: 12 });
+    const spa = race('spa', { hours: 6 });
+    const timeline = career([seb, spa], [
+      stint(seb, '2026-03-01T23:00', { from: '0:00', to: '4:00' }),
+      stint(seb, '2026-03-08T23:00', { from: '4:00', to: '8:00' }),
+      stint(seb, '2026-03-15T23:00', { from: '8:00', to: '12:00' }),
+      stint(spa, '2026-05-01T23:00', { from: '0:00', to: '6:00' }),
+    ]);
+    const chapter = buildChapter(input(timeline, 2026));
+    expect(chapter.records.length).toBeGreaterThan(CHRONICLE_SHAPE.wrappedRecordsShown);
+    const card = buildWrappedCards(chapter, { careerYear: 1, state: 'frozen' }).find((entry) => entry.kind === 'records');
+    if (card?.kind !== 'records') throw new Error('no records card');
+    expect(card.total).toBe(chapter.records.length);
+    expect(card.records).toHaveLength(CHRONICLE_SHAPE.wrappedRecordsShown);
+    expect(wrappedCardLine(card)).toBe(
+      `${chapter.records.length} personal records set, among them longest session (6h 00m), most in a day (6h 00m) `
+        + 'and most in seven days (6h 00m).',
+    );
   });
 
   it('names the celebrated milestones first, then the rarest achievements, then the rest', () => {

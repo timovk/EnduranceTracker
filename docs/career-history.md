@@ -163,7 +163,15 @@ hours (below).
 
 `replayRace(race, sessions)` replays one race on its own, for the Expedition
 paths. Its windows are cut at that race's own previous stint, which is enough
-there, because the Expedition figures date nothing by interpolation.
+there, because the Expedition figures date nothing by interpolation. The one
+thing it cannot know is where the race **started** in the career: its first
+stint's window is cut at the stint before it, whatever race that was. So the
+Expedition page reads that stint's instant (`previousStintInstant`, one
+indexed read) and starts the race at `careerStartOf(history, previous)`, and
+the Expedition Summary takes the career replay's `startedAt`. The page, the
+permanent summary, the Records tab and the Chronicle then give one start and
+one start-to-finish for the same race, also when its first stint was
+batch-logged a minute after another race's.
 
 ### Experienced
 
@@ -192,6 +200,15 @@ crossed `T`. For the stint `s` whose amount takes the total from below `T` to
   **INTERPOLATED**;
 - otherwise the instant is the stint's own: precision **STINT**.
 
+With `within`, the instant is also clamped to `within.end − 1 ms`: a year's
+total grows only from time in that year, so "336 hours in 2026" is never dated
+on 1 January 2027, and its chapter lists it. That matters for a stint
+batch-logged just after midnight whose cut window still holds hours of the old
+year: its own instant is in the new year, so the rung is dated at the old
+year's last moment, precision INTERPOLATED (worked out, not the stint's
+instant). `precisionLabel` never rounds a time into the next day, so it reads
+"around 23:55 on 31 December".
+
 Stints that add nothing are skipped. Because windows never overlap, instants
 are non-decreasing in canonical order and in `T`.
 
@@ -202,6 +219,7 @@ takes the first stint whose coverage, compared in whole numbers
 (`coverageCrossing`).
 
 Tests: `tests/domain/career-timeline.test.ts › interpolates the instant 100 hours was crossed`,
+`› the year rung is dated inside its own year` (three time zones),
 `› two stints logged a minute apart never date a later threshold before an earlier one`,
 `› a batch-logged stint’s crossing is STINT, not INTERPOLATED`,
 `› milestone instants are monotone in threshold for random logs`.
@@ -213,6 +231,13 @@ Every day, week, month and year is the Node server's local time, through
 `getDay` numbering), and week keys come from `viewingWeek`, so they agree with
 the budget. `User.timezone` stays unused. A finished year is frozen, so a
 later change of time zone never rewrites it.
+
+A day holds at most its own length (`dayLengthSeconds`: 23, 24 or 25 hours).
+Batch logging can crowd more credited time into one day; wherever a single
+day is shown — the most-in-a-day record, the chapter's and Career
+Statistics' most active day — its time is capped at the day's length, so the
+three always give one figure. New race coverage is not capped: at 2× a day
+really can cover more than 24 hours of racing.
 
 An **edition year** is the race date's UTC year (the date is stored as UTC
 midnight of the day typed), or the season's year when there is no date. Two
@@ -511,10 +536,13 @@ championship or saving a season; changing the week start; every event action;
 the mode switch; rebuilding a chapter and hiding the Wrapped prompt. The last phase of the backfill freezes an upgraded account's
 finished years.
 
-**Career Year 1** is the local year of the first stint, or of the earliest
-frozen chapter if that year's stints have since been deleted: a frozen year
-stays in the Chronicle, with its number, whatever happens to the history after
-it.
+**Career Year 1** is the local year of the career's first moment — where the
+first stint's window starts — or of the earliest frozen chapter if that year's
+stints have since been deleted: a frozen year stays in the Chronicle, with its
+number, whatever happens to the history after it. A very first stint logged at
+00:30 on 1 January that began on 31 December begins the career in the old
+year: that year is Career Year 1, a chapter of its own (as it is a year in
+Career Statistics), and the next year is a whole one.
 
 **Rebuilding** is the only way a frozen chapter changes, and only on request:
 the chapter's *Rebuild this chapter from today's history…* dialog
@@ -569,7 +597,9 @@ version adds its upgrade branch there.
 `domain/expedition.ts`), `schemaVersion: 1`: the race as it was (name,
 championship, event, edition year, circuit, runtime), `startedAt`,
 `completedAt`, the completing stint, credited, unique and re-watched time,
-sessions, calendar days and elapsed time from start to finish, average and
+sessions, calendar days and elapsed time from start to finish (the start is
+the career replay's: the first stint's window, cut at the stint before it in
+the career), average and
 longest session, the final completion text, XP by source (viewing, re-watch,
 Story Complete, checkpoints) summed from the ledger, the checkpoints with
 their dates, the mastery, milestones and achievements of the completing stint,

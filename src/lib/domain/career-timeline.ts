@@ -534,7 +534,14 @@ export function nthEvent(events: readonly TimelineEvent[], n: number): InstantRe
  * own instant is used and the precision says so.
  *
  * With `within`, only the part of each window inside it counts, which is how a
- * calendar-year total is crossed inside the part of a stint in that year.
+ * calendar-year total is crossed inside the part of a stint in that year. The
+ * instant is then always inside the window too: a total of a year can only
+ * grow from time in that year, so "336 hours in 2026" is never dated on
+ * 1 January 2027. A stint batch-logged just after New Year has an instant
+ * after the window; its crossing is dated at the window's last moment
+ * instead, and, since that is worked out rather than the stint's own
+ * instant, reads as INTERPOLATED. The clamp is a constant for a given window,
+ * so instants stay non-decreasing in the threshold.
  */
 export function cumulativeCrossing(
   stints: readonly StintEvent[],
@@ -542,6 +549,8 @@ export function cumulativeCrossing(
   amountOf: (stint: StintEvent) => number,
   within?: LocalWindow,
 ): InstantResult | null {
+  // The last instant inside `within`, whose end is exclusive.
+  const last = within === undefined ? Number.POSITIVE_INFINITY : within.end.getTime() - 1;
   let before = 0;
   for (const stint of stints) {
     const full = amountOf(stint);
@@ -561,13 +570,16 @@ export function cumulativeCrossing(
 
     if (before < thresholdSeconds && thresholdSeconds <= before + amount) {
       if (!stint.windowReliable) {
-        return { at: stint.watchedAt, precision: 'STINT', sessionId: stint.sessionId, raceId: stint.raceId };
+        if (stint.watchedAt.getTime() <= last) {
+          return { at: stint.watchedAt, precision: 'STINT', sessionId: stint.sessionId, raceId: stint.raceId };
+        }
+        return { at: new Date(last), precision: 'INTERPOLATED', sessionId: stint.sessionId, raceId: stint.raceId };
       }
       const span = segmentEnd.getTime() - segmentStart.getTime();
       const at = span > 0
-        ? new Date(segmentStart.getTime() + Math.round(((thresholdSeconds - before) / amount) * span))
-        : segmentEnd;
-      return { at, precision: 'INTERPOLATED', sessionId: stint.sessionId, raceId: stint.raceId };
+        ? segmentStart.getTime() + Math.round(((thresholdSeconds - before) / amount) * span)
+        : segmentEnd.getTime();
+      return { at: new Date(Math.min(at, last)), precision: 'INTERPOLATED', sessionId: stint.sessionId, raceId: stint.raceId };
     }
     before += amount;
   }

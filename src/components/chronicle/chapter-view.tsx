@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import type { ChronicleChapterView } from '@/lib/engines/chronicle-engine';
 import type { ChronicleChapterV1 } from '@/lib/domain/chronicle';
-import { formatDuration } from '@/lib/domain/time';
+import { formatDuration, formatPercentFloor } from '@/lib/domain/time';
 import { chapterBeginning, chapterHeadline, differencePhrase, milestoneLabel, precisionLabel } from '@/lib/copy/tone';
 import { PeriodBars } from '@/components/charts/monthly-bars';
 import { WeekdayBars, type WeekdayPoint } from '@/components/charts/weekday-bars';
@@ -52,13 +52,6 @@ const MONTHS = [
 /** Credited time: "181h 42m", or "0m" before the first minute. */
 function watched(seconds: number): string {
   return seconds < 60 ? '0m' : formatDuration(seconds);
-}
-
-/** A percentage floored to one decimal, so it never reads 100% while something is still to watch. */
-function percentText(value: number): string {
-  if (value >= 100) return '100%';
-  const tenths = Math.floor(Math.max(0, value) * 10) / 10;
-  return `${tenths.toLocaleString('en-GB')}%`;
 }
 
 function dateOf(iso: string): string {
@@ -295,7 +288,7 @@ function ViewingStatistics({ chapter, raceHref }: { chapter: ChronicleChapterV1;
           <Stat label="Re-watch time" value={watched(summary.rewatchSeconds)} size="sm" tone="muted" />
           <Stat
             label="Completion"
-            value={summary.completionPercent === null ? '—' : percentText(summary.completionPercent)}
+            value={summary.completionPercent === null ? '—' : formatPercentFloor(summary.completionPercent)}
             sub="of the races watched, by length"
             size="sm"
             tone="muted"
@@ -353,7 +346,7 @@ function BreakdownTable({ rows, nameHeading, withEditions }: { rows: BreakdownRo
                   {row.href !== null ? <Link href={row.href} className="hover:text-ink">{row.name}</Link> : row.name}
                 </td>
                 <td className="timing px-2 py-2 text-right text-ink">{watched(row.creditedSeconds)}</td>
-                <td className="timing px-2 py-2 text-right text-ink-dim">{percentText(row.share * 100)}</td>
+                <td className="timing px-2 py-2 text-right text-ink-dim">{formatPercentFloor(row.share * 100)}</td>
                 <td className="timing px-2 py-2 text-right text-ink-dim">{formatNumber(row.racesExperienced)}</td>
                 {withEditions ? <td className="timing px-2 py-2 text-right text-ink-dim">{formatNumber(row.editions ?? 0)}</td> : null}
                 <td className="timing px-4 py-2 text-right text-ink-dim">{formatNumber(row.storyCompletes)}</td>
@@ -446,7 +439,7 @@ function StoryCompleteSection({ view, raceHref }: { view: ChronicleChapterView; 
             />
             <Stat
               label="Complete stories"
-              value={stories.rate === null ? '—' : percentText(stories.rate)}
+              value={stories.rate === null ? '—' : formatPercentFloor(stories.rate)}
               sub={stories.rate === null
                 ? `shown from ${CAREER_STATS_SHAPE.rateMinimumRaces} races started in a year`
                 : `of the races started in ${chapter.year}`}
@@ -455,7 +448,7 @@ function StoryCompleteSection({ view, raceHref }: { view: ChronicleChapterView; 
           </div>
           {stories.rate !== null ? (
             <p className="text-xs text-ink-dim">
-              Of the races you started in {chapter.year}, {percentText(stories.rate)} are complete stories.
+              Of the races you started in {chapter.year}, {formatPercentFloor(stories.rate)} are complete stories.
             </p>
           ) : null}
 
