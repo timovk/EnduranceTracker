@@ -87,9 +87,20 @@ SQLite keeps recent writes in the `-wal` file beside it, so a copy of the `.db`
 alone can be missing the last thing you did. Either use the menu item, or close
 the application first and copy all three files together.
 
+A backup holds everything, including what 0.4.0 added: your Chronicle
+chapters, Expedition Summaries, events and the dates of your milestones live
+in the same file, so they are in every backup without anything extra to copy.
+
 A backup is an ordinary database file. To restore one, close the application,
 put it in the data folder as `endurance.db` (deleting any `-wal` and `-shm`
 files beside it), and start the application again.
+
+A backup made by an earlier version can be restored the same way. The next
+start brings it up to date and reads its history once, exactly as the first
+start of 0.4.0 did. It does not work the other way round: a career that 0.4.0
+has written to may not open in 0.3.2, because an Expedition checkpoint is a
+kind of XP 0.3.2 does not know. To go back to 0.3.2, restore the copy 0.4.0
+saved before it changed anything, `backups\pre-update-0.4.0-<date>.db`.
 
 ### Moving to another PC
 
@@ -120,8 +131,56 @@ failed — preparing the database, starting the server, waiting for it to
 answer. The log has the detail underneath it.
 
 **It sits on the splash screen for a long time.** The first launch after an
-update can take a few seconds longer while migrations run. If it never
-finishes, the log will say what it was waiting for.
+update can take a few seconds longer while migrations run. The first launch of
+0.4.0 also reads your viewing history once (below), and gives that at most
+half a minute before it lets the window open. If it never finishes, the log
+will say what it was waiting for.
+
+**What the first start of 0.4.0 wrote in the log.** The first time 0.4.0
+starts on a career from an earlier version, it reads the whole history once
+and fills in what 0.4.0 knows about it — milestone dates, event histories,
+Expedition checkpoints, the chapters of finished years. It writes one line per
+account:
+
+```
+[career-backfill] Alex (…): credited 212 races, 0 legacy races repaired, story bonuses +0/−0; 3 event steps (+800 XP), 41 credits; 2 new milestones (+1,500 XP), 14 dates filled, 3 recorded only; 2 expedition checkpoints (+300 XP), 1 summary; 1 chapter frozen
+```
+
+A very large history may not fit into one start. The line then ends with
+something like `paused before P3; continues on the next start`, or
+`paused before P1 (after race <id>)`, and the next start carries on from
+exactly there. That is expected rather than a fault: the application works as
+usual meanwhile, nothing is paid twice, and a finished year says *Complete —
+finalising* until its chapter can be written.
+
+A line ending `failed, will retry on the next start` means the pass hit an
+error for that account. What it had done is kept, and the next start tries
+again. If it says so on every start, the lines under it have the detail, and
+they are the thing to quote. `[career-backfill] could not run at start-up; it
+will be tried again on the next start`, naming no account, means the pass
+could not begin at all; the next start tries every account again.
+
+A line saying that some viewing XP rows or Story Complete bonuses of races
+deleted before 0.4.0 "were left as they were" is information, not a problem.
+`npm run db:recompute`, from a checkout, is what tidies them away.
+
+**The Chronicle's lines.** Last year's chapter is saved for good at the
+first chance at least three days into January. When a start is that first
+chance, the log says `[chronicle] Alex (…): froze the 2026 chapter`. Opening
+the dashboard or the Chronicle, or logging a stint, can save it first, and
+that writes nothing in the log, so the line may never appear.
+
+Three lines mean saving it did not work this time:
+
+- `[chronicle] Alex (…): could not freeze its finished years; the Chronicle
+  will try again when opened`, from a start, for one account;
+- `[chronicle] could not freeze finished years at start-up; the Chronicle will
+  try again when opened`, when that start could not try at all;
+- `[chronicle] <id>: could not freeze its finished years; they stay live until
+  the next try`, from opening the Chronicle or saving a change.
+
+Nothing is lost: the year stays live, marked *finalising*, and the next start,
+visit to the Chronicle or logged stint tries again.
 
 **Nothing happens when I open it a second time.** Only one copy runs at a
 time; a second launch brings the existing window to the front instead of

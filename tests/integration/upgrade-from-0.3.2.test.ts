@@ -18,8 +18,8 @@ import { join, resolve } from 'node:path';
 import { runMigrations } from '../../desktop/src/migrate';
 import { disconnectDb, prisma } from '@/lib/db/client';
 import {
-  CAREER_BACKFILL_PHASES, deadlineClock, isCareerBackfillApplied, readCareerBackfillMarker, runCareerBackfill,
-  runCareerBackfillFor,
+  CAREER_BACKFILL_KEY, CAREER_BACKFILL_PHASES, CAREER_BACKFILL_VERSION, deadlineClock, isCareerBackfillApplied,
+  readCareerBackfillMarker, runCareerBackfill, runCareerBackfillFor,
 } from '@/lib/server/upgrades/career-backfill';
 import { expeditionSummarySnapshotSchema } from '@/lib/domain/expedition';
 import { upgradeChapterSnapshot } from '@/lib/domain/chronicle';
@@ -27,6 +27,7 @@ import { getChronicleChapter, getChronicleIndex } from '@/lib/engines/chronicle-
 import { eventStepProblems, expeditionProblems, ledgerProblems } from '../helpers/career-db';
 import type { FixtureCopy } from '../helpers/fixture-db';
 import { FIXTURE_GENERATED_AT, FIXTURE_USER_ID, pointPrismaAtFixture } from '../helpers/fixture-db';
+import { DATABASE_CHECKS, HISTORY_PASS } from '../e2e/career-history.mjs';
 
 const MIGRATIONS = join(resolve(process.cwd()), 'prisma', 'migrations');
 const CAREER_HISTORY = '20260924120000_career_history';
@@ -56,6 +57,16 @@ function counts(file: string): Record<string, number> {
     return Object.fromEntries(tables.map((table) => [
       table, (db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n,
     ]));
+  } finally {
+    db.close();
+  }
+}
+
+/** One of the desktop end-to-end run's database checks, read from the copy. */
+function endToEndCount(sql: string): number {
+  const db = new Database(copy.file, { readonly: true });
+  try {
+    return (db.prepare(sql).get() as { n: number }).n;
   } finally {
     db.close();
   }
@@ -141,6 +152,16 @@ describe('migrating the 0.3.2 fixture', () => {
     const again = runMigrations(copy.file, MIGRATIONS);
     expect(again.applied).toEqual([]);
     expect(counts(copy.file)).toEqual(settled);
+  });
+
+  it('reads as not upgraded yet to the desktop end-to-end run', () => {
+    // Migrated but not yet started: no history pass, and no milestone dated.
+    expect(endToEndCount(DATABASE_CHECKS.completeHistoryPasses)).toBe(0);
+    expect(endToEndCount(DATABASE_CHECKS.undatedMilestones)).toBe(endToEndCount(DATABASE_CHECKS.milestones));
+    expect(endToEndCount(DATABASE_CHECKS.chaptersOf(2025))).toBe(0);
+    expect(endToEndCount(DATABASE_CHECKS.chapters)).toBe(0);
+    expect(endToEndCount(DATABASE_CHECKS.expeditionCheckpoints)).toBe(0);
+    expect(endToEndCount(DATABASE_CHECKS.expeditionXp)).toBe(0);
   });
 });
 
@@ -418,6 +439,31 @@ describe('the 0.4.0 career backfill on the 0.3.2 fixture', () => {
     });
     expect(keys.filter((key) => key._count._all > 1)).toEqual([]);
     expect(await ledgerProblems(FIXTURE_USER_ID)).toEqual([]);
+  });
+
+  it('reads as upgraded to the desktop end-to-end run, which checks the same things in the packaged app', async () => {
+    // The end-to-end script cannot import the module, so it names the marker's
+    // key, version and phases itself; they must be the module's.
+    expect(HISTORY_PASS).toEqual({
+      key: CAREER_BACKFILL_KEY, version: CAREER_BACKFILL_VERSION, phases: [...CAREER_BACKFILL_PHASES],
+    });
+    expect(endToEndCount(DATABASE_CHECKS.completeHistoryPasses)).toBe(1);
+    expect(endToEndCount(DATABASE_CHECKS.milestones)).toBeGreaterThan(30);
+    expect(endToEndCount(DATABASE_CHECKS.undatedMilestones)).toBe(0);
+    expect(endToEndCount(DATABASE_CHECKS.chaptersOf(2025))).toBe(1);
+    // 2026 is the year in progress, so 2025 is the only chapter frozen.
+    expect(endToEndCount(DATABASE_CHECKS.chapters)).toBe(1);
+    // Its Expeditions were paid as career XP only, each checkpoint once.
+    expect(endToEndCount(DATABASE_CHECKS.expeditionCheckpoints)).toBeGreaterThan(0);
+    expect(endToEndCount(DATABASE_CHECKS.distinctExpeditionCheckpoints))
+      .toBe(endToEndCount(DATABASE_CHECKS.expeditionCheckpoints));
+    expect(endToEndCount(DATABASE_CHECKS.expeditionSeasonXp)).toBe(0);
+    const expeditionXp = await prisma.xPTransaction.aggregate({
+      where: { userId: FIXTURE_USER_ID, source: 'EXPEDITION' },
+      _sum: { amount: true },
+    });
+    expect(endToEndCount(DATABASE_CHECKS.expeditionXp)).toBeGreaterThan(0);
+    expect(endToEndCount(DATABASE_CHECKS.expeditionXp)).toBe(expeditionXp._sum.amount ?? 0);
   });
 
   it('changes nothing on the next start, or when it is forced to run again', async () => {

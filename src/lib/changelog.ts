@@ -27,6 +27,79 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: readonly ChangelogEntry[] = [
   {
+    version: '0.4.0',
+    date: '2026-09-28',
+    title: 'Your career, year by year',
+    summary:
+      'Five new ways to look back on your watching: a Chronicle with a chapter for every year and an Endurance ' +
+      'Wrapped to click through, a page for every recurring event you follow, Expeditions for long races, Career ' +
+      'Statistics with personal records, and Career Milestones that keep the date they happened.',
+    note:
+      'The first time this version starts, it reads your viewing history once and fills in what you had already ' +
+      'reached: milestone dates, event histories, expedition checkpoints and the chapters of years already ' +
+      'finished. Before that, the desktop app saves a copy of your career in ' +
+      '%APPDATA%\\Endurance Racing Career\\backups, in a file whose name starts with pre-update-0.4.0.',
+    changes: [
+      {
+        kind: 'New',
+        items: [
+          'Chronicle, in the menu: a chapter for every year you have watched, starting with your first stint. Each ' +
+            'has your hours, races, complete race stories, championships and events, records, milestones and a ' +
+            'month-by-month view. A finished year is kept exactly as it was, even if you change your history later ' +
+            '(it is settled a few days into January, so a race you watch across New Year counts in both years).',
+          'Endurance Wrapped: cards for a finished year that you click through yourself. You can open a preview of ' +
+            'the current year at any time; every card of it is marked as a year still being written.',
+          'Events, in the menu: every recurring event you follow, such as the 24 Hours of Le Mans, has a page with ' +
+            'every edition you have watched, the hours and complete race stories they add up to, your longest run ' +
+            'of consecutive editions and the steps you have reached. You can create your own events, rename them ' +
+            'and combine two into one, and the page suggests races that look like editions of one. Any race can ' +
+            'belong to an event, not only major events.',
+          'Race Expeditions: races of 10 hours or more are Expeditions automatically, and you can switch Expedition ' +
+            'Mode on or off for any race. An Expedition has its own page with a timeline that shows exactly which ' +
+            'parts you have seen, and checkpoints at 10%, 25%, 50%, 75% and 90% of the story, which earn a little ' +
+            'XP on races of 6 hours or more. Switching it off never takes that XP away. When you complete one, a ' +
+            'summary of the whole expedition is kept.',
+          'Career Statistics (was Statistics): filter by year, championship, event, race or race length, compare ' +
+            'two years side by side, and see your personal records, such as your longest session and your most in ' +
+            'seven days.',
+          'Career Milestones, from the Career page: the big moments of your career, such as your first 24-hour race ' +
+            'or 1,000 hours, each with the date and time it happened. New ones include your first 6-hour race, ' +
+            '250 hours, 100 races experienced and two full weeks of racing inside one calendar year.',
+        ],
+      },
+      {
+        kind: 'Changed',
+        items: [
+          'Deleting a race now takes back the XP it earned, the same as deleting its stints one by one: viewing and ' +
+            're-watch XP, its Story Complete bonus and its Expedition checkpoints. Achievements, milestones and ' +
+            'anything else you reached stay.',
+          'Hours for milestones, records and statistics count viewing time the same way XP does, so a stint logged ' +
+            'at a very slow speed cannot add more than it could earn.',
+          'The recurring event of a race is now chosen from a list, and no longer disappears when "Major event" is ' +
+            'switched off.',
+          'An edition of an event is counted once per year, however many races of that year you have added.',
+          'Some moments are now shown as milestones without paying a second time, because something already pays ' +
+            'for them: your first race started (Green Flag), 2,500 hours (The Archive), and 5, 10 or 25 editions of ' +
+            "an event (that event's own steps).",
+          'The Milestones tab on Achievements is now called Lifetime ladders. The achievement "Expedition" is now ' +
+            'called "Around the Clock, Three Times", and the event steps for complete editions now say "complete" ' +
+            'in their names.',
+        ],
+      },
+      {
+        kind: 'Fixed',
+        items: [
+          'Deleting a stint now says how much XP came off with it, instead of saying the XP stays.',
+          "Changing a race's length now works out again what counts as watched, so a shorter length can no longer " +
+            'complete a race you have not fully seen.',
+          'Event editions dated 1 January are no longer counted in the year before on computers west of Greenwich.',
+          'A stint summary opened again later no longer lists things unlocked after that stint.',
+          'A completion figure never rounds up to 100% while part of the race is still to watch.',
+        ],
+      },
+    ],
+  },
+  {
     version: '0.3.2',
     date: '2026-09-24',
     title: 'Only races you can watch',

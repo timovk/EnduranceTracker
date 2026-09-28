@@ -29,15 +29,27 @@
  * 40 checks, including the closed season pass, races still to come on the
  * planner and dashboard, and a simulated update from 0.3.0 that runs the
  * one-time season reset, all passing. It is not a paper exercise.
+ *
+ * 0.4.0 adds the checks in `career-history.mjs` — the menu order, Career
+ * Milestones, an event made and given an edition, a 24-hour Expedition logged
+ * from its own page with Expedition Mode switched off and on again, the
+ * Chronicle with its Wrapped preview clicked to the end, and the Records and
+ * Compare tabs of Career Statistics — then looks in the database for what they
+ * left, and finishes with a simulated upgrade of a real 0.3.2 career: the
+ * committed fixture `tests/fixtures/career-0.3.2.db`, dropped into the data
+ * folder and started, must come out with its one-time history pass complete,
+ * every milestone dated and its first year frozen. That makes 71 checks while
+ * the season pass is closed, and 69 once it has reopened.
  */
 
 import { _electron as electron } from 'playwright';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { checkCareerHistory, DATABASE_CHECKS } from './career-history.mjs';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const require = createRequire(import.meta.url);
@@ -68,6 +80,15 @@ const SEASON_REOPENS = new Date(2026, 9, 1);
 const SEASON_CLOSED = new Date() < SEASON_REOPENS;
 /** "Q4 2026": the pass that opens at the reopening. */
 const REOPENING_PASS = `Q${Math.floor(SEASON_REOPENS.getMonth() / 3) + 1} ${SEASON_REOPENS.getFullYear()}`;
+
+/**
+ * A career written by the real 0.3.2 code (see tests/fixtures/README.md): one
+ * account, Demo Driver, with no password, and stints across 2025 and 2026.
+ */
+const FIXTURE_DATABASE = join(ROOT, 'tests', 'fixtures', 'career-0.3.2.db');
+const FIXTURE_ACCOUNT = 'Demo Driver';
+/** The fixture's first year, which the upgrade must leave as a finished chapter. */
+const FIXTURE_FIRST_YEAR = 2025;
 
 function valueOf(flag) {
   const index = argv.indexOf(flag);
@@ -163,19 +184,23 @@ process.stdout.write(
     : `The season reopened at ${SEASON_REOPENS.toString()}; checking the open pass.\n`,
 );
 
+/** The career database of the throwaway user-data folder. */
+const careerDatabase = join(userDataDir, 'data', 'endurance.db');
+
 /**
  * Run a few lines against the career database while the application is shut,
  * and return whatever they printed. `db` is an open better-sqlite3 handle.
+ * `file` is another database to open instead, such as a backup.
  *
  * The better-sqlite3 in node_modules is built for Electron's ABI while this
  * script runs (see the top of the file), so the lines run under Electron
  * acting as plain Node rather than in this process.
  */
-function inDatabase(name, body) {
+function inDatabase(name, body, file = careerDatabase) {
   const script = join(userDataDir, `${name}.cjs`);
   writeFileSync(script, `
     const Database = require(${JSON.stringify(join(ROOT, 'node_modules', 'better-sqlite3'))});
-    const db = new Database(${JSON.stringify(join(userDataDir, 'data', 'endurance.db'))});
+    const db = new Database(${JSON.stringify(file)});
     try {
       ${body}
     } finally {
@@ -189,8 +214,8 @@ function inDatabase(name, body) {
 }
 
 /** One number from the database: `sql` must select it as `n`. */
-function countIn(name, sql) {
-  const printed = inDatabase(name, `process.stdout.write(String(db.prepare(${JSON.stringify(sql)}).get().n));`).trim();
+function countIn(name, sql, file = careerDatabase) {
+  const printed = inDatabase(name, `process.stdout.write(String(db.prepare(${JSON.stringify(sql)}).get().n));`, file).trim();
   const value = Number(printed);
   check(printed !== '' && Number.isInteger(value), `${name} printed ${JSON.stringify(printed)}`);
   return value;
@@ -208,6 +233,9 @@ const launchOptions = packagedApp
       ],
       cwd: ROOT,
     };
+
+/** What the 0.4.0 checks left behind, for the database checks once the application is shut. */
+let careerHistory = null;
 
 const startedAt = Date.now();
 const app = await electron.launch({ ...launchOptions, timeout: BOOT_TIMEOUT_MS });
@@ -384,7 +412,8 @@ try {
       await page.fill('input[placeholder="05:30:00"]', '03:30:00');
       await page.waitForSelector('text=/In race time that is\\s*02:00:00\\s*to\\s*02:30:00/', { timeout: ACTION_TIMEOUT_MS });
       await page.click('button:has-text("Log stint")');
-      await page.waitForSelector('text=/33% → 42%/', { timeout: ACTION_TIMEOUT_MS });
+      // Completion is floored to one decimal, never rounded up: 2h of 6h is 33.3%, 2h30m is 41.6%.
+      await page.waitForSelector('text=/33\\.3% → 41\\.6%/', { timeout: ACTION_TIMEOUT_MS });
     });
 
     await step('remembers "Time left" for the next stint', async () => {
@@ -443,6 +472,12 @@ try {
       const text = (await panel.textContent()) ?? '';
       check(!text.includes(UPCOMING_RACE), 'the dashboard suggested a race that has not been run yet');
       check(text.includes('joins the suggestions on its race day'), 'the dashboard did not say a race was left out');
+    });
+
+    careerHistory = await checkCareerHistory(page, {
+      step, check, section, go, waitForPath, pathOf,
+      timeout: ACTION_TIMEOUT_MS,
+      race: { id: raceId, name: '6 Hours of Fuji' },
     });
 
     section('A second account');
@@ -511,6 +546,38 @@ try {
   });
 }
 
+section('What the career history left in the database');
+
+await step('holds each checkpoint the Expedition page showed, once, as career XP only', async () => {
+  const shown = careerHistory?.checkpoints ?? [];
+  check(shown.length > 0, 'the Expedition checks never got as far as a checkpoint');
+  const held = countIn('count-checkpoints', DATABASE_CHECKS.expeditionCheckpoints);
+  const distinct = countIn('count-distinct-checkpoints', DATABASE_CHECKS.distinctExpeditionCheckpoints);
+  check(held === shown.length && distinct === held, `the page showed ${shown.length} checkpoints; the ledger holds ${held} (${distinct} distinct)`);
+  const xp = countIn('sum-checkpoint-xp', DATABASE_CHECKS.expeditionXp);
+  const shownXp = shown.reduce((sum, checkpoint) => sum + checkpoint.xp, 0);
+  check(xp === shownXp, `the page showed ${shownXp} checkpoint XP; the ledger holds ${xp}`);
+  check(countIn('count-seasonal-checkpoints', DATABASE_CHECKS.expeditionSeasonXp) === 0, 'a checkpoint paid season XP');
+});
+
+await step('froze no chapter, and marked no Wrapped seen, for a year still being written', async () => {
+  check(careerHistory?.wrappedYear != null, 'the Wrapped preview was never clicked through');
+  const chapters = countIn('count-chapters', DATABASE_CHECKS.chapters);
+  check(chapters === 0, `found ${chapters} chronicle chapter(s)`);
+});
+
+await step('dated every milestone the new careers reached', async () => {
+  const milestones = countIn('count-milestones', DATABASE_CHECKS.milestones);
+  const undated = countIn('count-undated-milestones', DATABASE_CHECKS.undatedMilestones);
+  check(milestones > 0, 'no milestone was reached at all');
+  check(undated === 0, `${undated} of ${milestones} milestone(s) have no date`);
+});
+
+await step('marked both accounts, made on this version, as needing no history pass', async () => {
+  const complete = countIn('count-history-passes', DATABASE_CHECKS.completeHistoryPasses);
+  check(complete === 2, `expected 2 accounts marked, found ${complete}`);
+});
+
 section('Updating from an earlier version');
 
 const markerFile = join(userDataDir, 'last-version.json');
@@ -519,91 +586,181 @@ let updated = null;
 /** Season passes before the simulated update, which the season reset must not change. */
 let passesBeforeUpdate = null;
 
+// The throwaway folder goes however the two simulated updates below end,
+// even when one of them cannot start the application at all.
 try {
-  await step('recorded this version once it had started', async () => {
-    const marker = JSON.parse(readFileSync(markerFile, 'utf8'));
-    check(marker.version === VERSION, `the marker says ${marker.version}`);
-    check(!existsSync(backupDir) || readdirSync(backupDir).length === 0, 'a first install took a backup of nothing');
-  });
-
-  await step(
-    SEASON_CLOSED ? 'created no season pass while the season is closed' : 'created a season pass for the stints',
-    async () => {
-      passesBeforeUpdate = countIn('count-passes', 'SELECT COUNT(*) AS n FROM season_passes');
-      check(
-        SEASON_CLOSED ? passesBeforeUpdate === 0 : passesBeforeUpdate > 0,
-        `found ${passesBeforeUpdate} season pass(es)`,
-      );
-    },
-  );
-
-  await step('marked both accounts, made on this version, as never needing the season reset', async () => {
-    const marked = countIn('count-reset-markers', "SELECT COUNT(*) AS n FROM config_overrides WHERE key = 'seasonReset'");
-    check(marked === 2, `expected 2 accounts marked, found ${marked}`);
-  });
-
-  await step('is made to look like 0.3.0 was the last version here', async () => {
-    // 0.3.0 wrote the version marker and remembered the last release notes
-    // each account saw, but never ran the 0.3.1 season reset. Going straight
-    // from it to this version skips 0.3.1, whose notes are then owed too.
-    writeFileSync(markerFile, `${JSON.stringify({ version: '0.3.0', startedAt: new Date().toISOString() }, null, 2)}\n`);
-    inDatabase('forget-notes', `
-      db.prepare("UPDATE config_overrides SET value = '\\"0.3.0\\"' WHERE key = 'lastSeenVersion'").run();
-      db.prepare("DELETE FROM config_overrides WHERE key = 'seasonReset'").run();
-    `);
-  });
-
-  updated = await electron.launch({ ...launchOptions, timeout: BOOT_TIMEOUT_MS });
-  const page = await waitForApplicationWindow(updated);
-
-  await step('saved a copy of the career before touching it', async () => {
-    const copies = existsSync(backupDir) ? readdirSync(backupDir).filter((name) => name.startsWith(`pre-update-${VERSION}-`)) : [];
-    check(copies.length === 1, `expected one pre-update copy, found ${JSON.stringify(copies)}`);
-  });
-
-  await step('shows "What\'s new" once, and not again after it is closed', async () => {
-    if (pathOf(page).startsWith('/accounts')) {
-      await page.click(`button:has-text("${FIRST_ACCOUNT}")`);
-      await waitForPath(page, (path) => path === '/');
-    }
-    await page.waitForSelector(`text=What's new in ${VERSION}`, { timeout: ACTION_TIMEOUT_MS });
-    const dialog = (await page.textContent('dialog[open]')) ?? '';
-    check(dialog.includes('Season pass closed until 1 October'), 'the notes for the skipped 0.3.1 were not shown');
-    check(dialog.indexOf(VERSION) < dialog.indexOf('0.3.1'), 'the newest notes did not come first');
-    await page.click('button:has-text("Got it")');
-    await page.waitForSelector(`text=What's new in ${VERSION}`, { state: 'hidden', timeout: ACTION_TIMEOUT_MS });
-    await page.waitForTimeout(500);
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Dashboard', { timeout: ACTION_TIMEOUT_MS });
-    check(!(await page.isVisible(`text=What's new in ${VERSION}`)), 'the notes came back after being closed');
-  });
-} finally {
-  if (updated) {
-    await step('quits cleanly after the update', async () => {
-      await updated.close();
-    });
-
-    await step('ran the season reset once for each account from before 0.3.1', async () => {
-      const marked = countIn('count-reset-markers-after', "SELECT COUNT(*) AS n FROM config_overrides WHERE key = 'seasonReset'");
-      check(marked === 2, `expected 2 accounts marked, found ${marked}`);
-      // The server's output is captured into the shell's log.
-      const log = readFileSync(join(userDataDir, 'logs', 'main.log'), 'utf8');
-      for (const name of [FIRST_ACCOUNT, SECOND_ACCOUNT]) {
-        check(log.includes(`[season-reset] ${name} (`), `the log has no season reset line for ${name}`);
-      }
-      check(!log.includes('will retry on the next start'), 'the season reset failed for an account');
-      check(!log.includes('could not run at start-up'), 'the season reset could not run');
+  try {
+    await step('recorded this version once it had started', async () => {
+      const marker = JSON.parse(readFileSync(markerFile, 'utf8'));
+      check(marker.version === VERSION, `the marker says ${marker.version}`);
+      check(!existsSync(backupDir) || readdirSync(backupDir).length === 0, 'a first install took a backup of nothing');
     });
 
     await step(
-      SEASON_CLOSED ? 'still has no season pass after the update' : 'left this quarter’s pass alone',
+      SEASON_CLOSED ? 'created no season pass while the season is closed' : 'created a season pass for the stints',
       async () => {
-        const passes = countIn('count-passes-after', 'SELECT COUNT(*) AS n FROM season_passes');
-        check(passes === passesBeforeUpdate, `season passes went from ${passesBeforeUpdate} to ${passes}`);
+        passesBeforeUpdate = countIn('count-passes', 'SELECT COUNT(*) AS n FROM season_passes');
+        check(
+          SEASON_CLOSED ? passesBeforeUpdate === 0 : passesBeforeUpdate > 0,
+          `found ${passesBeforeUpdate} season pass(es)`,
+        );
       },
     );
+
+    await step('marked both accounts, made on this version, as never needing the season reset', async () => {
+      const marked = countIn('count-reset-markers', "SELECT COUNT(*) AS n FROM config_overrides WHERE key = 'seasonReset'");
+      check(marked === 2, `expected 2 accounts marked, found ${marked}`);
+    });
+
+    await step('is made to look like 0.3.0 was the last version here', async () => {
+      // 0.3.0 wrote the version marker and remembered the last release notes
+      // each account saw, but never ran the 0.3.1 season reset. Going straight
+      // from it to this version skips 0.3.1, whose notes are then owed too.
+      writeFileSync(markerFile, `${JSON.stringify({ version: '0.3.0', startedAt: new Date().toISOString() }, null, 2)}\n`);
+      inDatabase('forget-notes', `
+        db.prepare("UPDATE config_overrides SET value = '\\"0.3.0\\"' WHERE key = 'lastSeenVersion'").run();
+        db.prepare("DELETE FROM config_overrides WHERE key = 'seasonReset'").run();
+      `);
+    });
+
+    updated = await electron.launch({ ...launchOptions, timeout: BOOT_TIMEOUT_MS });
+    const page = await waitForApplicationWindow(updated);
+
+    await step('saved a copy of the career before touching it', async () => {
+      const copies = existsSync(backupDir) ? readdirSync(backupDir).filter((name) => name.startsWith(`pre-update-${VERSION}-`)) : [];
+      check(copies.length === 1, `expected one pre-update copy, found ${JSON.stringify(copies)}`);
+    });
+
+    await step('shows "What\'s new" once, and not again after it is closed', async () => {
+      if (pathOf(page).startsWith('/accounts')) {
+        await page.click(`button:has-text("${FIRST_ACCOUNT}")`);
+        await waitForPath(page, (path) => path === '/');
+      }
+      await page.waitForSelector(`text=What's new in ${VERSION}`, { timeout: ACTION_TIMEOUT_MS });
+      const dialog = (await page.textContent('dialog[open]')) ?? '';
+      check(dialog.includes('Season pass closed until 1 October'), 'the notes for the skipped 0.3.1 were not shown');
+      check(dialog.indexOf(VERSION) < dialog.indexOf('0.3.1'), 'the newest notes did not come first');
+      await page.click('button:has-text("Got it")');
+      await page.waitForSelector(`text=What's new in ${VERSION}`, { state: 'hidden', timeout: ACTION_TIMEOUT_MS });
+      await page.waitForTimeout(500);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('text=Dashboard', { timeout: ACTION_TIMEOUT_MS });
+      check(!(await page.isVisible(`text=What's new in ${VERSION}`)), 'the notes came back after being closed');
+    });
+  } finally {
+    if (updated) {
+      await step('quits cleanly after the update', async () => {
+        await updated.close();
+      });
+
+      await step('ran the season reset once for each account from before 0.3.1', async () => {
+        const marked = countIn('count-reset-markers-after', "SELECT COUNT(*) AS n FROM config_overrides WHERE key = 'seasonReset'");
+        check(marked === 2, `expected 2 accounts marked, found ${marked}`);
+        // The server's output is captured into the shell's log.
+        const log = readFileSync(join(userDataDir, 'logs', 'main.log'), 'utf8');
+        for (const name of [FIRST_ACCOUNT, SECOND_ACCOUNT]) {
+          check(log.includes(`[season-reset] ${name} (`), `the log has no season reset line for ${name}`);
+        }
+        check(!log.includes('will retry on the next start'), 'the season reset failed for an account');
+        check(!log.includes('could not run at start-up'), 'the season reset could not run');
+      });
+
+      await step(
+        SEASON_CLOSED ? 'still has no season pass after the update' : 'left this quarter’s pass alone',
+        async () => {
+          const passes = countIn('count-passes-after', 'SELECT COUNT(*) AS n FROM season_passes');
+          check(passes === passesBeforeUpdate, `season passes went from ${passesBeforeUpdate} to ${passes}`);
+        },
+      );
+    }
   }
 
+  section('Upgrading a career that 0.3.2 wrote');
+
+  let upgraded = null;
+
+  try {
+    await step('is given the 0.3.2 fixture in place of the career, as 0.3.2 left it', async () => {
+      // A copy, never the fixture itself; and no write-ahead log from the
+      // career it replaces, which SQLite would otherwise apply to it.
+      for (const suffix of ['', '-wal', '-shm']) rmSync(`${careerDatabase}${suffix}`, { force: true });
+      copyFileSync(FIXTURE_DATABASE, careerDatabase);
+      // The earlier update already took today's copy; clear it so this one is seen.
+      rmSync(backupDir, { recursive: true, force: true });
+      writeFileSync(markerFile, `${JSON.stringify({ version: '0.3.2', startedAt: new Date().toISOString() }, null, 2)}\n`);
+      const migrations = countIn('count-fixture-migrations', 'SELECT COUNT(*) AS n FROM _prisma_migrations');
+      check(migrations === 3, `the fixture has ${migrations} migrations applied, not 0.3.2's three`);
+    });
+
+    upgraded = await electron.launch({ ...launchOptions, timeout: BOOT_TIMEOUT_MS });
+    const page = await waitForApplicationWindow(upgraded);
+
+    await step('saved a copy of the 0.3.2 career before migrating it', async () => {
+      const copies = existsSync(backupDir) ? readdirSync(backupDir).filter((name) => name.startsWith(`pre-update-${VERSION}-`)) : [];
+      check(copies.length === 1, `expected one pre-update copy, found ${JSON.stringify(copies)}`);
+      const migrations = countIn('count-copy-migrations', 'SELECT COUNT(*) AS n FROM _prisma_migrations', join(backupDir, copies[0]));
+      check(migrations === 3, `the copy has ${migrations} migrations applied: it was taken after migrating`);
+    });
+
+    await step(`opens the upgraded career, with the notes for ${VERSION}`, async () => {
+      if (pathOf(page).startsWith('/accounts')) {
+        await page.click(`button:has-text("${FIXTURE_ACCOUNT}")`);
+        await waitForPath(page, (path) => path === '/');
+      }
+      await page.waitForSelector(`text=What's new in ${VERSION}`, { timeout: ACTION_TIMEOUT_MS });
+      const dialog = (await page.textContent('dialog[open]')) ?? '';
+      check(dialog.includes('Your career, year by year'), 'the notes for this version were not shown');
+      await page.click('button:has-text("Got it")');
+      await page.waitForSelector(`text=What's new in ${VERSION}`, { state: 'hidden', timeout: ACTION_TIMEOUT_MS });
+    });
+
+    await step(`shows ${FIXTURE_FIRST_YEAR} in the Chronicle as Career Year 1, finished and settled`, async () => {
+      await go(page, '/chronicle');
+      const card = page.locator('li', { hasText: `${FIXTURE_FIRST_YEAR} · Career Year 1` }).first();
+      await card.waitFor({ timeout: ACTION_TIMEOUT_MS });
+      const text = ((await card.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(text.includes('Complete') && !text.includes('finalising'), `the ${FIXTURE_FIRST_YEAR} chapter reads ${JSON.stringify(text)}`);
+    });
+
+    await step('shows its milestones with the dates history gives them', async () => {
+      await go(page, '/career/milestones');
+      await page.waitForSelector('h1:has-text("Career Milestones")', { timeout: ACTION_TIMEOUT_MS });
+      const card = page.locator('li', { hasText: 'First race started' }).first();
+      const text = ((await card.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(text.includes(`Reached with the stint logged at`) && text.includes(String(FIXTURE_FIRST_YEAR)),
+        `the first race started is not dated to its ${FIXTURE_FIRST_YEAR} stint: ${JSON.stringify(text)}`);
+    });
+  } finally {
+    if (upgraded) {
+      await step('quits cleanly after the upgrade', async () => {
+        await upgraded.close();
+      });
+
+      await step('finished the one-time history pass for the upgraded career', async () => {
+        const complete = countIn('count-upgraded-history-passes', DATABASE_CHECKS.completeHistoryPasses);
+        check(complete === 1, `expected the one account's history pass complete, found ${complete}`);
+        const log = readFileSync(join(userDataDir, 'logs', 'main.log'), 'utf8');
+        check(log.includes(`[career-backfill] ${FIXTURE_ACCOUNT} (`), 'the log has no history pass line for the upgraded career');
+        check(!log.includes('continues on the next start'), 'the history pass did not finish in one start');
+        check(!log.includes('failed, will retry on the next start'), 'the history pass failed');
+        check(!log.includes('could not run at start-up'), 'an upgrade step could not run');
+        check(!log.includes('could not freeze'), 'the Chronicle could not freeze a finished year');
+      });
+
+      await step('dated every milestone of the upgraded career', async () => {
+        const milestones = countIn('count-upgraded-milestones', DATABASE_CHECKS.milestones);
+        const undated = countIn('count-upgraded-undated', DATABASE_CHECKS.undatedMilestones);
+        check(milestones > 0, 'the upgraded career has no milestones');
+        check(undated === 0, `${undated} of ${milestones} milestone(s) have no date`);
+      });
+
+      await step(`froze the ${FIXTURE_FIRST_YEAR} chapter once`, async () => {
+        const chapters = countIn('count-upgraded-chapters', DATABASE_CHECKS.chaptersOf(FIXTURE_FIRST_YEAR));
+        check(chapters === 1, `found ${chapters} ${FIXTURE_FIRST_YEAR} chapter(s)`);
+      });
+    }
+  }
+} finally {
   if (!keepUserData) rmSync(userDataDir, { recursive: true, force: true });
   else process.stdout.write(`Kept ${userDataDir}\n`);
 }
